@@ -10,7 +10,7 @@ A local-first desktop app that tracks new album and EP releases from artists you
 - **Release feed** — browse albums and EPs sorted by date, filter by artist, type, or new-only
 - **New release detection** — "Check Now" scans all tracked artists and highlights newly discovered releases with a badge
 - **Official releases only** — automatically filters out bootlegs, compilations, live albums, soundtracks, and remixes
-- **Telegram notifications** — weekly bot notifications for new releases via cron
+- **Telegram notifications** — daily bot pings for newly discovered releases and release-day drops
 - **Click-to-run** — auto-installs dependencies on first launch, no manual setup needed
 
 ## Quick Start
@@ -39,25 +39,31 @@ python create-shortcut.py
 
 When you first add an artist, all their existing releases are imported as "already seen" so your feed isn't flooded. Only releases discovered in subsequent checks are marked as new.
 
-## Telegram Notifications (optional)
+## Telegram Setup (optional)
 
-Get a weekly Telegram message when new releases are found:
+Connect a Telegram bot to get notifications and manage your library from your phone:
 
 ```bash
 python notify.py --setup
 ```
 
-This walks you through creating a Telegram bot via @BotFather, connecting it, and prints a cron line for weekly Friday checks. You can also run `python notify.py` manually at any time.
+This walks you through creating a bot via @BotFather and saves your token and chat ID to `telegram_config.json`. Once configured, start the interactive bot (next section) to get automatic daily notifications.
+
+You can also run `python notify.py` manually at any time for a one-shot check plus notification.
 
 ## Interactive Telegram Bot (optional)
 
-Manage your entire music library from Telegram — no need to open the web UI:
+Manage your entire music library from Telegram — and get automatic daily notifications — no need to open the web UI:
 
 ```bash
 python telegram_bot.py
 ```
 
-This starts a long-polling bot that responds to these commands:
+This starts a long-polling bot that:
+
+- Runs a daily check at **10:00 local time**, pinging you about newly discovered releases and any tracked albums that drop that day.
+- Catches up on startup if the bot was down when the daily run was scheduled.
+- Responds to these commands:
 
 | Command | Description |
 |---------|-------------|
@@ -71,7 +77,7 @@ This starts a long-polling bot that responds to these commands:
 | `/cover` | Browse and view album cover art |
 | `/today` | Show releases that come out today |
 
-Uses the same `telegram_config.json` from notification setup. Run in tmux/screen or as a systemd service to keep it running.
+Uses the same `telegram_config.json` from setup. Run it as a systemd user service (recommended) or in tmux/screen to keep it running 24/7 — the scheduled daily notifications only fire while the bot is running, with catch-up on next startup.
 
 ## Tech Stack
 

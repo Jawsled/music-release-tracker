@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -29,6 +30,9 @@ CONFIG_PATH = Path(__file__).parent / "telegram_config.json"
 TELEGRAM_API = "https://api.telegram.org/bot{token}"
 
 COVER_ART_URL = "https://coverartarchive.org/release-group/{mbid}/front-500"
+
+NOTIFICATION_HOUR = 10  # Daily scheduled check fires at this hour (local time)
+LAST_CHECK_KEY = "last_scheduled_check"
 
 HELP_TEXT = (
     "\U0001f3b5 <b>Music Release Tracker Bot</b>\n"
@@ -364,6 +368,58 @@ async def handle_cover_callback(token: str, chat_id: str, release_mbid: str):
         await send_message(token, chat_id, "No cover art available for this release.")
 
 
+# --- Scheduled daily check ---
+
+def _seconds_until_next_run() -> float:
+    now = datetime.now()
+    target = now.replace(hour=NOTIFICATION_HOUR, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def _run_scheduled_check(token: str, chat_id: str):
+    from notify import run_check, format_message, check_release_day, format_release_day_message
+
+    summary = await run_check()
+    if summary:
+        await send_message(token, chat_id, format_message(summary))
+
+    due_today = check_release_day()
+    if due_today:
+        result = await send_message(token, chat_id, format_release_day_message(due_today))
+        if result.get("ok"):
+            for r in due_today:
+                db.mark_release_day_notified(r["id"])
+
+    db.set_meta(LAST_CHECK_KEY, datetime.now().strftime("%Y-%m-%d"))
+
+
+async def scheduled_check_loop(token: str, chat_id: str):
+    """Run the daily check at NOTIFICATION_HOUR local time.
+
+    On startup, if today's run was missed (bot was down at fire time), catch up.
+    """
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    if now.hour >= NOTIFICATION_HOUR and db.get_meta(LAST_CHECK_KEY) != today:
+        print(f"Scheduler: catching up on missed run for {today}")
+        try:
+            await _run_scheduled_check(token, chat_id)
+        except Exception as e:
+            print(f"Scheduler catch-up failed: {e}")
+
+    while True:
+        delay = _seconds_until_next_run()
+        next_at = datetime.now() + timedelta(seconds=delay)
+        print(f"Scheduler: next run at {next_at.strftime('%Y-%m-%d %H:%M:%S')} (in {int(delay)}s)")
+        await asyncio.sleep(delay)
+        try:
+            await _run_scheduled_check(token, chat_id)
+        except Exception as e:
+            print(f"Scheduled check failed: {e}")
+
+
 # --- Main loop ---
 
 async def handle_message(token: str, chat_id: str, message: dict):
@@ -429,6 +485,8 @@ async def main():
     chat_id = config["chat_id"]
 
     db.init_db()
+
+    asyncio.create_task(scheduled_check_loop(token, chat_id))
 
     print("Bot started. Listening for messages... (Ctrl+C to stop)")
 

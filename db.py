@@ -37,6 +37,11 @@ def init_db():
             release_day_notified INTEGER DEFAULT 0,
             FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
     """)
     # Migration: add release_day_notified column for existing databases
     try:
@@ -193,5 +198,29 @@ def get_unseen_count() -> int:
     try:
         row = conn.execute("SELECT COUNT(*) as cnt FROM releases WHERE notified = 0").fetchone()
         return row["cnt"]
+    finally:
+        conn.close()
+
+
+# --- Meta (key/value state) ---
+
+def get_meta(key: str) -> str | None:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+    finally:
+        conn.close()
+
+
+def set_meta(key: str, value: str):
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
     finally:
         conn.close()
