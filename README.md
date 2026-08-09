@@ -11,7 +11,7 @@ A local-first desktop app that tracks new album and EP releases from artists you
 - **Fetch tracklist** — Fetches tracklist for EP and Album release.
 - **Singles detection** — When fetching tracklist, if single release of a song exists, it will be marked with "SINGLE" badge. Useful if you want to avoid duplicates.
 - **New release detection** — "Check Now" scans all tracked artists and highlights newly discovered releases with a badge
-- **Official + Unofficial releases** — This can be changed in the musicbrainz.py.
+- **Official + Unofficial releases** — This can be changed in the musicbrainz.py file. This is done to catch pre-official release such as ones on soundcloud, assuming that gets caught and put on MB before official release.
 - **Shortcut to MB page** Click on "view" button to see individual release page on Musicbrainz. similarly, click on artist to see their page.
 - **Easy backup** — Allows users to import & export list of artists in a .json file
 
