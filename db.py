@@ -1,19 +1,3 @@
-from __future__ import annotations
-
-import sqlite3
-from datetime import datetime, timezone
-from pathlib import Path
-
-DB_PATH = Path(__file__).parent / "music_releases.db"
-
-
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
-
-
 def init_db():
     conn = get_db()
     conn.executescript("""
@@ -22,13 +6,15 @@ def init_db():
             mbid TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
             disambiguation TEXT DEFAULT '',
+            itunes_artist_id INTEGER,
             added_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS releases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            mbid TEXT UNIQUE NOT NULL,
+            mbid TEXT NOT NULL,
             artist_id INTEGER NOT NULL,
+            source TEXT DEFAULT 'musicbrainz',
             title TEXT NOT NULL,
             release_type TEXT NOT NULL,
             release_date TEXT DEFAULT '',
@@ -36,6 +22,7 @@ def init_db():
             notified INTEGER DEFAULT 0,
             release_day_notified INTEGER DEFAULT 0,
             mb_url TEXT DEFAULT '',
+            itunes_collection_id TEXT,
             FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE CASCADE
         );
 
@@ -44,19 +31,32 @@ def init_db():
             value TEXT NOT NULL
         );
     """)
+    
+    migrations = [
+        "ALTER TABLE releases ADD COLUMN source TEXT DEFAULT 'musicbrainz'",
+        "ALTER TABLE releases ADD COLUMN itunes_collection_id TEXT",
+        "ALTER TABLE artists ADD COLUMN itunes_artist_id INTEGER",
+    ]
+    for sql in migrations:
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
     # Migration: add release_day_notified column for existing databases
     try:
         conn.execute("ALTER TABLE releases ADD COLUMN release_day_notified INTEGER DEFAULT 0")
         conn.commit()
     except sqlite3.OperationalError:
-        pass  # Column already exists
+        pass
 
     # Migration: add mb_url column for existing databases
     try:
         conn.execute("ALTER TABLE releases ADD COLUMN mb_url TEXT DEFAULT ''")
         conn.commit()
     except sqlite3.OperationalError:
-        pass  # Column already exists
+        pass
 
     conn.commit()
     conn.close()
@@ -68,12 +68,12 @@ def _now_iso() -> str:
 
 # --- Artists ---
 
-def add_artist(mbid: str, name: str, disambiguation: str = "") -> dict:
+def add_artist(mbid: str, name: str, disambiguation: str = "", itunes_artist_id: int | None = None) -> dict:
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO artists (mbid, name, disambiguation, added_at) VALUES (?, ?, ?, ?)",
-            (mbid, name, disambiguation, _now_iso()),
+            "INSERT INTO artists (mbid, name, disambiguation, itunes_artist_id, added_at) VALUES (?, ?, ?, ?, ?)",
+            (mbid, name, disambiguation, itunes_artist_id, _now_iso()),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM artists WHERE mbid = ?", (mbid,)).fetchone()
@@ -119,18 +119,30 @@ def add_release(
     release_date: str,
     notified: int = 0,
     mb_url: str = "",
+    source: str = "musicbrainz",
+    itunes_collection_id: str | None = None,
 ) -> bool:
     """Insert a release. Returns True if inserted, False if it already existed."""
     conn = get_db()
     try:
+        # For iTunes releases, use collectionId as mbid for uniqueness
+        unique_key = mbid if source == "musicbrainz" else (itunes_collection_id or mbid)
+        
+        existing = conn.execute(
+            "SELECT id FROM releases WHERE artist_id = ? AND (mbid = ? OR itunes_collection_id = ?)",
+            (artist_id, unique_key, unique_key),
+        ).fetchone()
+        if existing:
+            return False
+
         conn.execute(
-            """INSERT OR IGNORE INTO releases
-               (mbid, artist_id, title, release_type, release_date, first_seen_at, notified, mb_url)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (mbid, artist_id, title, release_type, release_date, _now_iso(), notified, mb_url),
+            """INSERT INTO releases
+               (mbid, artist_id, source, title, release_type, release_date, first_seen_at, notified, mb_url, itunes_collection_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (unique_key, artist_id, source, title, release_type, release_date, _now_iso(), notified, mb_url, itunes_collection_id),
         )
         conn.commit()
-        return conn.total_changes > 0
+        return True
     finally:
         conn.close()
 
