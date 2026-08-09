@@ -27,7 +27,7 @@ That's it. On first run it creates a virtual environment and installs dependenci
 
 ## Desktop Shortcut (optional)
 
-- Includes conda launch shortcut .bat file. remove activation file and make shortcut and paste it on your desktop or start menu folder if you like.
+- Includes conda launch shortcut, if for some strange reason you want to run it in anaconda when it is already running in venv. But .bat file is there if you want it.
 - conda environment name should be music-release-tracker. 
 
 
