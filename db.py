@@ -224,6 +224,7 @@ def get_unseen_count() -> int:
         conn.close()
 
 
+<<<<<<< HEAD
 def get_artist_single_titles(artist_id: int) -> list[str]:
     """Return lowercase titles of all Single releases for a given artist."""
     conn = get_db()
@@ -249,6 +250,8 @@ def get_artist_id_by_release_mbid(mbid: str) -> int | None:
         conn.close()
 
 
+=======
+>>>>>>> 4a750d340307195ed2b4c9e79b08f0af651ae29e
 # --- Meta (key/value state) ---
 
 def get_meta(key: str) -> str | None:
