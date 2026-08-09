@@ -55,3 +55,7 @@ When you first add an artist, all their existing releases are imported as "alrea
 - Internet connection (for MusicBrainz API)
 
 All Python dependencies are installed automatically by `run.py`.
+
+
+## Planned future update
+- **iTunes/apple music support** - As great as Musicbrainz is, it can take several days to be updated. This planned update will try to remedy this. 
