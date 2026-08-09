@@ -6,7 +6,7 @@ A local-first desktop app that tracks new album and EP releases from artists you
 
 ## Features
 
-- **Artist search** — find and add artists from MusicBrainz with disambiguation support
+- **Artist search** — find and add artists from MusicBrainz with disambiguation (Short descriptor to help you make sure it is the right artist, sometimes not present)
 - **Release feed** — browse albums, EPs and singles sorted by date, filter by artist, type, or new-only
 - **Fetch tracklist** — Fetches tracklist for EP and Album release.
 - **Singles detection** — When fetching tracklist, if single release of a song exists, it will be marked with "SINGLE" badge. Useful if you want to avoid duplicates.
