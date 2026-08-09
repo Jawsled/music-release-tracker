@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -13,26 +13,70 @@
         <nav>
             <button class="tab-btn active" data-tab="feed">Feed <span id="unseen-badge" class="badge hidden">0</span></button>
             <button class="tab-btn" data-tab="artists">Artists</button>
-            <button class="tab-btn" data-tab="check">Check</button>
+            <button class="tab-btn" id="logs-btn" style="margin-left:auto;">Logs</button>
         </nav>
     </header>
+
+    <!-- Logs Panel -->
+    <div id="logs-panel" class="logs-panel hidden">
+        <div class="logs-header">
+            <h2>Scan Logs</h2>
+            <div class="logs-actions">
+                <button id="clear-logs-btn" class="check-btn" onclick="clearLogs()">Clear</button>
+                <button class="popup-close-btn" onclick="toggleLogsPanel()">✕</button>
+            </div>
+        </div>
+        <div id="logs-container" class="logs-container"></div>
+    </div>
 
     <main>
         <!-- Feed Tab -->
         <section id="tab-feed" class="tab-content active">
             <div class="filters">
-                <select id="filter-artist">
-                    <option value="">All Artists</option>
-                </select>
-                <select id="filter-type">
-                    <option value="">All Types</option>
-                    <option value="Album">Albums</option>
-                    <option value="EP">EPs</option>
-                </select>
-                <label class="checkbox-label">
-                    <input type="checkbox" id="filter-unseen"> New only
-                </label>
+                <!-- Artist filter: searchable dropdown -->
+                <div class="filter-dropdown" id="artist-filter-wrapper">
+                    <button type="button" class="filter-btn" onclick="toggleArtistDropdown()" id="filter-artist-btn">All Artists</button>
+                    <div class="dropdown-menu hidden" id="artist-dropdown-menu">
+                        <input type="text" class="dropdown-search" placeholder="Search artists..." id="artist-filter-search" oninput="filterArtistList()">
+                        <div class="dropdown-list" id="artist-dropdown-list"></div>
+                    </div>
+                </div>
+
+                <!-- Release type: toggle chips -->
+                <div class="type-chips">
+                    <button type="button" class="chip active" data-type="" onclick="selectType(this)">All</button>
+                    <button type="button" class="chip" data-type="Album" onclick="selectType(this)">Albums</button>
+                    <button type="button" class="chip" data-type="EP" onclick="selectType(this)">EPs</button>
+                    <button type="button" class="chip" data-type="Single" onclick="selectType(this)">Singles</button>
+                </div>
+
+                <label class="checkbox-label"><input type="checkbox" id="filter-unseen"> New only</label>
+                <button id="markallasseen" class="check-btn">Mark All as Seen</button>
+                <button id="check-btn" class="check-btn check-now-btn">Check Now</button>
             </div>
+
+            <!-- Popup panel (appears when clicking Check Now) -->
+            <div id="check-popup" class="check-popup hidden">
+                <div class="popup-header">
+                    <span id="popup-title">Checking for new releases...</span>
+                    <button class="popup-close-btn" onclick="closeCheckPopup()">✕</button>
+                </div>
+
+                <!-- Progress bar -->
+                <div class="progress-bar-track">
+                    <div id="check-progress-bar" class="progress-bar-fill"></div>
+                </div>
+                <span id="check-progress-text" class="check-progress-text">Idle</span>
+
+                <!-- Pause/Resume button -->
+                <button id="pause-btn" class="pause-btn hidden" onclick="togglePauseCheck()">⏸ Pause</button>
+
+                <!-- Results -->
+                <div id="summary-body" class="popup-results hidden">
+                    <h3>New Releases Found</h3>
+                </div>
+            </div>
+
             <div id="release-list" class="release-list">
                 <p class="empty-state">No releases yet. Add some artists to get started.</p>
             </div>
@@ -45,17 +89,15 @@
                 <button id="artist-search-btn">Search</button>
             </div>
             <div id="search-results" class="search-results"></div>
+            <div class="import-export-bar">
+                <button id="export-artists-btn" class="check-btn" onclick="exportArtists()">Export ↗</button>
+                <button id="import-btn" class="check-btn">Import ↙</button>
+                <input type="file" id="import-file-input" accept=".json" style="display:none">
+            </div>
             <h2>Tracked Artists</h2>
             <div id="artist-list" class="artist-list">
                 <p class="empty-state">No artists tracked yet.</p>
             </div>
-        </section>
-
-        <!-- Check Tab -->
-        <section id="tab-check" class="tab-content">
-            <button id="check-btn" class="check-btn">Check Now</button>
-            <div id="check-progress" class="check-progress"></div>
-            <div id="check-summary" class="check-summary"></div>
         </section>
     </main>
 

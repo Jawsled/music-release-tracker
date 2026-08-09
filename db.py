@@ -35,12 +35,25 @@ def init_db():
             first_seen_at TEXT NOT NULL,
             notified INTEGER DEFAULT 0,
             release_day_notified INTEGER DEFAULT 0,
+            mb_url TEXT DEFAULT '',
             FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );
     """)
     # Migration: add release_day_notified column for existing databases
     try:
         conn.execute("ALTER TABLE releases ADD COLUMN release_day_notified INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Migration: add mb_url column for existing databases
+    try:
+        conn.execute("ALTER TABLE releases ADD COLUMN mb_url TEXT DEFAULT ''")
         conn.commit()
     except sqlite3.OperationalError:
         pass  # Column already exists
@@ -105,15 +118,16 @@ def add_release(
     release_type: str,
     release_date: str,
     notified: int = 0,
+    mb_url: str = "",
 ) -> bool:
     """Insert a release. Returns True if inserted, False if it already existed."""
     conn = get_db()
     try:
         conn.execute(
             """INSERT OR IGNORE INTO releases
-               (mbid, artist_id, title, release_type, release_date, first_seen_at, notified)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (mbid, artist_id, title, release_type, release_date, _now_iso(), notified),
+               (mbid, artist_id, title, release_type, release_date, first_seen_at, notified, mb_url)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (mbid, artist_id, title, release_type, release_date, _now_iso(), notified, mb_url),
         )
         conn.commit()
         return conn.total_changes > 0
@@ -129,7 +143,7 @@ def get_releases(
     conn = get_db()
     try:
         query = """
-            SELECT r.*, a.name as artist_name
+            SELECT r.*, a.name as artist_name, a.mbid as artist_mbid
             FROM releases r
             JOIN artists a ON r.artist_id = a.id
             WHERE 1=1
@@ -153,13 +167,14 @@ def get_releases(
         conn.close()
 
 
-def mark_release_seen(release_id: int):
+def mark_all_releases_seen():
     conn = get_db()
     try:
-        conn.execute("UPDATE releases SET notified = 1 WHERE id = ?", (release_id,))
+        conn.execute("UPDATE releases SET notified = 1")
         conn.commit()
     finally:
         conn.close()
+
 
 
 def get_releases_due_today() -> list[dict]:
@@ -193,5 +208,54 @@ def get_unseen_count() -> int:
     try:
         row = conn.execute("SELECT COUNT(*) as cnt FROM releases WHERE notified = 0").fetchone()
         return row["cnt"]
+    finally:
+        conn.close()
+
+
+def get_artist_single_titles(artist_id: int) -> list[str]:
+    """Return lowercase titles of all Single releases for a given artist."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT title FROM releases WHERE artist_id = ? AND release_type = 'Single'",
+            (artist_id,),
+        ).fetchall()
+        return [row["title"].strip().lower() for row in rows if row["title"]]
+    finally:
+        conn.close()
+
+
+def get_artist_id_by_release_mbid(mbid: str) -> int | None:
+    """Look up artist_id from a release MBID."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT artist_id FROM releases WHERE mbid = ?", (mbid,)
+        ).fetchone()
+        return row["artist_id"] if row else None
+    finally:
+        conn.close()
+
+
+# --- Meta (key/value state) ---
+
+def get_meta(key: str) -> str | None:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+    finally:
+        conn.close()
+
+
+def set_meta(key: str, value: str):
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
     finally:
         conn.close()

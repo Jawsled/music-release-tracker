@@ -1,5 +1,0 @@
-.venv/
-music_releases.db
-__pycache__/
-telegram_config.json
-notify.log
