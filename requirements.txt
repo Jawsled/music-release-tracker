@@ -1,5 +1,8 @@
 fastapi
 uvicorn
 httpx
-jinja2
+jinja2==3.1.4
+starlette==0.38.6
 python-multipart
+
+#Jinja2 version matters due to known compatibility issues!
