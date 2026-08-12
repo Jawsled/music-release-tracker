@@ -17,7 +17,7 @@ tabButtons.forEach(btn => {
 
 // --- Feed Tab ---
 let activeArtistFilterId = "";   // selected artist ID (empty = all)
-let activeTypeFilter = "";       // selected release type
+let activeTypeFilters = ["Album", "EP", "Single", "Other"];  // multi-select release types (empty = all)
 const filterUnseen = document.getElementById("filter-unseen");
 const releaseList = document.getElementById("release-list");
 const unseenBadge = document.getElementById("unseen-badge");
@@ -29,6 +29,40 @@ const filterArtistBtn = document.getElementById("filter-artist-btn");
 filterUnseen.addEventListener("change", loadReleases);
 
 // --- Artist Dropdown Logic ---
+// Synchronous cache of artists for button text updates
+let _artistsCache = [];
+
+function _getArtistName(id) {
+  const a = _artistsCache.find(x => String(x.id) === String(id));
+  return a ? a.name : null;
+}
+
+function _updateCheckBtn() {
+  if (!scanRunning) {
+    if (activeArtistFilterId) {
+      const name = _getArtistName(activeArtistFilterId);
+      checkBtn.textContent = name ? `Check ${name}` : "Check All Artists";
+    } else {
+      checkBtn.textContent = "Check All Artists";
+    }
+  }
+}
+
+// Refresh the artists cache
+async function _refreshArtistsCache() {
+  try {
+    const resp = await fetch("/api/artists");
+    _artistsCache = await resp.json();
+    _updateCheckBtn();
+  } catch {
+    // silent fail
+  }
+}
+
+// Refresh cache periodically and after mutations
+_refreshArtistsCache();
+setInterval(_refreshArtistsCache, 10000);
+
 function toggleArtistDropdown() {
   const hidden = artistDropdownMenu.classList.contains("hidden");
   if (hidden) {
@@ -74,31 +108,39 @@ function filterArtistList() {
 
 function selectArtist(id) {
   activeArtistFilterId = String(id);
+  
   if (id === "" || id === "0" || id === false) {
     filterArtistBtn.textContent = "All Artists";
   } else {
-    // Find name for display
-    fetch("/api/artists").then(r => r.json()).then(data => {
-      const a = data.find(x => String(x.id) === String(id));
-      filterArtistBtn.textContent = a ? esc(a.name) : "All Artists";
-    });
+    const name = _getArtistName(id);
+    filterArtistBtn.textContent = name ? esc(name) : "All Artists";
   }
+  _updateCheckBtn();
   closeArtistDropdown();
   loadReleases();
 }
 
-// --- Type Chip Logic ---
-function selectType(chipEl) {
-  document.querySelectorAll(".chip").forEach(c => c.classList.remove("active"));
-  chipEl.classList.add("active");
-  activeTypeFilter = chipEl.dataset.type;
+// --- Type Chip Logic (multi-select; empty = all) ---
+function toggleType(chipEl) {
+  const type = chipEl.dataset.type;
+  const idx = activeTypeFilters.indexOf(type);
+  if (idx === -1) {
+    activeTypeFilters.push(type);
+    chipEl.classList.add("active");
+  } else {
+    activeTypeFilters.splice(idx, 1);
+    chipEl.classList.remove("active");
+  }
   loadReleases();
 }
 
 async function loadReleases() {
   const params = new URLSearchParams();
   if (activeArtistFilterId) params.set("artist_id", activeArtistFilterId);
-  if (activeTypeFilter) params.set("type", activeTypeFilter);
+  // Send selected types as comma-separated; empty means "all"
+  if (activeTypeFilters.length > 0 && activeTypeFilters.length < 4) {
+    params.set("type", activeTypeFilters.join(","));
+  }
   if (filterUnseen.checked) params.set("unseen_only", "true");
 
   const resp = await fetch(`/api/releases?${params}`);
@@ -120,15 +162,43 @@ function renderReleaseCard(r) {
     ? `<a href="https://musicbrainz.org/artist/${esc(r.artist_mbid)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${esc(r.artist_name)}</a>`
     : esc(r.artist_name);
 
+  // Determine source badge and view URL
+  const source = r.source || "musicbrainz";
+  const sourceBadge = source === "itunes"
+    ? '<span class="source-badge itunes">iTunes</span>'
+    : '<span class="source-badge mb">MB</span>';
+
+  // Build the correct "View" URL based on source
+  let viewUrl;
+  if (source === "itunes" && r.itunes_collection_id) {
+    // iTunes: link to Apple Music album page
+    viewUrl = `https://music.apple.com/us/album/${esc(r.title.toLowerCase().replace(/[^a-z0-9]/g, ''))}/${r.itunes_collection_id}`;
+  } else if (source === "itunes" && r.mb_url) {
+    viewUrl = r.mb_url;
+  } else {
+    // MusicBrainz default
+    viewUrl = r.mb_url || `https://musicbrainz.org/release-group/${r.mbid}`;
+  }
+
+  // Determine cover art URL
+  let coverUrl;
+  if (source === 'itunes' && r.artwork_url) {
+    coverUrl = r.artwork_url;
+  } else if (source === 'itunes') {
+    coverUrl = '/static/icon.svg';
+  } else {
+    coverUrl = `https://coverartarchive.org/release-group/${esc(r.mbid)}/front-250`;
+  }
+
   return `
     <div class="release-item ${r.notified === 0 ? "unseen" : ""}" data-id="${esc(r.id)}" data-mbid="${esc(r.mbid)}">
       <div class="release-card" ${cardClick}>
         <img class="release-cover"
-             src="https://coverartarchive.org/release-group/${esc(r.mbid)}/front-250"
+             src="${coverUrl}"
              alt="" loading="lazy"
              onerror="this.onerror=null;this.classList.add('no-cover');this.src='/static/icon.svg'">
         <div class="release-info">
-          <div class="release-title">${esc(r.title)}</div>
+          <div class="release-title">${esc(r.title)} ${sourceBadge}</div>
           <div class="release-artist">${artistLink}</div>
           <div class="release-meta">
             ${esc(r.release_type)} · ${esc(r.release_date || "Unknown date")}
@@ -136,7 +206,7 @@ function renderReleaseCard(r) {
           </div>
         </div>
         <div class="release-actions">
-          <a href="${esc(r.mb_url || `https://musicbrainz.org/release-group/${r.mbid}`)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">View ↗</a>
+          <a href="${esc(viewUrl)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">View ↗</a>
           ${r.notified === 0 ? `<span class="release-badge" onclick="event.stopPropagation();markSeen(${r.id}, this)">NEW</span>` : ""}
         </div>
       </div>
@@ -267,15 +337,30 @@ async function searchArtists() {
     if (results.length === 0) {
       searchResults.innerHTML = '<p class="status-msg">No artists found.</p>';
     } else {
-      searchResults.innerHTML = results.slice(0, 10).map(a => `
-        <div class="search-result-item">
-          <div class="result-info">
-            <div class="result-name">${esc(a.name)}</div>
-            <div class="result-detail">${[a.disambiguation, a.type, a.country].filter(Boolean).join(" · ")}</div>
+      searchResults.innerHTML = results.slice(0, 15).map(a => {
+        // Build source badges with external links BEFORE adding
+        let badges = '';
+        if (a.mbid && a.itunes_artist_id) {
+          badges = `<a class="source-badge mb ext-link" href="https://musicbrainz.org/artist/${esc(a.mbid)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">MB ↗</a> <a class="source-badge itunes ext-link" href="https://music.apple.com/artist/${esc(a.name.toLowerCase().replace(/[^a-z0-9]/g, ''))}/${esc(a.itunes_artist_id)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">iTunes ↗</a>`;
+        } else if (a.mbid) {
+          badges = `<a class="source-badge mb ext-link" href="https://musicbrainz.org/artist/${esc(a.mbid)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">MB ↗</a>`;
+        } else if (a.itunes_artist_id) {
+          badges = `<a class="source-badge itunes ext-link" href="https://music.apple.com/artist/${esc(a.name.toLowerCase().replace(/[^a-z0-9]/g, ''))}/${esc(a.itunes_artist_id)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">iTunes ↗</a>`;
+        }
+        
+        // Show already tracked indicator
+        const trackedMsg = a.already_tracked ? ' <span style="color:#888;font-size:0.75rem;">(already tracked)</span>' : '';
+        
+        return `
+          <div class="search-result-item">
+            <div class="result-info">
+              <div class="result-name">${esc(a.name)}${trackedMsg}</div>
+              <div class="result-detail">${[a.disambiguation, a.type, a.country].filter(Boolean).join(" · ")} · ${badges}</div>
+            </div>
+            <button class="add-btn" onclick='addArtist(${JSON.stringify(a).replace(/'/g, "&#39;")}, this)'>${a.already_tracked ? 'Link' : 'Add'}</button>
           </div>
-          <button class="add-btn" onclick='addArtist(${JSON.stringify(a).replace(/'/g, "&#39;")}, this)'>Add</button>
-        </div>
-      `).join("");
+        `;
+      }).join("");
     }
   } catch (err) {
     searchResults.innerHTML = `<p class="status-msg error">Search failed: ${esc(err.message)}</p>`;
@@ -289,29 +374,55 @@ async function addArtist(artist, btn) {
   btn.disabled = true;
   btn.textContent = "Adding...";
 
-  try {
-    const resp = await fetch("/api/artists", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        mbid: artist.mbid,
-        name: artist.name,
-        disambiguation: artist.disambiguation
-      })
-    });
-    const result = await resp.json();
-
-    if (result.status === "already_exists") {
-      btn.textContent = "Already added";
-    } else {
-      btn.textContent = `Added (${result.releases_imported} releases)`;
-    }
-
-    loadArtists();
-    // Dropdown fetches fresh data on open, no need to update eagerly
-  } catch {
-    btn.textContent = "Error";
+  // Determine which source to add based on available IDs
+  // If both mbid and itunes_artist_id exist, add both sequentially
+  const sourcesToAdd = [];
+  if (artist.mbid) {
+    sourcesToAdd.push({ source: "musicbrainz", id: artist.mbid });
   }
+  if (artist.itunes_artist_id) {
+    sourcesToAdd.push({ source: "itunes", id: String(artist.itunes_artist_id) });
+  }
+
+  // Default to the original source if neither is set (legacy)
+  if (sourcesToAdd.length === 0) {
+    sourcesToAdd.push({ source: artist.source, id: artist.mbid });
+  }
+
+  let totalReleases = 0;
+  let lastStatus = "";
+
+  for (const s of sourcesToAdd) {
+    try {
+      const resp = await fetch("/api/artists", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: s.source,
+          id: s.id,
+          name: artist.name,
+          disambiguation: artist.disambiguation
+        })
+      });
+      const result = await resp.json();
+      lastStatus = result.status;
+      totalReleases += result.releases_imported || 0;
+    } catch {
+      btn.textContent = "Error";
+      return;
+    }
+  }
+
+  if (lastStatus === "already_exists") {
+    btn.textContent = "Already added";
+  } else if (lastStatus === "linked") {
+    btn.textContent = `Linked (${totalReleases} releases)`;
+  } else {
+    btn.textContent = `Added (${totalReleases} releases)`;
+  }
+
+  loadArtists();
+  // Dropdown fetches fresh data on open, no need to update eagerly
 }
 
 async function loadArtists() {
@@ -321,16 +432,53 @@ async function loadArtists() {
   if (artists.length === 0) {
     artistListEl.innerHTML = '<p class="empty-state">No artists tracked yet.</p>';
   } else {
-    artistListEl.innerHTML = artists.map(a => `
-      <div class="artist-item">
-        <div>
-          <span class="artist-name">${esc(a.name)}</span>
-          ${a.disambiguation ? `<span class="artist-disambig"> — ${esc(a.disambiguation)}</span>` : ""}
-          ${a.mbid ? `<a class="mb-link mb-artist-link" href="https://musicbrainz.org/artist/${esc(a.mbid)}" target="_blank" rel="noopener">MB ↗</a>` : ""}
+    artistListEl.innerHTML = artists.map(a => {
+      const hasMb = !!a.mbid;
+      const hasItunes = !!a.itunes_artist_id;
+      
+      // Source badges/links (left cluster)
+      let sourceBadges = '';
+      if (hasMb) {
+        sourceBadges += `<a class="mb-link mb-artist-link" href="https://musicbrainz.org/artist/${esc(a.mbid)}" target="_blank" rel="noopener">MB ↗</a>`;
+      }
+      if (hasItunes) {
+        sourceBadges += `<a class="mb-link itunes-artist-link" href="https://music.apple.com/artist/${esc(a.name.toLowerCase().replace(/[^a-z0-9]/g, ''))}/${esc(a.itunes_artist_id)}" target="_blank" rel="noopener">iTunes ↗</a>`;
+      }
+      
+      // Link buttons (for missing sources)
+      let linkBtns = '';
+      if (!hasMb && hasItunes) {
+        linkBtns += `<button class="link-source-btn" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'musicbrainz')" title="Link MusicBrainz">Link MB</button>`;
+      } else if (!hasMb && !hasItunes) {
+        linkBtns += `<button class="link-source-btn" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'both')" title="Link MusicBrainz or iTunes">Link Source</button>`;
+      }
+      if (!hasItunes && hasMb) {
+        linkBtns += `<button class="link-source-btn" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'itunes')" title="Link iTunes">Link iTunes</button>`;
+      }
+      
+      // Unlink buttons
+      let unlinkBtns = '';
+      if (hasItunes) {
+        unlinkBtns += `<button class="unlink-btn" onclick="unlinkArtistItunes(${a.id}, this)" title="Unlink iTunes">Unlink iTunes</button>`;
+      }
+      if (hasMb) {
+        unlinkBtns += `<button class="unlink-btn" onclick="unlinkArtistMb(${a.id}, this)" title="Unlink MusicBrainz">Unlink MB</button>`;
+      }
+      
+      return `
+        <div class="artist-item">
+          <div class="artist-identity">
+            <span class="artist-name">${esc(a.name)}</span>
+            ${a.disambiguation ? `<span class="artist-disambig"> — ${esc(a.disambiguation)}</span>` : ""}
+          </div>
+          <div class="artist-actions">
+            <div class="artist-source-badges">${sourceBadges}</div>
+            <div class="artist-link-unlink-btns">${linkBtns}${unlinkBtns}</div>
+            <button class="remove-btn" onclick="removeArtist(${a.id}, this)">Remove</button>
+          </div>
         </div>
-        <button class="remove-btn" onclick="removeArtist(${a.id}, this)">Remove</button>
-      </div>
-    `).join("");
+      `;
+    }).join("");
   }
 }
 
@@ -340,6 +488,18 @@ async function removeArtist(id, btn) {
   loadArtists();
   // Dropdown will refresh itself when opened next time
   loadReleases();
+}
+
+async function unlinkArtistItunes(id, btn) {
+  btn.disabled = true;
+  await fetch(`/api/artists/${id}/unlink-itunes`, { method: "POST" });
+  loadArtists();
+}
+
+async function unlinkArtistMb(id, btn) {
+  btn.disabled = true;
+  await fetch(`/api/artists/${id}/unlink-mb`, { method: "POST" });
+  loadArtists();
 }
 
 // --- Check Now Popup ---
@@ -432,7 +592,16 @@ function runCheck(skip = 0) {
   scanRunning = true;
   currentSkip = skip;
 
-  checkBtn.textContent = "Checking...";
+  // Build URL with artist_id if a specific artist is selected
+  let url = `/api/check?skip=${skip}`;
+  if (activeArtistFilterId) {
+    url += `&artist_id=${activeArtistFilterId}`;
+    const name = _getArtistName(activeArtistFilterId);
+    checkBtn.textContent = name ? `Checking ${name}...` : "Checking...";
+  } else {
+    checkBtn.textContent = "Checking...";
+  }
+
   popupTitle.textContent = `Starting check…`;
 
   summaryBody.innerHTML = "";
@@ -442,7 +611,7 @@ function runCheck(skip = 0) {
   pauseBtn.textContent = "⏸ Pause";
   pauseBtn.classList.remove("resuming");
 
-  const source = new EventSource(`/api/check?skip=${skip}`);
+  const source = new EventSource(url);
   activeSource = source;
 
   // Compute total artists for progress bar (fetch once)
@@ -466,7 +635,7 @@ function runCheck(skip = 0) {
       source.close();
       activeSource = null;
       pauseBtn.classList.add("hidden");
-      checkBtn.textContent = "Check Now";
+      _updateCheckBtn();
       checkProgressText.textContent = data.message;
       checkProgressText.className = "check-progress-text error";
     } else if (data.type === "done") {
@@ -486,7 +655,9 @@ function runCheck(skip = 0) {
         }
       }
 
-      checkBtn.textContent = "Check Now";
+      // Update button text to reflect current filter state
+      _updateCheckBtn();
+      
       popupTitle.textContent = "Done!";
       checkProgressBar.style.width = "100%";
       checkProgressBar.classList.add("done");
@@ -514,7 +685,7 @@ function runCheck(skip = 0) {
       scanRunning = false;
       activeSource = null;
       pauseBtn.classList.add("hidden");
-      checkBtn.textContent = "Check Now";
+      _updateCheckBtn();
       popupTitle.textContent = "Error";
       checkProgressText.textContent = "Connection lost.";
       checkProgressText.className = "check-progress-text error";
@@ -670,6 +841,160 @@ logsContainer.addEventListener("scroll", () => {
   const atBottom = logsContainer.scrollHeight - logsContainer.scrollTop - logsContainer.clientHeight < 50;
   logsAutoScroll = atBottom;
 });
+
+// --- Link Source Modal ---
+const linkSourceModal = document.getElementById("link-source-modal");
+const linkSourceTitle = document.getElementById("link-source-title");
+const linkSourceInput = document.getElementById("link-source-input");
+const linkSourceSearchBtn = document.getElementById("link-source-search-btn");
+const linkSourceResults = document.getElementById("link-source-results");
+
+let currentLinkArtistId = null;
+let currentLinkSource = "";
+
+linkSourceSearchBtn.addEventListener("click", searchLinkSource);
+linkSourceInput.addEventListener("keydown", e => { if (e.key === "Enter") searchLinkSource(); });
+
+function openLinkSourceModal(artistId, artistName, source) {
+  currentLinkArtistId = artistId;
+  currentLinkSource = source;
+  
+  // Set title based on what source we're looking for
+  if (source === "musicbrainz") {
+    linkSourceTitle.textContent = `Link MusicBrainz for ${artistName}`;
+  } else if (source === "itunes") {
+    linkSourceTitle.textContent = `Link iTunes for ${artistName}`;
+  } else {
+    linkSourceTitle.textContent = `Link Source for ${artistName}`;
+  }
+  
+  // Hide search bar and show searching message
+  linkSourceInput.closest('.search-bar').style.display = 'none';
+  linkSourceResults.innerHTML = '<p class="status-msg">Searching...</p>';
+  linkSourceModal.classList.remove("hidden");
+  
+  // Auto-search with the artist name
+  searchLinkSource(artistName);
+}
+
+function closeLinkSourceModal() {
+  // Reset search bar visibility for next time
+  linkSourceInput.closest('.search-bar').style.display = '';
+  linkSourceModal.classList.add("hidden");
+  currentLinkArtistId = null;
+  currentLinkSource = "";
+}
+
+// Close modal when clicking outside
+linkSourceModal.addEventListener("click", (e) => {
+  if (e.target === linkSourceModal) {
+    closeLinkSourceModal();
+  }
+});
+
+async function searchLinkSource(query) {
+  query = query || linkSourceInput.value.trim();
+  if (!query) return;
+
+  try {
+    const resp = await fetch("/api/artists/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ 
+        query,
+        source: currentLinkSource === "musicbrainz" ? "musicbrainz" : 
+                currentLinkSource === "itunes" ? "itunes" : ""
+      })
+    });
+    const results = await resp.json();
+
+    if (results.length === 0) {
+      linkSourceResults.innerHTML = '<p class="status-msg">No artists found.</p>';
+    } else {
+      linkSourceResults.innerHTML = results.slice(0, 10).map(a => {
+        let badges = '';
+        if (a.mbid && a.itunes_artist_id) {
+          badges = `<a class="source-badge mb ext-link" href="https://musicbrainz.org/artist/${esc(a.mbid)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">MB ↗</a> <a class="source-badge itunes ext-link" href="https://music.apple.com/artist/${esc(a.name.toLowerCase().replace(/[^a-z0-9]/g, ''))}/${esc(a.itunes_artist_id)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">iTunes ↗</a>`;
+        } else if (a.mbid) {
+          badges = `<a class="source-badge mb ext-link" href="https://musicbrainz.org/artist/${esc(a.mbid)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">MB ↗</a>`;
+        } else if (a.itunes_artist_id) {
+          badges = `<a class="source-badge itunes ext-link" href="https://music.apple.com/artist/${esc(a.name.toLowerCase().replace(/[^a-z0-9]/g, ''))}/${esc(a.itunes_artist_id)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">iTunes ↗</a>`;
+        }
+        
+        return `
+          <div class="search-result-item">
+            <div class="result-info">
+              <div class="result-name">${esc(a.name)}</div>
+              <div class="result-detail">${[a.disambiguation, a.type, a.country].filter(Boolean).join(" · ")} · ${badges}</div>
+            </div>
+            <button class="add-btn" onclick='linkSource(${JSON.stringify(a).replace(/'/g, "&#39;")}, this)'>Link</button>
+          </div>
+        `;
+      }).join("");
+    }
+  } catch (err) {
+    linkSourceResults.innerHTML = `<p class="status-msg error">Search failed: ${esc(err.message)}</p>`;
+  }
+}
+
+async function linkSource(artist, btn) {
+  btn.disabled = true;
+  btn.textContent = "Linking...";
+
+  try {
+    // Determine which source to link
+    let sourceToLink = null;
+    let idToLink = null;
+
+    if (currentLinkSource === "musicbrainz" && artist.mbid) {
+      sourceToLink = "musicbrainz";
+      idToLink = artist.mbid;
+    } else if (currentLinkSource === "itunes" && artist.itunes_artist_id) {
+      sourceToLink = "itunes";
+      idToLink = String(artist.itunes_artist_id);
+    } else if (currentLinkSource === "both") {
+      // Link both if available
+      if (artist.mbid) {
+        sourceToLink = "musicbrainz";
+        idToLink = artist.mbid;
+      } else if (artist.itunes_artist_id) {
+        sourceToLink = "itunes";
+        idToLink = String(artist.itunes_artist_id);
+      }
+    }
+
+    if (!sourceToLink || !idToLink) {
+      btn.textContent = "No valid source";
+      return;
+    }
+
+    const resp = await fetch("/api/artists", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: sourceToLink,
+        id: idToLink,
+        name: artist.name,
+        disambiguation: artist.disambiguation
+      })
+    });
+    const result = await resp.json();
+
+    if (result.status === "already_exists") {
+      btn.textContent = "Already linked";
+    } else if (result.status === "linked") {
+      btn.textContent = `Linked (${result.releases_imported || 0} releases)`;
+    }
+
+    // Close modal and refresh artist list
+    setTimeout(() => {
+      closeLinkSourceModal();
+      loadArtists();
+    }, 1000);
+  } catch {
+    btn.textContent = "Error";
+  }
+}
 
 // --- Init ---
 loadReleases();

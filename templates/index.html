@@ -42,38 +42,38 @@
                     </div>
                 </div>
 
-                <!-- Release type: toggle chips -->
+                <!-- Release type: toggle chips (multi-select; none selected = all) -->
                 <div class="type-chips">
-                    <button type="button" class="chip active" data-type="" onclick="selectType(this)">All</button>
-                    <button type="button" class="chip" data-type="Album" onclick="selectType(this)">Albums</button>
-                    <button type="button" class="chip" data-type="EP" onclick="selectType(this)">EPs</button>
-                    <button type="button" class="chip" data-type="Single" onclick="selectType(this)">Singles</button>
+                    <button type="button" class="chip active" data-type="Album" onclick="toggleType(this)">Albums</button>
+                    <button type="button" class="chip active" data-type="EP" onclick="toggleType(this)">EPs</button>
+                    <button type="button" class="chip active" data-type="Single" onclick="toggleType(this)">Singles</button>
+                    <button type="button" class="chip active" data-type="Other" onclick="toggleType(this)">Others</button>
                 </div>
 
                 <label class="checkbox-label"><input type="checkbox" id="filter-unseen"> New only</label>
                 <button id="markallasseen" class="check-btn">Mark All as Seen</button>
-                <button id="check-btn" class="check-btn check-now-btn">Check Now</button>
-            </div>
+                <button id="check-btn" class="check-btn check-now-btn">Check All Artists</button>
 
-            <!-- Popup panel (appears when clicking Check Now) -->
-            <div id="check-popup" class="check-popup hidden">
-                <div class="popup-header">
-                    <span id="popup-title">Checking for new releases...</span>
-                    <button class="popup-close-btn" onclick="closeCheckPopup()">✕</button>
-                </div>
+                <!-- Popup panel (appears when clicking Check Now) -->
+                <div id="check-popup" class="check-popup hidden">
+                    <div class="popup-header">
+                        <span id="popup-title">Checking for new releases...</span>
+                        <button class="popup-close-btn" onclick="closeCheckPopup()">✕</button>
+                    </div>
 
-                <!-- Progress bar -->
-                <div class="progress-bar-track">
-                    <div id="check-progress-bar" class="progress-bar-fill"></div>
-                </div>
-                <span id="check-progress-text" class="check-progress-text">Idle</span>
+                    <!-- Progress bar -->
+                    <div class="progress-bar-track">
+                        <div id="check-progress-bar" class="progress-bar-fill"></div>
+                    </div>
+                    <span id="check-progress-text" class="check-progress-text">Idle</span>
 
-                <!-- Pause/Resume button -->
-                <button id="pause-btn" class="pause-btn hidden" onclick="togglePauseCheck()">⏸ Pause</button>
+                    <!-- Pause/Resume button -->
+                    <button id="pause-btn" class="pause-btn hidden" onclick="togglePauseCheck()">⏸ Pause</button>
 
-                <!-- Results -->
-                <div id="summary-body" class="popup-results hidden">
-                    <h3>New Releases Found</h3>
+                    <!-- Results -->
+                    <div id="summary-body" class="popup-results hidden">
+                        <h3>New Releases Found</h3>
+                    </div>
                 </div>
             </div>
 
@@ -85,7 +85,7 @@
         <!-- Artists Tab -->
         <section id="tab-artists" class="tab-content">
             <div class="search-bar">
-                <input type="text" id="artist-search-input" placeholder="Search for an artist...">
+                <input type="text" id="artist-search-input" placeholder="Search Musicbrainz & iTunes or manually paste link">
                 <button id="artist-search-btn">Search</button>
             </div>
             <div id="search-results" class="search-results"></div>
@@ -100,6 +100,23 @@
             </div>
         </section>
     </main>
+
+    <!-- Link Source Modal -->
+    <div id="link-source-modal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="link-source-title">Link Missing Source</h3>
+                <button class="popup-close-btn" onclick="closeLinkSourceModal()">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="search-bar">
+                    <input type="text" id="link-source-input" placeholder="Search for artist...">
+                    <button id="link-source-search-btn">Search</button>
+                </div>
+                <div id="link-source-results" class="search-results"></div>
+            </div>
+        </div>
+    </div>
 
     <script src="/static/app.js"></script>
 </body>

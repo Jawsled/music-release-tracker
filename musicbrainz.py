@@ -163,12 +163,16 @@ async def get_release_tracks(rg_id: str) -> list[dict]:
 
 
 async def get_artist_releases(mbid: str) -> list[dict]:
-    """Fetch official album and EP release groups for an artist.
+    """Fetch all official release groups for an artist.
 
     Uses the /release endpoint with status=official and inc=release-groups,
     then deduplicates by release group ID. This filters out bootlegs and
     unofficial releases that the /release-group endpoint cannot distinguish.
     Also fetches the URL to the release-group page from MusicBrainz.
+
+    Fetches all primary release types (Album, EP, Single, Broadcast, Other) to match
+    everything on the artist's releases page. Recordings are excluded as they are
+    individual tracks rather than commercial releases.
     """
     seen_rg_ids = set()
     all_releases = []
@@ -180,7 +184,7 @@ async def get_artist_releases(mbid: str) -> list[dict]:
             f"{BASE_URL}/release",
             params={
                 "artist": mbid,
-                "type": "album|ep",
+                "type": "album|ep|single|broadcast|other",
                 "status": "official",
                 "inc": "release-groups",
                 "fmt": "json",
@@ -197,16 +201,23 @@ async def get_artist_releases(mbid: str) -> list[dict]:
             seen_rg_ids.add(rg_id)
 
             primary_type = rg.get("primary-type", "")
-            if primary_type not in ("Album", "EP"):
+            if primary_type not in ("Album", "EP", "Single", "Broadcast", "Other"):
                 continue
-            if rg.get("secondary-types"):
-                continue
+            # Normalize Broadcast/Other into "Other" category for UI
+            if primary_type not in ("Album", "EP", "Single"):
+                primary_type = "Other"
+
+            # Use the official release's date instead of release-group's first-release-date
+            # to avoid bootleg/unofficial dates polluting the data
+            release_date = release.get("date", "")
+            if not release_date:
+                release_date = rg.get("first-release-date", "")
 
             all_releases.append({
                 "mbid": rg_id,
                 "title": rg.get("title", ""),
                 "type": primary_type,
-                "date": rg.get("first-release-date", ""),
+                "date": release_date,
                 "url": f"https://musicbrainz.org/release-group/{rg_id}",
                 "artist_mbid": mbid,  # Store artist MBID for linking
             })
