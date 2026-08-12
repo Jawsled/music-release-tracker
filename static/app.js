@@ -320,6 +320,19 @@ const artistListEl = document.getElementById("artist-list");
 searchBtn.addEventListener("click", searchArtists);
 searchInput.addEventListener("keydown", e => { if (e.key === "Enter") searchArtists(); });
 
+// Reactive search: clear results when input is empty, debounce search when typing
+let _searchTimeout = null;
+searchInput.addEventListener("input", () => {
+  const query = searchInput.value.trim();
+  clearTimeout(_searchTimeout);
+  if (!query) {
+    searchResults.innerHTML = "";
+    return;
+  }
+  // Debounce: wait 400ms after typing stops before searching
+  _searchTimeout = setTimeout(searchArtists, 400);
+});
+
 async function searchArtists() {
   const query = searchInput.value.trim();
   if (!query) return;
