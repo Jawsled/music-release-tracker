@@ -57,7 +57,7 @@ When you first add an artist, all their existing releases are imported as "alrea
 the release title from the same artist.
 - **New only checkbox:** self explanatory. Newly added tracks will be marked with `NEW` badge unless individually dismissed by clicking on said badgeds, or using `Mark all as seen` button. The "new" in this case has nothing to do with release dates. It is about if a release is newly added to the db.
 - **Tracklist:** Uses Musicbrainz and iTunes API to fetch tracklist for anything other than Singles.
-- ** SINGLE badge:** The check is purely local. It looks for matching track titles from same artist's single releases.
+- **SINGLE badge:** The check is purely local. It looks for matching track titles from same artist's single releases.
 
 ## Known issues
 
