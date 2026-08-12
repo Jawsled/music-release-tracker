@@ -82,8 +82,11 @@ async def search_artist(query: str, country: str = "us") -> list[dict]:
 
     results = []
     for a in data.get("results", []):
-        # iTunes doesn't consistently return a separate score field in a stable way,
-        # but it often includes 'score' for search ranking.
+        # Get artist image URL (iTunes provides 100x100, downscale to 50x50 for search results)
+        artist_image = a.get("artistImageUrl", "")
+        if artist_image:
+            artist_image = artist_image.replace("w100h100", "w50h50").replace("100x100", "50x50")
+
         results.append(
             {
                 "artistId": a.get("artistId"),
@@ -91,6 +94,7 @@ async def search_artist(query: str, country: str = "us") -> list[dict]:
                 "disambiguation": a.get("primaryGenreName", ""),
                 "country": country,
                 "score": a.get("score", 0),
+                "artistImageUrl": artist_image,
             }
         )
     return results
@@ -123,7 +127,7 @@ async def get_artist_releases(
         LOOKUP_URL,
         params={
             "id": artist_id,
-            "entity": "album",
+                        "entity": "album",
             "country": country,
         },
     )
@@ -133,6 +137,10 @@ async def get_artist_releases(
     out: list[dict] = []
 
     for r in results_list:
+        # Filter to only releases where this artist is the primary artist
+        # (Lookup API can return albums where artist is a contributor/featured)
+        if r.get("artistId") != artist_id:
+            continue
         collection_id = r.get("collectionId")
         if not collection_id or collection_id in seen_collection_ids:
             continue

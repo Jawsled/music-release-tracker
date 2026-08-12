@@ -69,6 +69,7 @@ function toggleArtistDropdown() {
     renderArtistDropdown();
     artistDropdownMenu.classList.remove("hidden");
     artistFilterSearch.value = "";
+    artistFilterSearch.focus();
     filterArtistBtn.style.borderColor = "#8c8c8c";
   } else {
     closeArtistDropdown();
@@ -334,7 +335,7 @@ async function searchArtists() {
     });
     const results = await resp.json();
 
-    if (results.length === 0) {
+        if (results.length === 0) {
       searchResults.innerHTML = '<p class="status-msg">No artists found.</p>';
     } else {
       searchResults.innerHTML = results.slice(0, 15).map(a => {
@@ -351,11 +352,20 @@ async function searchArtists() {
         // Show already tracked indicator
         const trackedMsg = a.already_tracked ? ' <span style="color:#888;font-size:0.75rem;">(already tracked)</span>' : '';
         
+        // Artist image (from iTunes artistImageUrl or MusicBrainz)
+        const artistImage = a.artistImageUrl || '';
+        const imageHtml = artistImage
+          ? `<img class="result-image" src="${esc(artistImage)}" alt="" onerror="this.style.display='none'">`
+          : '';
+        
         return `
           <div class="search-result-item">
             <div class="result-info">
-              <div class="result-name">${esc(a.name)}${trackedMsg}</div>
-              <div class="result-detail">${[a.disambiguation, a.type, a.country].filter(Boolean).join(" · ")} · ${badges}</div>
+              ${imageHtml}
+              <div class="result-text">
+                <div class="result-name">${esc(a.name)}${trackedMsg}</div>
+                <div class="result-detail">${[a.disambiguation, a.type, a.country].filter(Boolean).join(" · ")} · ${badges}</div>
+              </div>
             </div>
             <button class="add-btn" onclick='addArtist(${JSON.stringify(a).replace(/'/g, "&#39;")}, this)'>${a.already_tracked ? 'Link' : 'Add'}</button>
           </div>
@@ -492,14 +502,26 @@ async function removeArtist(id, btn) {
 
 async function unlinkArtistItunes(id, btn) {
   btn.disabled = true;
+  const confirmed = confirm("Unlink iTunes for this artist?\n\nThis will also remove all iTunes releases for this artist from the feed.");
+  if (!confirmed) {
+    btn.disabled = false;
+    return;
+  }
   await fetch(`/api/artists/${id}/unlink-itunes`, { method: "POST" });
   loadArtists();
+  loadReleases();
 }
 
 async function unlinkArtistMb(id, btn) {
   btn.disabled = true;
+  const confirmed = confirm("Unlink MusicBrainz for this artist?\n\nThis will also remove all MusicBrainz releases for this artist from the feed.");
+  if (!confirmed) {
+    btn.disabled = false;
+    return;
+  }
   await fetch(`/api/artists/${id}/unlink-mb`, { method: "POST" });
   loadArtists();
+  loadReleases();
 }
 
 // --- Check Now Popup ---

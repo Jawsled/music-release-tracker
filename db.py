@@ -169,9 +169,15 @@ def link_artist(artist_id: int, mbid: str, itunes_artist_id: int | None) -> dict
 
 
 def unlink_artist_itunes(artist_id: int) -> dict:
-    """Remove iTunes ID from an artist entry."""
+    """Remove iTunes ID from an artist entry and delete associated iTunes releases."""
     conn = get_db()
     try:
+        # Delete all iTunes releases for this artist
+        conn.execute(
+            "DELETE FROM releases WHERE artist_id = ? AND source = 'itunes'",
+            (artist_id,),
+        )
+        # Clear the iTunes ID
         conn.execute(
             "UPDATE artists SET itunes_artist_id = NULL WHERE id = ?",
             (artist_id,),
@@ -184,9 +190,15 @@ def unlink_artist_itunes(artist_id: int) -> dict:
 
 
 def unlink_artist_mb(artist_id: int) -> dict:
-    """Remove MusicBrainz ID from an artist entry."""
+    """Remove MusicBrainz ID from an artist entry and delete associated MB releases."""
     conn = get_db()
     try:
+        # Delete all MusicBrainz releases for this artist
+        conn.execute(
+            "DELETE FROM releases WHERE artist_id = ? AND source = 'musicbrainz'",
+            (artist_id,),
+        )
+        # Clear the MB ID
         conn.execute(
             "UPDATE artists SET mbid = NULL WHERE id = ?",
             (artist_id,),

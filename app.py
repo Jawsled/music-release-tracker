@@ -202,7 +202,7 @@ async def search_artists(body: ArtistSearchRequest):
     elif body.source == "musicbrainz":
         return await _search_mb()
     else:
-        # Search both in parallel
+                # Search both in parallel
         mb_results, it_results = await asyncio.gather(_search_mb(), _search_itunes())
 
         # Build lookup maps by normalized name
@@ -228,6 +228,7 @@ async def search_artists(body: ArtistSearchRequest):
                 "country": r.get("country", ""),
                 "score": r.get("score", 0),
                 "source": "musicbrainz",
+                "artistImageUrl": "",
             }
 
         for key, r in it_by_name.items():
@@ -238,6 +239,9 @@ async def search_artists(body: ArtistSearchRequest):
                 # Preserve iTunes country if not already set
                 if not merged[key].get("country") and r.get("country"):
                     merged[key]["country"] = r["country"]
+                # Use iTunes image if available
+                if r.get("artistImageUrl"):
+                    merged[key]["artistImageUrl"] = r["artistImageUrl"]
             else:
                 merged[key] = {
                     "name": r["name"],
@@ -248,6 +252,7 @@ async def search_artists(body: ArtistSearchRequest):
                     "country": r.get("country", ""),
                     "score": r.get("score", 0),
                     "source": "itunes",
+                    "artistImageUrl": r.get("artistImageUrl", ""),
                 }
 
         # Add already_tracked info for UI
