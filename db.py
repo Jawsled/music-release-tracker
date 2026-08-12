@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 
-DB_PATH = "data/releases.db"
+DB_PATH = "music-release-tracker.db"
 
 
 def get_db() -> sqlite3.Connection:
