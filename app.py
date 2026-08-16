@@ -603,6 +603,25 @@ async def get_release_tracks(release_id: str):
     return {"mbid": release_id, "tracks": result_tracks}
 
 
+@app.get("/api/releases/{release_id}/streaming")
+async def get_release_streaming(release_id: str):
+    """Fetch and return external streaming URLs for a release.
+
+    Streaming links only exist in MusicBrainz's url-rels, so iTunes-sourced
+    releases simply return an empty list (the UI hides the section then).
+    """
+    release = db.get_release_by_id(release_id)
+    if not release:
+        return {"mbid": release_id, "streaming": []}
+
+    source = release.get("source", "musicbrainz")
+    if source == "itunes":
+        return {"mbid": release_id, "streaming": []}
+
+    streaming = await musicbrainz.get_release_streaming_urls(release_id)
+    return {"mbid": release_id, "streaming": streaming}
+
+
 def _titles_match(a: str, b: str) -> bool:
     """Heuristic title matcher ignoring common suffixes/prefixes."""
     # Strip common non-essential parts for comparison

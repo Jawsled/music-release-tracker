@@ -70,6 +70,11 @@ main { max-width: 800px; margin: 0 auto; padding: 1.5rem; }
 .release-actions a { color: #888; text-decoration: none; font-size: 0.82rem; transition: color 0.2s; }
 .release-actions a:hover { color: #ccc; }
 .release-meta { color: #888; font-size: 0.82rem; margin-top: 0.25rem; display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+.hint-group { display: flex; align-items: center; gap: 0.3rem; margin-left: auto; }
+.tracks-hint { color: #888; font-size: 0.75rem; cursor: pointer; }
+.tracks-hint:hover { color: #c0c0c0; }
+.stream-hint { color: #888; font-size: 0.75rem; cursor: pointer; }
+.stream-hint:hover { color: #c0c0c0; }
 .release-actions { display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0; }
 
 /* Integrated tracklist section */
@@ -86,6 +91,39 @@ main { max-width: 800px; margin: 0 auto; padding: 1.5rem; }
 .track-title-text { flex: 1; color: #b4b4b4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 0.4rem; min-width: 0; }
 .single-badge { display: inline-block; background: #555; color: #ccc; font-size: 0.65rem; font-weight: 700; padding: 0.1rem 0.35rem; border-radius: 3px; letter-spacing: 0.04em; flex-shrink: 0; }
 .track-length { color: #666; font-size: 0.78rem; flex-shrink: 0; min-width: 2.5rem; text-align: right; }
+
+/* Streaming links section (dedicated, separate from tracklist) */
+.streaming-section { border-top: 1px solid rgba(255,255,255,0.08); max-height: 0; overflow: hidden; transition: max-height 0.3s ease-out; }
+.streaming-section.expanded { max-height: 9999px; }
+.streaming-header { padding: 0.6rem 1rem; display: flex; justify-content: space-between; align-items: center; background: rgba(255,255,255,0.03); position: sticky; top: 0; z-index: 1; }
+.streaming-list { padding: 0.4rem 1rem 0.75rem; display: flex; flex-wrap: wrap; gap: 0.4rem; }
+
+.stream-link { display: inline-flex; align-items: center; gap: 0.4rem; background: #2a2a2a; color: #c8c8c8; text-decoration: none; font-size: 0.78rem; font-weight: 600; padding: 0.35rem 0.7rem; border-radius: 6px; white-space: nowrap; transition: background 0.2s, color 0.2s, transform 0.1s; }
+.stream-link:hover { transform: translateY(-1px); }
+.stream-icon { width: 18px; height: 18px; flex-shrink: 0; filter: brightness(0) invert(1); opacity: 0.85; }
+.stream-label { line-height: 1; }
+
+/* Per-service brand colors */
+.stream-spotify       { background: rgba(29,185,84,0.12);  color: #1DB954; border: 1px solid rgba(29,185,84,0.30); }
+.stream-spotify:hover { background: rgba(29,185,84,0.22); }
+.stream-apple_music   { background: rgba(249,66,93,0.12);  color: #F9425D; border: 1px solid rgba(249,66,93,0.30); }
+.stream-apple_music:hover { background: rgba(249,66,93,0.22); }
+.stream-amazon_music  { background: rgba(38,150,209,0.12); color: #2696D1; border: 1px solid rgba(38,150,209,0.30); }
+.stream-amazon_music:hover { background: rgba(38,150,209,0.22); }
+.stream-deezer        { background: rgba(172,65,255,0.12); color: #AC41FF; border: 1px solid rgba(172,65,255,0.30); }
+.stream-deezer:hover  { background: rgba(172,65,255,0.22); }
+.stream-tidal         { background: rgba(91,85,163,0.18);  color: #7B75B3; border: 1px solid rgba(91,85,163,0.40); }
+.stream-tidal:hover   { background: rgba(91,85,163,0.30); }
+.stream-soundcloud    { background: rgba(252,61,10,0.12);  color: #FC3D0A; border: 1px solid rgba(252,61,10,0.30); }
+.stream-soundcloud:hover { background: rgba(252,61,10,0.22); }
+.stream-qobuz         { background: rgba(0,112,239,0.12);  color: #0070EF; border: 1px solid rgba(0,112,239,0.30); }
+.stream-qobuz:hover   { background: rgba(0,112,239,0.22); }
+.stream-youtube       { background: rgba(255,0,0,0.12);    color: #FF0000; border: 1px solid rgba(255,0,0,0.30); }
+.stream-youtube:hover { background: rgba(255,0,0,0.22); }
+
+/* Stream toggle button in release actions */
+.stream-btn { background: transparent; color: #6a8a7a; border: 1px solid #6a8a7a; padding: 0.2rem 0.55rem; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: 600; transition: all 0.2s; white-space: nowrap; }
+.stream-btn:hover { background: #6a8a7a; color: #1a1a1a; }
 
 /* Links */
 .mb-link { display: inline-flex; align-items: center; gap: 0.25rem; background: #2a2a2a; color: #b8b8b8; text-decoration: none; font-size: 0.78rem; font-weight: 600; padding: 0.35rem 0.65rem; border-radius: 6px; white-space: nowrap; transition: background 0.2s, color 0.2s, transform 0.1s; }
@@ -134,11 +172,13 @@ main { max-width: 800px; margin: 0 auto; padding: 1.5rem; }
 .artist-item .artist-source-badges { display: inline-flex; align-items: center; gap: 0.3rem; flex-shrink: 0; }
 .artist-item .artist-link-unlink-btns { display: inline-flex; align-items: center; gap: 0.3rem; margin-left: 0.5rem; flex-shrink: 0; }
 
-.remove-btn { background: transparent; color: #9a6a6a; border: 1px solid #9a6a6a; padding: 0.3rem 0.7rem; border-radius: 5px; cursor: pointer; font-size: 0.8rem; transition: all 0.2s; }
+.remove-btn { background: transparent; color: #9a6a6a; padding: 0.3rem; border-radius: 5px; cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; justify-content: center; line-height: 1; border: none; }
 .remove-btn:hover { background: #9a6a6a; color: #1a1a1a; }
+.remove-btn svg { display: block; }
 
-.unlink-btn { background: transparent; color: #c4a86a; border: 1px solid #c4a86a; padding: 0.3rem 0.6rem; border-radius: 5px; cursor: pointer; font-size: 0.75rem; transition: all 0.2s; margin-right: 0.3rem; }
+.unlink-btn { background: transparent; color: #c4a86a; border: 1px solid #c4a86a; padding: 0.3rem 0.5rem; border-radius: 5px; cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; justify-content: center; line-height: 1; gap: 0.3rem; }
 .unlink-btn:hover { background: #c4a86a; color: #1a1a1a; }
+.unlink-btn svg { display: block; }
 
 .artist-actions { display: flex; align-items: center; gap: 0.3rem; }
 
@@ -328,22 +368,9 @@ main { max-width: 800px; margin: 0 auto; padding: 1.5rem; }
     padding: 1rem 1.2rem;
 }
 
-.link-source-btn {
-    background: transparent;
-    color: #6a8a7a;
-    border: 1px solid #6a8a7a;
-    padding: 0.3rem 0.6rem;
-    border-radius: 5px;
-    cursor: pointer;
-    font-size: 0.75rem;
-    transition: all 0.2s;
-    margin-right: 0.3rem;
-}
-
-.link-source-btn:hover {
-    background: #6a8a7a;
-    color: #1a1a1a;
-}
+.link-source-btn { background: transparent; color: #6a8a7a; border: 1px solid #6a8a7a; padding: 0.3rem 0.5rem; border-radius: 5px; cursor: pointer; transition: all 0.2s; display: inline-flex; align-items: center; justify-content: center; line-height: 1; gap: 0.3rem; }
+.link-source-btn:hover { background: #6a8a7a; color: #1a1a1a; }
+.link-source-btn svg { display: block; }
 
 /* Misc */
 h2 { font-size: 1rem; color: #aaa; margin-bottom: 0.75rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }

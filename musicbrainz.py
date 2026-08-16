@@ -162,6 +162,176 @@ async def get_release_tracks(rg_id: str) -> list[dict]:
     return all_tracks
 
 
+
+
+# ---------------------------------------------------------------------------
+# Streaming / external URL relationships
+# ---------------------------------------------------------------------------
+
+# Keyword-based mapping of MusicBrainz URL-relationship types to friendly
+# streaming-service names. Matching on substrings keeps this robust across
+# MB's varied naming ("Spotify Track", "Spotify Artist", etc.).
+# Order matters: more specific keywords first so a compound name resolves
+# to the intended service.
+STREAMING_SERVICE_KEYWORDS = [
+    ("apple music", "Apple Music",  "apple_music"),
+    ("spotify",     "Spotify",      "spotify"),
+    ("amazon",      "Amazon Music", "amazon_music"),
+    ("deezer",      "Deezer",       "deezer"),
+    ("tidal",       "Tidal",        "tidal"),
+    ("soundcloud",  "SoundCloud",   "soundcloud"),
+    ("qobuz",       "Qobuz",        "qobuz"),
+    ("bandcamp",    "Bandcamp",     "bandcamp"),
+    ("youtube",     "YouTube",      "youtube"),
+]
+
+# Generic relationship types that indicate streaming but don't name the
+# specific service. When we see one of these we must look at the URL domain
+# to determine which service it belongs to.
+GENERIC_STREAMING_TYPES = {"streaming", "free streaming", "streaming (free)"}
+
+# URL domain -> service mapping, used when the relationship type is generic.
+# Each entry: (domain_substring, display_name, css_key)
+STREAMING_URL_PATTERNS = [
+    ("open.spotify.com",   "Spotify",      "spotify"),
+    ("spotify.com",        "Spotify",      "spotify"),
+    ("spotify.link",       "Spotify",      "spotify"),
+    ("music.apple.com",    "Apple Music",  "apple_music"),
+    ("itunes.apple.com",   "Apple Music",  "apple_music"),
+    ("music.amazon.com",   "Amazon Music", "amazon_music"),
+    ("amazon.com",         "Amazon Music", "amazon_music"),
+    ("deezer.com",         "Deezer",       "deezer"),
+    ("tidal.com",          "Tidal",        "tidal"),
+    ("soundcloud.com",     "SoundCloud",   "soundcloud"),
+    ("qobuz.com",          "Qobuz",        "qobuz"),
+    ("bandcamp.com",       "Bandcamp",     "bandcamp"),
+    ("youtube.com",        "YouTube",      "youtube"),
+    ("youtu.be",           "YouTube",      "youtube"),
+]
+
+
+def _classify_streaming_service(type_str: str, url: str = "") -> dict | None:
+    """Return {"service": label, "key": css_key} if the URL-relation is a
+    known streaming service, else None.
+
+    First tries to match on the relationship type string (e.g. "Spotify Track").
+    If the type is generic (e.g. "streaming", "free streaming"), falls back to
+    matching on the URL domain (e.g. "open.spotify.com" -> Spotify).
+    """
+    t = (type_str or "").lower()
+
+    # Direct keyword match on the relationship type
+    for kw, label, key in STREAMING_SERVICE_KEYWORDS:
+        if kw in t:
+            return {"service": label, "key": key}
+
+    # Generic streaming type -> classify by URL domain
+    if t in GENERIC_STREAMING_TYPES and url:
+        u = url.lower()
+        for domain, label, key in STREAMING_URL_PATTERNS:
+            if domain in u:
+                return {"service": label, "key": key}
+
+    return None
+
+
+async def get_release_streaming_urls(rg_id: str) -> list[dict]:
+    """Fetch external streaming URLs for a release group.
+
+    A release group can contain MANY concrete releases (e.g. Midnights has 86),
+    and MusicBrainz's /release endpoint only returns the first 25 by default.
+    Streaming links are often attached to releases beyond that window, so we
+    paginate with limit=100 and walk every release, collecting each one's URL
+    relationships (inc=url-rels). Only known streaming-service relationships
+    are kept, deduplicated by service key (one link per service).
+
+    To prefer the "standard" edition (e.g. "Midnights" over "Midnights (Til Dawn edition)"),
+    we first identify the most common release title across all releases in the group,
+    then collect streaming URLs in two passes:
+    1. Standard edition releases first (preferred links)
+    2. Remaining releases as fallback for any missing services
+
+    Returns [{"service": "Spotify", "key": "spotify", "url": "..."}, ...].
+    """
+    limit = 100
+    offset = 0
+    max_pages = 10  # safety cap: 1000 releases is far beyond any real group
+
+    # Collect ALL releases with their streaming URLs
+    all_releases: list[dict] = []
+    for _ in range(max_pages):
+        data = await _rate_limited_get(
+            f"{BASE_URL}/release",
+            params={
+                "release-group": rg_id,
+                "inc": "url-rels",
+                "fmt": "json",
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+
+        releases = data.get("releases") or []
+        if not releases:
+            break
+
+        all_releases.extend(releases)
+
+        total = data.get("release-count", 0)
+        offset += limit
+        if offset >= total:
+            break
+
+    if not all_releases:
+        return []
+
+    # Identify the standard edition: most common release title
+    title_counts: dict[str, int] = {}
+    for release in all_releases:
+        title = release.get("title", "")
+        title_counts[title] = title_counts.get(title, 0) + 1
+
+    # The standard edition title is the one that appears most frequently
+    standard_title = max(title_counts, key=title_counts.get)
+
+    # Separate releases into standard edition and others
+    standard_releases = [r for r in all_releases if r.get("title") == standard_title]
+    other_releases = [r for r in all_releases if r.get("title") != standard_title]
+
+    # Collect streaming URLs, deduplicating by service key
+    seen_keys: set[str] = set()
+    out: list[dict] = []
+
+    def process_releases(releases: list[dict]):
+        for release in releases:
+            for url_rel in release.get("relations") or []:
+                if url_rel.get("target-type") != "url":
+                    continue
+
+                url_obj = url_rel.get("url") or {}
+                value = url_obj.get("resource", "")
+                if not value:
+                    continue
+
+                mapping = _classify_streaming_service(url_rel.get("type", ""), value)
+                if not mapping:
+                    continue
+
+                key = mapping["key"]
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                out.append({**mapping, "url": value})
+
+    # Pass 1: standard edition (preferred)
+    process_releases(standard_releases)
+
+    # Pass 2: other releases (fallback for missing services)
+    process_releases(other_releases)
+
+    return out
+
+
 async def get_artist_releases(mbid: str) -> list[dict]:
     """Fetch all official release groups for an artist.
 

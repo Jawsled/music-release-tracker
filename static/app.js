@@ -191,8 +191,14 @@ function renderReleaseCard(r) {
     coverUrl = `https://coverartarchive.org/release-group/${esc(r.mbid)}/front-250`;
   }
 
+    // Streaming links only exist for MusicBrainz-sourced releases.
+  const hasStreaming = source === "musicbrainz";
+  const streamHint = hasStreaming
+    ? '<span class="stream-hint" onclick="event.stopPropagation();toggleStreaming(this)">Stream ▾</span>'
+    : "";
+
   return `
-    <div class="release-item ${r.notified === 0 ? "unseen" : ""}" data-id="${esc(r.id)}" data-mbid="${esc(r.mbid)}">
+    <div class="release-item ${r.notified === 0 ? "unseen" : ""}" data-id="${esc(r.id)}" data-mbid="${esc(r.mbid)}" data-source="${esc(source)}">
       <div class="release-card" ${cardClick}>
         <img class="release-cover"
              src="${coverUrl}"
@@ -201,9 +207,12 @@ function renderReleaseCard(r) {
         <div class="release-info">
           <div class="release-title">${esc(r.title)} ${sourceBadge}</div>
           <div class="release-artist">${artistLink}</div>
-          <div class="release-meta">
+                              <div class="release-meta">
             ${esc(r.release_type)} · ${esc(r.release_date || "Unknown date")}
-            ${hasTracklist ? '<span style="color:#666;font-size:0.75rem;margin-left:auto;">click for tracks ▾</span>' : ""}
+            <span class="hint-group">
+              ${hasTracklist ? '<span class="tracks-hint">Tracklist ▾</span>' : ""}
+              ${streamHint}
+            </span>
           </div>
         </div>
         <div class="release-actions">
@@ -212,12 +221,14 @@ function renderReleaseCard(r) {
         </div>
       </div>
       <div class="tracklist-section"></div>
+      ${hasStreaming ? '<div class="streaming-section"></div>' : ''}
     </div>
   `;
 }
 
 // --- Tracklist Toggle (integrated inline) ---
 const tracklistCache = {};
+const streamingCache = {};
 
 function toggleTracklist(cardEl) {
   const item = cardEl.closest(".release-item");
@@ -280,6 +291,91 @@ function renderTracklist(container, tracks) {
           <span class="track-length">${formatLength(t.length)}</span>
         </div>
       `).join("")}
+    </div>
+  `;
+}
+
+// --- Streaming URLs Toggle (dedicated section, separate from tracklist) ---
+function toggleStreaming(cardEl) {
+  const item = cardEl.closest(".release-item");
+  if (!item) return;
+  const section = item.querySelector(".streaming-section");
+  if (!section) return;
+
+  // Streaming links only exist for MusicBrainz-sourced releases.
+  const source = item.dataset.source || "musicbrainz";
+  if (source !== "musicbrainz") {
+    section.classList.remove("expanded");
+    return;
+  }
+
+  const releaseMbid = item.dataset.mbid;
+  const expanded = section.classList.contains("expanded");
+
+  if (expanded) {
+    section.classList.remove("expanded");
+    return;
+  }
+
+  // Check cache first
+  if (streamingCache[releaseMbid]) {
+    renderStreaming(section, streamingCache[releaseMbid]);
+    section.classList.add("expanded");
+    return;
+  }
+
+  section.classList.add("expanded");
+  section.innerHTML = '<p class="tracklist-loading">Loading streaming links...</p>';
+
+  fetch(`/api/releases/${encodeURIComponent(releaseMbid)}/streaming`)
+    .then(r => r.json())
+    .then(data => {
+      const streaming = data.streaming || [];
+      streamingCache[releaseMbid] = streaming;
+      renderStreaming(section, streaming);
+    })
+    .catch(() => {
+      section.innerHTML = '<p class="tracklist-error">Failed to load streaming links.</p>';
+    });
+}
+
+// --- Streaming service icon mapping ---
+const STREAMING_ICONS = {
+  spotify: "spotify.svg",
+  apple_music: "apple-music.svg",
+  amazon_music: "amazon-music.svg",
+  deezer: "deezer.svg",
+  tidal: "tidal.svg",
+  soundcloud: "soundcloud.svg",
+  qobuz: "qobuz.svg",
+  bandcamp: "bandcamp.svg",
+  youtube: "youtube.svg",
+};
+
+function renderStreaming(container, streaming) {
+  if (!streaming || streaming.length === 0) {
+    container.innerHTML = '<p class="tracklist-empty">No streaming links found for this release.</p>';
+    return;
+  }
+
+  container.innerHTML = `
+    <div class="streaming-header">
+      <span class="tracklist-title">Stream on</span>
+      <span class="tracklist-count">${streaming.length} link${streaming.length > 1 ? "s" : ""}</span>
+    </div>
+    <div class="streaming-list">
+      ${streaming.map(s => {
+        const icon = STREAMING_ICONS[s.key];
+        const iconHtml = icon
+          ? `<img class="stream-icon" src="/static/assets/${icon}" alt="${esc(s.service)}" loading="lazy">`
+          : "";
+        return `
+          <a class="stream-link stream-${esc(s.key)}" href="${esc(s.url)}" target="_blank" rel="noopener" title="${esc(s.service)}">
+            ${iconHtml}
+            <span class="stream-label">${esc(s.service)}</span>
+          </a>
+        `;
+      }).join("")}
     </div>
   `;
 }
@@ -468,25 +564,21 @@ async function loadArtists() {
         sourceBadges += `<a class="mb-link itunes-artist-link" href="https://music.apple.com/artist/${esc(a.name.toLowerCase().replace(/[^a-z0-9]/g, ''))}/${esc(a.itunes_artist_id)}" target="_blank" rel="noopener">iTunes ↗</a>`;
       }
       
-      // Link buttons (for missing sources)
-      let linkBtns = '';
-      if (!hasMb && hasItunes) {
-        linkBtns += `<button class="link-source-btn" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'musicbrainz')" title="Link MusicBrainz">Link MB</button>`;
-      } else if (!hasMb && !hasItunes) {
-        linkBtns += `<button class="link-source-btn" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'both')" title="Link MusicBrainz or iTunes">Link Source</button>`;
-      }
-      if (!hasItunes && hasMb) {
-        linkBtns += `<button class="link-source-btn" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'itunes')" title="Link iTunes">Link iTunes</button>`;
-      }
-      
-      // Unlink buttons
-      let unlinkBtns = '';
-      if (hasItunes) {
-        unlinkBtns += `<button class="unlink-btn" onclick="unlinkArtistItunes(${a.id}, this)" title="Unlink iTunes">Unlink iTunes</button>`;
-      }
-      if (hasMb) {
-        unlinkBtns += `<button class="unlink-btn" onclick="unlinkArtistMb(${a.id}, this)" title="Unlink MusicBrainz">Unlink MB</button>`;
-      }
+            // Build combined link/unlink buttons grouped by source: MB first, then iTunes
+            let linkUnlinkBtns = '';
+            if (hasMb) {
+              linkUnlinkBtns += `<button class="unlink-btn" onclick="unlinkArtistMb(${a.id}, this)" title="Unlink MusicBrainz"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="currentColor" d="m19.25 16.45l-1.5-1.55q1-.275 1.625-1.063T20 12q0-1.25-.875-2.125T17 9h-4V7h4q2.075 0 3.538 1.463T22 12q0 1.425-.737 2.625T19.25 16.45M15.85 13l-2-2H16v2zm3.95 9.6L1.4 4.2l1.4-1.4l18.4 18.4zM11 17H7q-2.075 0-3.537-1.463T2 12q0-1.725 1.05-3.075t2.7-1.775L7.6 9H7q-1.25 0-2.125.875T4 12t.875 2.125T7 15h4zm-3-4v-2h1.625l1.975 2z"/></svg>MB</button>`;
+            } else if (hasItunes) {
+              linkUnlinkBtns += `<button class="link-source-btn" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'musicbrainz')" title="Link MusicBrainz"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="currentColor" d="M17 20v-3h-3v-2h3v-3h2v3h3v2h-3v3zm-6-3H7q-2.075 0-3.537-1.463T2 12t1.463-3.537T7 7h4v2H7q-1.25 0-2.125.875T4 12t.875 2.125T7 15h4zm-3-4v-2h8v2zm14-1h-2q0-1.25-.875-2.125T17 9h-4V7h4q2.075 0 3.538 1.463T22 12"/></svg>MB</button>`;
+            } else {
+              linkUnlinkBtns += `<button class="link-source-btn" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'musicbrainz')" title="Link MusicBrainz"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="currentColor" d="M17 20v-3h-3v-2h3v-3h2v3h3v2h-3v3zm-6-3H7q-2.075 0-3.537-1.463T2 12t1.463-3.537T7 7h4v2H7q-1.25 0-2.125.875T4 12t.875 2.125T7 15h4zm-3-4v-2h8v2zm14-1h-2q0-1.25-.875-2.125T17 9h-4V7h4q2.075 0 3.538 1.463T22 12"/></svg>MB</button>`;
+              linkUnlinkBtns += `<button class="link-source-btn" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'itunes')" title="Link iTunes"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="currentColor" d="M17 20v-3h-3v-2h3v-3h2v3h3v2h-3v3zm-6-3H7q-2.075 0-3.537-1.463T2 12t1.463-3.537T7 7h4v2H7q-1.25 0-2.125.875T4 12t.875 2.125T7 15h4zm-3-4v-2h8v2zm14-1h-2q0-1.25-.875-2.125T17 9h-4V7h4q2.075 0 3.538 1.463T22 12"/></svg>iTunes</button>`;
+            }
+            if (hasItunes) {
+              linkUnlinkBtns += `<button class="unlink-btn" onclick="unlinkArtistItunes(${a.id}, this)" title="Unlink iTunes"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="currentColor" d="m19.25 16.45l-1.5-1.55q1-.275 1.625-1.063T20 12q0-1.25-.875-2.125T17 9h-4V7h4q2.075 0 3.538 1.463T22 12q0 1.425-.737 2.625T19.25 16.45M15.85 13l-2-2H16v2zm3.95 9.6L1.4 4.2l1.4-1.4l18.4 18.4zM11 17H7q-2.075 0-3.537-1.463T2 12q0-1.725 1.05-3.075t2.7-1.775L7.6 9H7q-1.25 0-2.125.875T4 12t.875 2.125T7 15h4zm-3-4v-2h1.625l1.975 2z"/></svg>iTunes</button>`;
+            } else if (hasMb) {
+              linkUnlinkBtns += `<button class="link-source-btn" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'itunes')" title="Link iTunes"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24"><path fill="currentColor" d="M17 20v-3h-3v-2h3v-3h2v3h3v2h-3v3zm-6-3H7q-2.075 0-3.537-1.463T2 12t1.463-3.537T7 7h4v2H7q-1.25 0-2.125.875T4 12t.875 2.125T7 15h4zm-3-4v-2h8v2zm14-1h-2q0-1.25-.875-2.125T17 9h-4V7h4q2.075 0 3.538 1.463T22 12"/></svg>iTunes</button>`;
+            }
       
       return `
         <div class="artist-item">
@@ -494,10 +586,12 @@ async function loadArtists() {
             <span class="artist-name">${esc(a.name)}</span>
             ${a.disambiguation ? `<span class="artist-disambig"> — ${esc(a.disambiguation)}</span>` : ""}
           </div>
-          <div class="artist-actions">
+                    <div class="artist-actions">
             <div class="artist-source-badges">${sourceBadges}</div>
-            <div class="artist-link-unlink-btns">${linkBtns}${unlinkBtns}</div>
-            <button class="remove-btn" onclick="removeArtist(${a.id}, this)">Remove</button>
+            <div class="artist-link-unlink-btns">${linkUnlinkBtns}</div>
+                        <button class="remove-btn" onclick="removeArtist(${a.id}, this)" title="Remove artist">
+                          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 11a1 1 0 1 0 0 2h8a1 1 0 1 0 0-2z"/><path fill-rule="evenodd" d="M23 12c0 6.075-4.925 11-11 11S1 18.075 1 12S5.925 1 12 1s11 4.925 11 11m-2 0a9 9 0 1 1-18 0a9 9 0 0 1 18 0" clip-rule="evenodd"/></svg>
+                        </button>
           </div>
         </div>
       `;

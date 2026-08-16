@@ -1,8 +1,6 @@
 @echo off
 powershell -NoProfile -WindowStyle Minimized -Command "Start-Sleep -Milliseconds 200"
 
-call %userprofile%\pinokio\bin\miniconda\Scripts\activate.bat
-call activate music-release-tracker
 cd %userprofile%\music-release-tracker
 call python run.py
 
