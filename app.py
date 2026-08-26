@@ -5,9 +5,9 @@ import json
 import logging
 import webbrowser
 from contextlib import asynccontextmanager
-from datetime import datetime
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,6 +17,7 @@ from pydantic import BaseModel
 import db
 import musicbrainz
 import itunes
+import logstore
 
 HOST = "127.0.0.1"
 PORT = 7070
@@ -25,27 +26,13 @@ PORT = 7070
 logger = logging.getLogger("music-release-tracker")
 logger.setLevel(logging.INFO)
 
-# In-memory log storage (circular buffer)
-_scan_logs: list[dict] = []
-MAX_LOG_ENTRIES = 500
+# Capture library-level logs (retries, timeouts, rate limits) into the UI log
+logstore.attach_handler("music-release-tracker")
 
 
 def _add_log(level: str, message: str, artist: str = "", detail: str = ""):
-    """Add a log entry to the in-memory log store."""
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "level": level,
-        "message": message,
-        "artist": artist,
-        "detail": detail,
-    }
-    _scan_logs.append(entry)
-    # Keep only the last MAX_LOG_ENTRIES entries
-    if len(_scan_logs) > MAX_LOG_ENTRIES:
-        _scan_logs.pop(0)
-    # Also write to console
-    log_method = getattr(logger, level.lower(), logger.info)
-    log_method(f"[{artist or 'SCAN'}] {message}" + (f" - {detail}" if detail else ""))
+    """Add a log entry to the shared UI log store (also mirrors to console)."""
+    logstore.add_log(level, message, artist=artist, detail=detail)
 
 
 @asynccontextmanager
@@ -359,6 +346,7 @@ async def add_artist(body: ArtistAddRequest):
                     notified=1,
                     source="musicbrainz",
                     mb_url=rel.get("url", ""),
+                    credits=json.dumps(rel.get("credits") or []),
                 )
                 if inserted:
                     count += 1
@@ -410,6 +398,7 @@ async def add_artist(body: ArtistAddRequest):
                 notified=1,
                 source="musicbrainz",
                 mb_url=rel.get("url", ""),
+                credits=json.dumps(rel.get("credits") or []),
             )
             if inserted:
                 count += 1
@@ -578,7 +567,9 @@ async def get_release_tracks(release_id: str):
         collection_id = release.get("itunes_collection_id") or release_id
         tracks = await itunes.get_release_tracks(int(collection_id))
     else:
-        tracks = await musicbrainz.get_release_tracks(release_id)
+        # Pass the tracked artist's MBID so their own credit is filtered out
+        # of per-track "feat." listings
+        tracks = await musicbrainz.get_release_tracks(release_id, main_mbid=release.get("artist_mbid") or "")
 
     # Find all single titles locally for this artist
     single_titles: set[str] = set()
@@ -640,11 +631,86 @@ def _titles_match(a: str, b: str) -> bool:
 
 # --- Check endpoint (SSE) ---
 
+def _artist_sources(artist: dict) -> list[str]:
+    """Sources configured for an artist ('musicbrainz', 'itunes' or both)."""
+    sources = []
+    if artist.get("mbid"):
+        sources.append("musicbrainz")
+    if artist.get("itunes_artist_id"):
+        sources.append("itunes")
+    # Default to musicbrainz if neither is set (legacy)
+    return sources or ["musicbrainz"]
+
+
+async def _fetch_artist_new_titles(artist: dict) -> list[str]:
+    """Fetch releases for one artist from every configured source.
+
+    Returns the titles of newly inserted releases. Raises on API/network
+    failure so callers can decide to skip/retry.
+    """
+    has_mb = bool(artist.get("mbid"))
+    has_itunes = bool(artist.get("itunes_artist_id"))
+
+    new_titles = []
+    for source in _artist_sources(artist):
+        if source == "musicbrainz" and has_mb:
+            releases = await musicbrainz.get_artist_releases(artist["mbid"])
+            for rel in releases:
+                inserted = db.add_release(
+                    mbid=rel["mbid"],
+                    artist_id=artist["id"],
+                    title=rel["title"],
+                    release_type=rel["type"],
+                    release_date=rel["date"],
+                    notified=0,
+                    source="musicbrainz",
+                    mb_url=rel.get("url", ""),
+                    credits=json.dumps(rel.get("credits") or []),
+                )
+                if inserted:
+                    new_titles.append(rel["title"])
+        elif source == "itunes" and has_itunes:
+            releases = await itunes.get_artist_releases(artist["itunes_artist_id"], artist_name=artist["name"])
+            # Get existing MB releases for this artist to check for duplicates
+            existing_releases = db.get_releases(artist_id=artist["id"])
+            mb_titles = {_normalize_release_title(r["title"]) for r in existing_releases if r.get("source") == "musicbrainz"}
+            for rel in releases:
+                # Skip iTunes releases that duplicate MB releases (ignoring - Single/- EP suffix)
+                itunes_title_norm = _normalize_release_title(rel["title"])
+                if itunes_title_norm in mb_titles:
+                    continue
+                inserted = db.add_release(
+                    mbid=str(rel["id"]),
+                    artist_id=artist["id"],
+                    title=rel["title"],
+                    release_type=rel["type"],
+                    release_date=rel.get("date", ""),
+                    notified=0,
+                    source="itunes",
+                    itunes_collection_id=str(rel["id"]),
+                    artwork_url=rel.get("artwork_url", ""),
+                )
+                if inserted:
+                    new_titles.append(rel["title"])
+
+    return new_titles
+
+
+def _error_message(e: Exception) -> str:
+    msg = str(e) if str(e) else repr(e)
+    response = getattr(e, "response", None)
+    if response is not None:
+        msg = f"HTTP {response.status_code}: {msg}"
+    elif isinstance(e, httpx.TimeoutException):
+        msg = f"Timeout after retries: {msg}" if msg else "Read timeout after retries"
+    return msg
+
+
 @app.get("/api/check")
 async def check_releases(skip: int = Query(0), artist_id: Optional[int] = Query(None)):
     async def event_stream():
         artists = db.get_all_artists()
-        
+
         # Filter to specific artist if artist_id is provided
         if artist_id is not None:
             artists = [a for a in artists if a["id"] == artist_id]
@@ -660,99 +726,81 @@ async def check_releases(skip: int = Query(0), artist_id: Optional[int] = Query(
             yield _sse({"type": "done", "message": "No artists to check.", "summary": [], "skip": skip, "total_checked": 0})
             return
 
-        summary = []
+        summary: list[dict] = []
+        failed_artists: list[dict] = []
 
+        async def check_one(artist: dict) -> tuple[list[str], str]:
+            """Check one artist. Returns (new_titles, "") or ([], error_message).
+            A failure is logged here; callers decide whether to skip or retry."""
+            sources = ", ".join(s.upper() for s in _artist_sources(artist))
+            try:
+                titles = await _fetch_artist_new_titles(artist)
+                return titles, ""
+            except Exception as e:
+                error_msg = _error_message(e)
+                _add_log("ERROR", f"Failed to fetch releases from {sources}, skipping for now",
+                         artist=artist["name"], detail=error_msg)
+                return [], f"{artist['name']} ({sources}): {error_msg}"
+
+        def record_success(artist: dict, new_titles: list[str]):
+            _add_log("INFO", f"Checked OK - {len(new_titles)} new release(s)", artist=artist["name"])
+            if new_titles:
+                summary.append({
+                    "artist": artist["name"],
+                    "new_releases": new_titles,
+                })
+
+        # --- Pass 1: everyone ---
         for i, artist in enumerate(artists[skip:], skip + 1):
-            # Determine sources from whether mbid and/or itunes_artist_id is set
-            has_mb = bool(artist.get("mbid"))
-            has_itunes = bool(artist.get("itunes_artist_id"))
-            sources = []
-            if has_mb:
-                sources.append("musicbrainz")
-            if has_itunes:
-                sources.append("itunes")
-
-            # Default to musicbrainz if neither is set (legacy)
-            if not sources:
-                sources = ["musicbrainz"]
-
+            sources = ", ".join(s.upper() for s in _artist_sources(artist))
             yield _sse({
                 "type": "progress",
-                "message": f"Checking {', '.join(s.upper() for s in sources)} - artist {i} of {total}: {artist['name']}...",
+                "message": f"Checking {sources} - artist {i} of {total}: {artist['name']}...",
                 "current": i,
                 "total": total,
             })
 
-            try:
-                new_titles = []
-                for source in sources:
-                    if source == "musicbrainz" and has_mb:
-                        releases = await musicbrainz.get_artist_releases(artist["mbid"])
-                        for rel in releases:
-                            inserted = db.add_release(
-                                mbid=rel["mbid"],
-                                artist_id=artist["id"],
-                                title=rel["title"],
-                                release_type=rel["type"],
-                                release_date=rel["date"],
-                                notified=0,
-                                source="musicbrainz",
-                                mb_url=rel.get("url", ""),
-                            )
-                            if inserted:
-                                new_titles.append(rel["title"])
-                    elif source == "itunes" and has_itunes:
-                        releases = await itunes.get_artist_releases(artist["itunes_artist_id"], artist_name=artist["name"])
-                        # Get existing MB releases for this artist to check for duplicates
-                        existing_releases = db.get_releases(artist_id=artist["id"])
-                        mb_titles = {_normalize_release_title(r["title"]) for r in existing_releases if r.get("source") == "musicbrainz"}
-                        for rel in releases:
-                            # Skip iTunes releases that duplicate MB releases (ignoring - Single/- EP suffix)
-                            itunes_title_norm = _normalize_release_title(rel["title"])
-                            if itunes_title_norm in mb_titles:
-                                continue
-                            inserted = db.add_release(
-                                mbid=str(rel["id"]),
-                                artist_id=artist["id"],
-                                title=rel["title"],
-                                release_type=rel["type"],
-                                release_date=rel.get("date", ""),
-                                notified=0,
-                                source="itunes",
-                                itunes_collection_id=str(rel["id"]),
-                                artwork_url=rel.get("artwork_url", ""),
-                            )
-                            if inserted:
-                                new_titles.append(rel["title"])
-
-                total_sources = len(sources)
-                _add_log("INFO", f"Found {len(new_titles)} new from {total_sources} source(s)", artist=artist["name"])
-
-                if new_titles:
-                    summary.append({
-                        "artist": artist["name"],
-                        "new_releases": new_titles,
-                    })
-                    _add_log("INFO", f"Found {len(new_titles)} new release(s)", artist=artist["name"])
-            except Exception as e:
-                error_msg = str(e) if str(e) else repr(e)
-                # Extract useful info from httpx errors
-                if hasattr(e, "response") and e.response is not None:
-                    error_msg = f"HTTP {e.response.status_code}: {error_msg}"
-                source_names = ', '.join(sources)
-                _add_log("ERROR", f"Failed to fetch releases from {source_names}: {error_msg}", artist=artist["name"])
-                yield _sse({
-                    "type": "error",
-                    "message": f"Error checking {artist['name']} ({source_names}): {error_msg}",
-                })
+            new_titles, error_msg = await check_one(artist)
+            if error_msg:
+                failed_artists.append(artist)
+                # Non-fatal: tell the UI about it but keep scanning
+                yield _sse({"type": "warning", "message": f"Skipped {error_msg}"})
                 continue
+            record_success(artist, new_titles)
 
+        # --- Pass 2: one retry for artists that failed (transient timeouts / 503s) ---
+        if failed_artists:
+            retry_count = len(failed_artists)
+            _add_log("INFO", f"Retrying {retry_count} failed artist(s)...")
+            yield _sse({
+                "type": "progress",
+                "message": f"Retrying {retry_count} failed artist(s)...",
+                "current": total,
+                "total": total,
+            })
+            for artist in list(failed_artists):
+                new_titles, error_msg = await check_one(artist)
+                if error_msg:
+                    yield _sse({"type": "warning", "message": f"Skipped again {error_msg}"})
+                    continue  # stays in failed_artists
+                failed_artists.remove(artist)
+                record_success(artist, new_titles)
+
+        failed_names = [a["name"] for a in failed_artists]
         total_new = sum(len(s["new_releases"]) for s in summary)
-        _add_log("INFO", f"Scan complete. Found {total_new} new release(s).")
+        done_msg = f"Done! Found {total_new} new release(s)."
+        if failed_names:
+            done_msg += f" {len(failed_names)} artist(s) could not be checked - see Logs."
+            _add_log("WARNING", f"Scan finished with {len(failed_names)} unchecked artist(s)",
+                     detail=", ".join(failed_names))
+        else:
+            _add_log("INFO", f"Scan complete. Found {total_new} new release(s).")
+
         yield _sse({
             "type": "done",
-            "message": f"Done! Found {total_new} new release(s).",
+            "message": done_msg,
             "summary": summary,
+            "failed": failed_names,
         })
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -761,13 +809,13 @@ async def check_releases(skip: int = Query(0), artist_id: Optional[int] = Query(
 @app.get("/api/logs")
 async def get_logs(limit: int = Query(100)):
     """Return recent scan log entries."""
-    return _scan_logs[-limit:]
+    return logstore.get_logs(limit)
 
 
 @app.post("/api/logs/clear")
 async def clear_logs():
     """Clear the in-memory log store."""
-    _scan_logs.clear()
+    logstore.clear_logs()
     return {"status": "cleared"}
 
 

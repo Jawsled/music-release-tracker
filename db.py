@@ -39,6 +39,7 @@ def init_db():
             mb_url TEXT DEFAULT '',
             itunes_collection_id TEXT,
             artwork_url TEXT DEFAULT '',
+            credits TEXT DEFAULT '',
             FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE CASCADE
         );
 
@@ -52,6 +53,7 @@ def init_db():
         "ALTER TABLE releases ADD COLUMN source TEXT DEFAULT 'musicbrainz'",
         "ALTER TABLE releases ADD COLUMN itunes_collection_id TEXT",
         "ALTER TABLE artists ADD COLUMN itunes_artist_id INTEGER",
+        "ALTER TABLE releases ADD COLUMN credits TEXT DEFAULT ''",
     ]
     for sql in migrations:
         try:
@@ -223,12 +225,17 @@ def add_release(
     source: str = "musicbrainz",
     itunes_collection_id: str | None = None,
     artwork_url: str = "",
+    credits: str = "",
 ) -> bool:
     """Insert a release, or update release_date if it already exists.
     
     Returns True if inserted or updated, False if unchanged.
     Updates ensure bootleg/unofficial dates get replaced with official dates
     on the next sync.
+
+    credits: JSON string of credited artists (from MusicBrainz artist-credit).
+    Existing rows are silently backfilled when credit data arrives or changes —
+    this does NOT count as a new release.
     """
     conn = get_db()
     try:
@@ -236,26 +243,33 @@ def add_release(
         unique_key = mbid if source == "musicbrainz" else (itunes_collection_id or mbid)
         
         existing = conn.execute(
-            "SELECT id, release_date FROM releases WHERE artist_id = ? AND (mbid = ? OR itunes_collection_id = ?)",
+            "SELECT id, release_date, credits FROM releases WHERE artist_id = ? AND (mbid = ? OR itunes_collection_id = ?)",
             (artist_id, unique_key, unique_key),
         ).fetchone()
         
         if existing:
+            changed = False
             # Update release_date if it differs (e.g., bootleg date -> official date)
             if existing["release_date"] != release_date:
                 conn.execute(
                     "UPDATE releases SET release_date = ? WHERE id = ?",
                     (release_date, existing["id"]),
                 )
-                conn.commit()
-                return True  # Updated
-            return False  # Unchanged
+                changed = True
+            # Silently backfill credits when they arrive/changed (not counted as new)
+            if credits and existing["credits"] != credits:
+                conn.execute(
+                    "UPDATE releases SET credits = ? WHERE id = ?",
+                    (credits, existing["id"]),
+                )
+            conn.commit()
+            return changed  # True only for inserts / date updates
 
         conn.execute(
             """INSERT INTO releases
-               (mbid, artist_id, source, title, release_type, release_date, first_seen_at, notified, mb_url, itunes_collection_id, artwork_url)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (unique_key, artist_id, source, title, release_type, release_date, _now_iso(), notified, mb_url, itunes_collection_id, artwork_url),
+               (mbid, artist_id, source, title, release_type, release_date, first_seen_at, notified, mb_url, itunes_collection_id, artwork_url, credits)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (unique_key, artist_id, source, title, release_type, release_date, _now_iso(), notified, mb_url, itunes_collection_id, artwork_url, credits),
         )
         conn.commit()
         return True

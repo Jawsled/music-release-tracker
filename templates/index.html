@@ -67,8 +67,11 @@
                     </div>
                     <span id="check-progress-text" class="check-progress-text">Idle</span>
 
-                    <!-- Pause/Resume button -->
-                    <button id="pause-btn" class="pause-btn hidden" onclick="togglePauseCheck()">⏸ Pause</button>
+                    <!-- Footer: pause/resume + sound toggle -->
+                    <div class="popup-footer">
+                        <button id="pause-btn" class="pause-btn hidden" onclick="togglePauseCheck()">⏸ Pause</button>
+                        <label class="checkbox-label" title="Play a chime when a check finishes"><input type="checkbox" id="sound-enabled" checked> chime on completion</label>
+                    </div>
 
                     <!-- Results -->
                     <div id="summary-body" class="popup-results hidden">

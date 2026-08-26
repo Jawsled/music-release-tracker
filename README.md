@@ -1,21 +1,23 @@
 # Music Release Tracker
 
-A local-first desktop app that tracks new album and EP releases from artists you follow, powered by [MusicBrainz](https://musicbrainz.org/) and [iTunes](https://music.apple.com)
+A local-first desktop app that tracks new album and EP releases from artists you follow. Powered by [MusicBrainz](https://musicbrainz.org/) and [iTunes](https://music.apple.com).
 
-![Dark themed UI with three tabs: Feed, Artists, and Check](https://img.shields.io/badge/theme-dark-1a1a2e) ![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-bb86fc) ![License: MIT](https://img.shields.io/badge/license-MIT-03dac6)
+![Theme](https://img.shields.io/badge/theme-dark-1a1a2e) ![Python](https://img.shields.io/badge/python-3.8%2B-bb86fc) ![License: MIT](https://img.shields.io/badge/license-MIT-03dac6)
+
+---
 
 ## Features
 
-- **Artist search:** search artists from MusicBrainz and iTunes, or paste mbid, musicbrainz artist URL, or apple Music artist URL manually. You are also able to click on MB / iTunes button to confirm that you are adding the right artist.
-- **Release feed:** browse albums, EPs and singles sorted by date, filter by artist, type, or new-only
-- **Fetch tracklist:** Fetches tracklist for EP and Album releases. Includes number of tracks and lenghts for each tracks.
-- **Fetch Streaming Links:** Fetches external streming links listed in MB release page.
-- **Singles detection:** When fetching tracklist, if single release of a song exists, it will be marked with `SINGLE` badge. Useful if you want to avoid duplicates.
-- **Duplicates detection:** If there is Duplicate release between Musicbrainz and iTunes, MB result will be prioritized. iTunes results are treated as complementary to catch releases that are not (yet) on MB in pretty much real time. 
-- **New release detection:** "Check Now" scans all tracked artists and highlights newly discovered releases with a badge
-- **Official releases:** It will fetch basically everything from "releases" tab from artists' MB page. this is done to include not only regular releases but pre-release, remixes, and Mixes / compilation such as DJ sets.
-- **Shortcut to release page:** Click on `view ↗` button to see individual release page on Musicbrainz or apple Music. similarly, click on artist name to see their page.
-- **Easy backup** — Allows users to import & export list of artists in a .json file which includes their name, mbid and iTunes artist ID. or alternatively you can make a copy of .db file in root directory which also includes scanned releases.
+- **Artist search:** Search MusicBrainz and iTunes by name, or paste an MBID, MusicBrainz artist URL, or Apple Music artist URL manually. Preview buttons let you confirm you're adding the right artist.
+- **Release feed:** Browse albums, EPs, and singles sorted by date; filter by artist, release type, or new-only.
+- **Tracklists:** Fetch tracklists for album and EP releases, including track numbers and durations.
+- **Streaming links:** Fetch external streaming links listed on the MusicBrainz release page.
+- **Single detection:** When fetching a tracklist, songs that also exist as standalone singles are marked with a `SINGLE` badge — handy for avoiding duplicates.
+- **Duplicate handling:** Duplicate releases between MusicBrainz and iTunes are deduplicated, with MB results prioritized. iTunes acts as a complement to catch releases not (yet) on MusicBrainz in near real time.
+- **New release detection:** "Check Now" scans all tracked artists and highlights newly discovered releases with a `NEW` badge.
+- **Official releases:** Everything from the artist's MusicBrainz *releases* tab is fetched: regular releases plus pre-releases, remixes, DJ sets, compilations, and more.
+- **Quick links:** Click `view ↗` on a card to open the release page on MusicBrainz or Apple Music, or click the artist name for their page.
+- **Easy backup:** Import/export your artists as a `.json` file (name, MBID, iTunes ID), or copy the `.db` file in the root directory, which also includes scanned releases.
 
 ## Quick Start
 
@@ -24,74 +26,87 @@ git clone https://github.com/Jawsled/music-release-tracker.git
 cd music-release-tracker
 python run.py
 ```
-or if you are on windows, run the `music-release-tracker.bat` file. if you wish, you can create desktop shortcut to this .bat file and plce it in `C:\ProgramData\Microsoft\Windows\Start Menu\Programs` if you want to make it show up in windows start menu.
 
-Simple as that. On first run it creates a virtual environment and installs dependencies automatically. You wiill be directed to the webUI `http://127.0.0.1:7070`.
+On Windows you can instead run `Music-Release-Tracker.bat`. To add it to the Start Menu, create a shortcut to the `.bat` file and place it in:
 
-## Conda (optional)
+```
+C:\ProgramData\Microsoft\Windows\Start Menu\Programs
+```
 
-- Includes conda launch shortcut, if for some strange reason you want to run it in anaconda when it is already running in venv. But `music-release-tracker(conda).bat` file is there if you want it.
-- conda environment name should be music-release-tracker. 
+That's it. On first run the app creates a virtual environment, installs dependencies automatically, then opens the web UI at `http://127.0.0.1:7070`.
 
+### Conda (optional)
+
+A `Music-Release-Tracker (conda).bat` launcher is included if you prefer running under Anaconda. The conda environment name should be `music-release-tracker`.
 
 ## General Workflow
 
-1. **Add artists:** search by name and pick from results, or paste in URL if the search did not pick up the artist you want.
-2. **Check for new releases:** The check button acknowledges which artists are being selected from the dropdown menu in the feed. If all artists are shown, it will update all artist entries, if one specific artist is selected, it will only check said artist to make the process quick and avoid being rate limited.
-3. **Browse your feed:** Each releases contain Title, releast type, date, and source (MB/iTunes) as well as cover image. newly added releases will have "NEW" badge, click to dismiss individually, or press "Mark all as seen" button. If searching for particular release, use browser's search function (Ctrl+F).
+1. **Add artists:** Search by name and pick from results, or paste a URL if search doesn't find who you're looking for.
+2. **Check for new releases:** The check respects the artist selected in the feed's dropdown: with *all artists* shown it scans everyone; with a specific artist selected it only checks that one (faster, and avoids rate limiting).
+3. **Browse your feed:** Each release shows title, type, date, source (MB/iTunes), and cover art. New releases carry a `NEW` badge — click badges individually to dismiss them, or use *Mark all as seen*. Use your browser's find (`Ctrl+F`) to search for a particular release.
 
-When you first add an artist, all their existing releases are imported as "already seen" so your feed isn't flooded. Only releases discovered in subsequent checks are marked as new.
+> When you first add an artist, all of their existing releases are imported as *already seen*, so your feed isn't flooded. Only releases found by later checks are marked new.
 
-## Artists page
+## Pages
 
-- **Artist search:** Search will query Musicbrainz and iTunes API endpoints for entered term. Once results are pulled, mbid or artist ID is extracted and stored in db.
-- **Manual querying:** Sometimes search doesn't pick up the artist you want. But don't fret! enter mbid, whole Musicbrainz artist URL, or apple music artist page URL to manually query and find the artist.
-- **Artist Linking:** If you already have an artist added on either of MB or iTunes, you can link another source to the same artist manually. You can also unlink a source, which will be a confirmation prompt, should you confirm, release entries from that source will be removed.
-- **Import / Export:** Exports Artists entries including mbid and iTunes artist ID in json format.
+### Artists
 
-## Feed Page
-- **Artist dropdown:** Pretty self explanatory. Select artist you want to view the release of.
-- **Check for new releases:** It runs on checks for artists you selected using the dropdown menu. Therefore by default it runs check for all artists.
-- **Filtering by release types:** The release type chips can be used to show / hide releases of specific types. combines with artist filtering.
-- **Musicbrainz release types:** The script fetches everything classified as releases. (not recordings), which incluees Albums, EPs, Singles, and variosu "mixes" and category literally called "other". since there are just too many categoris, anything labelled other than album, EP or single are all treated as "others" when filtering (the actual release type will be visible in the individual release cards).
-- **iTunes release types:** Because all iTunes results have attribute `collectiontype=album`, the script will look at the suffix such as `- Single` or `- EP` for classification. Lacking them, it will automatically classify them as an album.
-- **Duplicate handling** - For now, the duplicate handling is rudimentary. It strips Singel / EP suffix from iTunes results and runs case-matching for 
-the release title from the same artist.
-- **New only checkbox:** self explanatory. Newly added tracks will be marked with `NEW` badge unless individually dismissed by clicking on said badgeds, or using `Mark all as seen` button. The "new" in this case has nothing to do with release dates. It is about if a release is newly added to the db.
-- **Tracklist:** Uses Musicbrainz and iTunes API to fetch tracklist for anything other than Singles.
-- **SINGLE badge:** The check is purely local. It looks for matching track titles from same artist's single releases.
-- **Streming Liks:** Fetches external streaming link from MB release page.
+- **Search:** Queries the MusicBrainz and iTunes APIs; the MBID / Apple artist ID is extracted and stored in the database.
+- **Manual query:** If search comes up empty, paste an MBID, full MusicBrainz artist URL, or Apple Music artist URL.
+- **Linking:** Already have an artist added via one source? Manually link the other source to the same entry. Unlinking asks for confirmation, then removes that source's release entries.
+- **Import / Export:** Export/import artist entries (name, MBID, iTunes ID) as JSON.
 
-## SQL Database
-- **artists:** stores `mbid`  `name` `disambiguation` `itunes_artist_id` `added_at` also gives them internal numeric ID.
-- **releases:** stores `mbid` (itunes ID also goes in this field) `artist id` `source` (mb/itunes) `release_type` `release_date` `first_seen_at` `notified` `release_day_notified` (these 2 are unused) `mb_url`(individual release in the release group) `itunes_collection_id` `artwork_url` `external_urls` also gives them internal numeric ID
+### Feed
 
-## Known issues
+- **Artist dropdown:** Choose whose releases to view.
+- **Check for new releases:** Checks the artist(s) currently selected in the dropdown (all artists by default).
+- **Type filters:** Release-type chips show/hide releases per type and combine with artist filtering.
+  - *MusicBrainz types:* Everything classified as a release is fetched (albums, EPs, singles, and various mixes/compilations). Anything that isn't an album, EP, or single falls under **Other** when filtering — the exact type still appears on each release card.
+  - *iTunes types:* Since iTunes labels everything `collectionType=Album`, classification uses title suffixes like `- Single` / `- EP`; anything else counts as an album.
+- **Duplicate handling:** Rudimentary for now: `- Single`/`- EP` suffixes are stripped from iTunes titles and matched case-insensitively against releases from the same artist.
+- **New-only checkbox:** Shows only entries marked `NEW`. "New" here means newly added to the database. This has nothing to do with release dates. Dismiss badges individually or via *Mark all as seen*.
+- **Tracklist:** Fetched from MusicBrainz/iTunes for anything other than singles.
+- **`SINGLE` badge:** Purely local: matches track titles against the artist's single releases.
 
-- **Quirks with iTunes API:** Due to iTunes not providing release type and labels everything as `collectiontype=album`,  I had to resort to using suffix `- Single` and `- EP` to classify them as such. Lacking those, it will be classified as an album. This is unfortunately not fixable without using the modern apple music API key. This also means we are working with less frequently maintained dataset, which may not reflect full release catalogue (sometimes you need to use UPC lookup to find missing releases).
-- The program is fairly good at finding duplicates and hiding iTunes release if it deems such, but if the title is slightly different, it can still show up. I plan to fix this down the line, however it is not as simple as treating all (feat. fetured-artist) becausee some tracks get additional featured artists, which then gets a new release, and there also no way to tell this apart.
+## Database
 
-## Telegram (removed)
+SQLite database (`music-release-tracker.db`) with two tables:
 
-- Telegram support has been dropped since a significant portion of code has been re-written and I did not deem this feature necessary.
-- However, if you wish to add your own integrations to Telegram / Discord and such, please feel free to do so.
+| Table | Columns |
+| --- | --- |
+| `artists` | internal ID · `mbid` · `name` · `disambiguation` · `itunes_artist_id` · `added_at` |
+| `feed` | internal ID · `mbid` (iTunes ID also lives here) · artist ID · `source` (`mb`/`itunes`) · `release_type` · `release_date` · `first_seen_at` · `notified` · `release_day_notified` *(unused)* · `mb_url` · `itunes_collection_id` · `artwork_url` · `external_urls` |
+
+## Known Issues
+
+- **iTunes quirks:** iTunes provides no release type (everything is `collectionType=Album`), so suffix-based classification is used. Fixing this properly would require the modern Apple Music API key, and the iTunes catalog is less frequently maintained — some releases only surface via UPC lookup.
+- **Near-duplicate titles:** Deduplication can miss releases whose titles differ slightly. A blanket strip of `(feat. …)` isn't safe, since some tracks gain additional featured artists and legitimately become new releases.
+- **MusicBrainz credits:** The scan works at the *release group* level (individual releases are only fetched on demand for tracklists/streaming links), so credited artists don't appear during a release-group scan.
+
+### Telegram (removed)
+
+Telegram support was dropped during a significant rewrite. Feel free to build your own Telegram/Discord/etc. integrations on top.
 
 ## Tech Stack
 
-- **Backend:** Python, FastAPI, SQLite
-- **Frontend:** Vanilla HTML/CSS/JS, dark theme
-- **Data source:** [MusicBrainz API](https://musicbrainz.org/doc/MusicBrainz_API) and [iTunes search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI) (no API keys required) 
+| Layer | Tech |
+| --- | --- |
+| Backend | Python · FastAPI · SQLite |
+| Frontend | Vanilla HTML/CSS/JS (dark theme) |
+| Data sources | [MusicBrainz API](https://musicbrainz.org/doc/MusicBrainz_API) · [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI) — no API keys required |
 
 ## Requirements
 
-- Python 3.8 or newer
-- Internet connection (for MusicBrainz / iTunes API)
+- Python 3.8+
+- Internet connection (for MusicBrainz / iTunes APIs)
 
-All Python dependencies are installed automatically by `run.py`. If not, reference requirements.txt.
+All dependencies are installed automatically by `run.py` (see [`requirements.txt`](requirements.txt)).
 
-## Acknowledgement
-icons by [thesvg](https://thesvg.org), [simpleicons](https://simpleicons.org) and [tabler.io](https://tabler.io)
+## Acknowledgements
 
-## Disclosure on LLM use
+Icons by [thesvg.org](https://thesvg.org), [simpleicons.org](https://simpleicons.org), and [tabler.io](https://tabler.io).
+
+## Disclosure on LLM Use
+
 - The original release by Katemptiness was co-authored with Claude.
 - This fork contains bugfixes and feature additions assisted by Qwen3.6.

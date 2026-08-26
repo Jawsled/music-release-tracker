@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 
 import httpx
@@ -8,6 +9,8 @@ import httpx
 BASE_URL = "https://itunes.apple.com/search"
 LOOKUP_URL = "https://itunes.apple.com/lookup"
 USER_AGENT = "MusicReleaseTracker/0.1.0 (https://github.com/placeholder)"
+
+logger = logging.getLogger("music-release-tracker.itunes")
 
 _last_request_time: float = 0.0
 _lock = asyncio.Lock()
@@ -17,27 +20,34 @@ COOLDOWN_503 = 5.0       # seconds to wait before first retry on 503
 COOLDOWN_503_RETRY = 10.0  # seconds to wait before second retry on 503
 MAX_503_RETRIES = 2       # max retries on 503 before giving up
 
+MAX_NET_RETRIES = 3       # max retries for timeouts / connection errors
+NET_BACKOFF_BASE = 2.0    # base backoff; doubles each retry (2s, 4s, 8s)
+
 
 def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
             headers={"User-Agent": USER_AGENT},
-            timeout=20.0,
+            timeout=httpx.Timeout(30.0, connect=10.0),
         )
     return _client
 
 
 async def _rate_limited_get(url: str, params: dict) -> dict:
     """Make a GET request with rate limiting and serialization.
-    
-    On 503 errors, waits for a cooldown period and retries up to MAX_503_RETRIES times.
-    Raises httpx.HTTPStatusError if all retries are exhausted.
+
+    Retries automatically on:
+      - 503 errors (cooldown waits)
+      - timeouts (e.g. ReadTimeout) and connection errors (exponential backoff)
+
+    Raises the underlying exception once all retries are exhausted.
+    Every retry is logged so it shows up in the UI log.
     """
     global _last_request_time
-    last_err = None
-    
-    for attempt in range(MAX_503_RETRIES + 1):
+    last_err: Exception | None = None
+
+    for attempt in range(max(MAX_503_RETRIES, MAX_NET_RETRIES) + 1):
         async with _lock:
             now = time.monotonic()
             elapsed = now - _last_request_time
@@ -48,28 +58,51 @@ async def _rate_limited_get(url: str, params: dict) -> dict:
             client = _get_client()
             try:
                 resp = await client.get(url, params=params)
-                if resp.status_code == 503:
-                    # Rate limit hit - wait and retry
-                    cooldown = COOLDOWN_503_RETRY if attempt > 0 else COOLDOWN_503
-                    if attempt < MAX_503_RETRIES:
-                        await asyncio.sleep(cooldown)
-                        continue
-                    else:
-                        raise httpx.HTTPStatusError(
-                            f"503 Service Unavailable after {MAX_503_RETRIES} retries",
-                            request=resp.request,
-                            response=resp
-                        )
                 resp.raise_for_status()
                 return resp.json()
             except httpx.HTTPStatusError as e:
                 last_err = e
                 if e.response.status_code == 503 and attempt < MAX_503_RETRIES:
                     cooldown = COOLDOWN_503_RETRY if attempt > 0 else COOLDOWN_503
+                    logger.warning(
+                        f"iTunes rate limit (503), retrying "
+                        f"{attempt + 1}/{MAX_503_RETRIES} in {cooldown:.0f}s",
+                        extra={"detail": url},
+                    )
                     await asyncio.sleep(cooldown)
                     continue
+                logger.error(f"HTTP error {e.response.status_code} on {url}, giving up",
+                             extra={"detail": str(e)})
                 raise
-    
+            except httpx.TimeoutException as e:
+                last_err = e
+                if attempt >= MAX_NET_RETRIES:
+                    logger.error(f"Timeout on {url} after {attempt + 1} attempts, giving up",
+                                 extra={"detail": str(e)})
+                    raise
+                delay = NET_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"Timeout, retrying {attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
+                    extra={"detail": url},
+                )
+                await asyncio.sleep(delay)
+                continue
+            except httpx.RequestError as e:
+                last_err = e
+                if attempt >= MAX_NET_RETRIES:
+                    logger.error(f"Network error on {url} after {attempt + 1} attempts, giving up",
+                                 extra={"detail": str(e)})
+                    raise
+                delay = NET_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"Network error ({type(e).__name__}), retrying "
+                    f"{attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
+                    extra={"detail": url},
+                )
+                await asyncio.sleep(delay)
+                continue
+
+    assert last_err is not None
     raise last_err
 
 

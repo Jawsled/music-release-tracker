@@ -19,27 +19,45 @@ COOLDOWN_503 = 5.0       # seconds to wait before first retry on 503
 COOLDOWN_503_RETRY = 10.0  # seconds to wait before second retry on 503
 MAX_503_RETRIES = 2       # max retries on 503 before giving up
 
+MAX_NET_RETRIES = 3       # max retries for timeouts / connection errors
+NET_BACKOFF_BASE = 2.0    # base backoff for network errors; doubles each retry (2s, 4s, 8s)
+
 
 def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
             headers={"User-Agent": USER_AGENT},
-            timeout=20.0,
+            timeout=httpx.Timeout(30.0, connect=10.0),
         )
     return _client
 
 
+def _retry_after_seconds(headers) -> float | None:
+    """Parse the Retry-After header (seconds form) if present."""
+    raw = headers.get("Retry-After") if headers else None
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (ValueError, TypeError):
+        return None
+
+
 async def _rate_limited_get(url: str, params: dict) -> dict:
     """Make a GET request with rate limiting and serialization.
-    
-    On 503 errors, waits for a cooldown period and retries up to MAX_503_RETRIES times.
-    Raises httpx.HTTPStatusError if all retries are exhausted.
+
+    Retries automatically on:
+      - 503 rate limiting (cooldown waits, honors Retry-After)
+      - timeouts (e.g. ReadTimeout) and connection errors (exponential backoff)
+
+    Raises httpx.HTTPStatusError / httpx.RequestError once all retries are
+    exhausted. Every retry/skip decision is logged so it shows up in the UI log.
     """
     global _last_request_time
-    last_err = None
-    
-    for attempt in range(MAX_503_RETRIES + 1):
+    last_err: Exception | None = None
+
+    for attempt in range(max(MAX_503_RETRIES, MAX_NET_RETRIES) + 1):
         async with _lock:
             now = time.monotonic()
             elapsed = now - _last_request_time
@@ -50,42 +68,107 @@ async def _rate_limited_get(url: str, params: dict) -> dict:
             client = _get_client()
             try:
                 resp = await client.get(url, params=params)
-                if resp.status_code == 503:
-                    cooldown = COOLDOWN_503_RETRY if attempt > 0 else COOLDOWN_503
-                    logger.warning(f"503 rate limit on {url} (attempt {attempt + 1}), retrying in {cooldown}s")
-                    if attempt < MAX_503_RETRIES:
-                        await asyncio.sleep(cooldown)
-                        continue
-                    else:
-                        raise httpx.HTTPStatusError(
-                            f"503 Service Unavailable after {MAX_503_RETRIES} retries",
-                            request=resp.request,
-                            response=resp
-                        )
                 resp.raise_for_status()
                 return resp.json()
+
             except httpx.HTTPStatusError as e:
                 last_err = e
-                if e.response.status_code == 503 and attempt < MAX_503_RETRIES:
+                status = e.response.status_code
+                if status == 503 and attempt < MAX_503_RETRIES:
                     cooldown = COOLDOWN_503_RETRY if attempt > 0 else COOLDOWN_503
+                    retry_after = _retry_after_seconds(e.response.headers)
+                    if retry_after:
+                        cooldown = max(cooldown, min(retry_after, 60.0))
+                    logger.warning(
+                        f"MusicBrainz rate limit (503), retrying "
+                        f"{attempt + 1}/{MAX_503_RETRIES} in {cooldown:.0f}s",
+                        extra={"detail": url},
+                    )
                     await asyncio.sleep(cooldown)
                     continue
-                logger.error(f"HTTP error {e.response.status_code} on {url}: {e}")
+                logger.error(
+                    f"HTTP error {status} on {url}, giving up",
+                    extra={"detail": str(e)},
+                )
                 raise
+
             except httpx.TimeoutException as e:
                 last_err = e
-                logger.error(f"Timeout on {url}: {e}")
-                raise
+                if attempt >= MAX_NET_RETRIES:
+                    logger.error(
+                        f"Read timeout on {url} after {attempt + 1} attempts, giving up",
+                        extra={"detail": str(e)},
+                    )
+                    raise
+                delay = NET_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"Read timeout, retrying {attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
+                    extra={"detail": url},
+                )
+                await asyncio.sleep(delay)
+                continue
+
             except httpx.RequestError as e:
                 last_err = e
-                logger.error(f"Request error on {url}: {e}")
-                raise
+                if attempt >= MAX_NET_RETRIES:
+                    logger.error(
+                        f"Network error on {url} after {attempt + 1} attempts, giving up",
+                        extra={"detail": str(e)},
+                    )
+                    raise
+                delay = NET_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"Network error ({type(e).__name__}), retrying "
+                    f"{attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
+                    extra={"detail": url},
+                )
+                await asyncio.sleep(delay)
+                continue
+
             except Exception as e:
                 last_err = e
-                logger.error(f"Unexpected error on {url}: {type(e).__name__}: {e}")
+                logger.error(
+                    f"Unexpected error on {url}",
+                    extra={"detail": f"{type(e).__name__}: {e}"},
+                )
                 raise
-    
+
+    assert last_err is not None
     raise last_err
+
+
+def _extract_credits(artist_credit, main_mbid: str = "") -> list[dict]:
+    """Extract credited artists other than the tracked artist from a
+    MusicBrainz artist-credit list.
+
+    Each entry looks like {"name": "Stack$", "joinphrase": ", ",
+    "artist": {"id": ..., "name": "Stacks"}}. The credited display name
+    ("name") may differ from the canonical artist name.
+
+    Returns an ordered, deduplicated [{"name": str, "mbid": str}, ...]
+    excluding the tracked artist (matched by MBID).
+    """
+    if not artist_credit or not isinstance(artist_credit, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for entry in artist_credit:
+        if not isinstance(entry, dict):
+            continue
+        artist = entry.get("artist") or {}
+        name = entry.get("name") or artist.get("name", "")
+        mbid = artist.get("id", "")
+        if not name:
+            continue
+        # The tracked artist themselves is not a "credit" on their own release
+        if main_mbid and mbid == main_mbid:
+            continue
+        key = mbid or f"name:{name.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"name": name, "mbid": mbid})
+    return out
 
 
 async def search_artist(query: str) -> list[dict]:
@@ -108,11 +191,15 @@ async def search_artist(query: str) -> list[dict]:
     return results
 
 
-async def get_release_tracks(rg_id: str) -> list[dict]:
+async def get_release_tracks(rg_id: str, main_mbid: str = "") -> list[dict]:
     """Fetch tracks for a release group from MusicBrainz.
 
     Queries /release with the release-group filter to find an actual release,
-    then fetches that release with track info included.
+    then fetches that release with track info included (plus per-track
+    artist-credit, piggybacked on the same request).
+
+    main_mbid: MBID of the tracked artist; their own credit is filtered out
+    of each track's credits so only featured/guest artists are listed.
     """
     # Step 1 – find a release belonging to this release group
     data = await _rate_limited_get(
@@ -133,7 +220,7 @@ async def get_release_tracks(rg_id: str) -> list[dict]:
     await asyncio.sleep(1.0)  # Rate limit: MusicBrainz requires ~1s between requests
     rel = await _rate_limited_get(
         f"{BASE_URL}/release/{release_mbid}",
-        params={"inc": "recordings", "fmt": "json"},
+        params={"inc": "recordings+artist-credits", "fmt": "json"},
     )
 
     seen_track_numbers = set()
@@ -157,6 +244,11 @@ async def get_release_tracks(rg_id: str) -> list[dict]:
                 "number": num,
                 "title": title,
                 "length": track.get("length", 0),
+                "credits": _extract_credits(
+                    (track.get("recording") or {}).get("artist-credit")
+                    or track.get("artist-credit"),
+                    main_mbid,
+                ),
             })
 
     return all_tracks
@@ -340,6 +432,9 @@ async def get_artist_releases(mbid: str) -> list[dict]:
     unofficial releases that the /release-group endpoint cannot distinguish.
     Also fetches the URL to the release-group page from MusicBrainz.
 
+    artist-credits is included on the same request (no extra API calls) so
+    credited/featured artists on each release can be shown in the UI.
+
     Fetches all primary release types (Album, EP, Single, Broadcast, Other) to match
     everything on the artist's releases page. Recordings are excluded as they are
     individual tracks rather than commercial releases.
@@ -356,7 +451,7 @@ async def get_artist_releases(mbid: str) -> list[dict]:
                 "artist": mbid,
                 "type": "album|ep|single|broadcast|other",
                 "status": "official",
-                "inc": "release-groups",
+                "inc": "release-groups+artist-credits",
                 "fmt": "json",
                 "limit": limit,
                 "offset": offset,
@@ -390,6 +485,7 @@ async def get_artist_releases(mbid: str) -> list[dict]:
                 "date": release_date,
                 "url": f"https://musicbrainz.org/release-group/{rg_id}",
                 "artist_mbid": mbid,  # Store artist MBID for linking
+                "credits": _extract_credits(release.get("artist-credit"), mbid),
             })
 
         total = data.get("release-count", 0)

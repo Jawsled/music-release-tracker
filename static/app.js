@@ -156,6 +156,19 @@ async function loadReleases() {
   updateUnseenBadge();
 }
 
+// --- Credited artists (MusicBrainz artist-credit) ---
+function parseCredits(raw) {
+  // Credits are stored as a JSON string in SQLite; tolerate already-parsed arrays
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 function renderReleaseCard(r) {
   const hasTracklist = r.release_type !== "Single";
   const cardClick = hasTracklist ? `onclick="toggleTracklist(this)"` : "";
@@ -197,6 +210,10 @@ function renderReleaseCard(r) {
     ? '<span class="stream-hint" onclick="event.stopPropagation();toggleStreaming(this)">Stream ▾</span>'
     : "";
 
+  // Credited artists (e.g. featured guests / collabs), excluding the tracked artist
+  const creditNames = parseCredits(r.credits).map(c => esc(c.name)).join(", ");
+  const creditsHtml = creditNames ? `<div class="release-credits">with ${creditNames}</div>` : "";
+
   return `
     <div class="release-item ${r.notified === 0 ? "unseen" : ""}" data-id="${esc(r.id)}" data-mbid="${esc(r.mbid)}" data-source="${esc(source)}">
       <div class="release-card" ${cardClick}>
@@ -207,6 +224,7 @@ function renderReleaseCard(r) {
         <div class="release-info">
           <div class="release-title">${esc(r.title)} ${sourceBadge}</div>
           <div class="release-artist">${artistLink}</div>
+          ${creditsHtml}
                               <div class="release-meta">
             ${esc(r.release_type)} · ${esc(r.release_date || "Unknown date")}
             <span class="hint-group">
@@ -284,13 +302,17 @@ function renderTracklist(container, tracks) {
       <span class="tracklist-count">${tracks.length} tracks</span>
     </div>
     <div class="tracklist-list">
-      ${tracks.map(t => `
+      ${tracks.map(t => {
+        const featBadge = (t.credits && t.credits.length)
+          ? `<span class="track-feat">feat. ${t.credits.map(c => esc(c.name)).join(", ")}</span>`
+          : "";
+        return `
         <div class="track-item">
           <span class="track-number">${esc(t.number)}</span>
-          <span class="track-title-text">${esc(t.title)}${t.has_single ? ' <span class="single-badge" title="Also released as a single">SINGLE</span>' : ''}</span>
+          <span class="track-title-text">${esc(t.title)}${t.has_single ? ' <span class="single-badge" title="Also released as a single">SINGLE</span>' : ''}${featBadge}</span>
           <span class="track-length">${formatLength(t.length)}</span>
         </div>
-      `).join("")}
+      `; }).join("")}
     </div>
   `;
 }
@@ -750,15 +772,22 @@ function runCheck(skip = 0) {
     const data = JSON.parse(event.data);
 
     if (data.type === "progress") {
-      if (!totalArtists) totalArtists = data.total - skip; // remaining artists
-      const pct = Math.round((data.current / (skip + totalArtists)) * 100);
-      checkProgressBar.style.width = pct + "%";
+      if (data.total && !totalArtists) totalArtists = data.total - skip; // remaining artists
+      if (typeof data.current === "number" && totalArtists) {
+        const pct = Math.round((data.current / (skip + totalArtists)) * 100);
+        checkProgressBar.style.width = pct + "%";
+
+        // Live percentage on button too
+        checkBtn.textContent = `${pct}%`;
+        popupTitle.textContent = `Checking… ${pct}%`;
+      }
       checkProgressText.textContent = data.message;
       checkProgressText.className = "check-progress-text";
-      popupTitle.textContent = `Checking… ${pct}%`;
-
-      // Live percentage on button too
-      checkBtn.textContent = `${pct}%`;
+    } else if (data.type === "warning") {
+      // Per-artist failure (e.g. timeout / rate limit after retries).
+      // Show it, but let the scan continue.
+      checkProgressText.textContent = data.message;
+      checkProgressText.className = "check-progress-text error";
     } else if (data.type === "error") {
       scanRunning = false;
       source.close();
@@ -772,6 +801,7 @@ function runCheck(skip = 0) {
       source.close();
       activeSource = null;
       pauseBtn.classList.add("hidden");
+      playChime();
 
       // Merge partial results from this run with earlier runs
       const mergedSummary = [...partialSummary];
@@ -792,8 +822,11 @@ function runCheck(skip = 0) {
       checkProgressBar.classList.add("done");
 
       const totalNew = mergedSummary.reduce((sum, s) => sum + s.new_releases.length, 0);
-      checkProgressText.textContent = `Done! Found ${totalNew} new release(s).`;
-      checkProgressText.className = "check-progress-text done";
+      const failedCount = Array.isArray(data.failed) ? data.failed.length : 0;
+      checkProgressText.textContent =
+        `Done! Found ${totalNew} new release(s).` +
+        (failedCount > 0 ? ` ${failedCount} artist(s) could not be checked - see Logs.` : "");
+      checkProgressText.className = "check-progress-text" + (failedCount > 0 ? " error" : " done");
 
       if (mergedSummary.length > 0) {
         summaryBody.innerHTML = renderSummary(mergedSummary);
@@ -820,6 +853,27 @@ function runCheck(skip = 0) {
       checkProgressText.className = "check-progress-text error";
     }
   };
+}
+
+// --- Completion chime ---
+// Tiny WAV (~13KB) played when a check finishes. Toggle persists in localStorage.
+const chimeAudio = new Audio("/static/assets/chime.wav");
+chimeAudio.preload = "auto";
+let soundEnabled = localStorage.getItem("mrt_sound_enabled") !== "0"; // default: on
+
+const soundToggle = document.getElementById("sound-enabled");
+soundToggle.checked = soundEnabled;
+soundToggle.addEventListener("change", () => {
+  soundEnabled = soundToggle.checked;
+  localStorage.setItem("mrt_sound_enabled", soundEnabled ? "1" : "0");
+});
+
+function playChime() {
+  if (!soundEnabled) return;
+  try {
+    chimeAudio.currentTime = 0;
+    chimeAudio.play().catch(() => {}); // ignore autoplay-policy rejections
+  } catch { /* ignore */ }
 }
 
 function renderSummary(summary) {
