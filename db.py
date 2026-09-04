@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
-DB_PATH = "music-release-tracker.db"
+DB_PATH = str(Path(__file__).resolve().parent / "music-release-tracker.db")
 
 _conn: sqlite3.Connection | None = None
 
@@ -93,6 +94,22 @@ def init_db():
         pass
 
     conn.commit()
+
+    # Fold any WAL content back into the main .db file so that copying just
+    # music-release-tracker.db (without its -wal/-shm sidecars) always
+    # carries the full data. Cheap and safe to run on every startup.
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.OperationalError:
+        pass
+
+
+def get_counts() -> dict[str, int]:
+    """Return artist/release totals (for startup diagnostics)."""
+    conn = get_db()
+    artists = conn.execute("SELECT COUNT(*) c FROM artists").fetchone()["c"]
+    releases = conn.execute("SELECT COUNT(*) c FROM releases").fetchone()["c"]
+    return {"artists": artists, "releases": releases}
 
 
 def _now_iso() -> str:

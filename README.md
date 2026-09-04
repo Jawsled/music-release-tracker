@@ -20,7 +20,7 @@ A local-first desktop app that tracks new album and EP releases from artists you
 - **Artist notes:** The 3-dot menu on each tracked artist lets you edit a free-text note, check a single artist, link or unlink sources, and untrack.
 - **Logs:** The Scan Logs panel streams scan activity with level filters, text search and pause.
 - **Startup options:** Optionally scan for new releases and/or run dedup automatically when the app starts.
-- **Easy backup:** Import/export your artists as a `.json` file, or copy the `.db` file in the root directory, which also includes scanned releases.
+- **Easy backup:** Import/export your artists as a `.json` file, or stop the app and copy `music-release-tracker.db` from the app folder. That single file is self-contained (it holds artists, releases and settings), so no sidecar files need to come along. Drop it next to a fresh install before starting the app to restore everything.
 
 ## Quick Start
 

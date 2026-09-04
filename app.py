@@ -39,6 +39,12 @@ def _add_log(level: str, message: str, artist: str = "", detail: str = ""):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    try:
+        counts = db.get_counts()
+        _add_log("INFO", f"Using database {db.DB_PATH} "
+                 f"({counts['artists']} artists, {counts['releases']} releases)")
+    except Exception as e:
+        _add_log("ERROR", "Could not read database stats", detail=str(e))
     # Run startup dedup if enabled
     settings = db.get_all_settings()
     if settings.get("startup_dedup") == "1":
