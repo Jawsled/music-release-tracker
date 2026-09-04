@@ -1441,6 +1441,7 @@ function runCheck(skip = 0) {
 // Tiny WAV (~13KB) played when a check finishes. Toggle persists in localStorage.
 const chimeAudio = new Audio("/static/assets/chime.wav");
 chimeAudio.preload = "auto";
+chimeAudio.volume = 0.25; // gentle notification level, not a jumpscare
 let soundEnabled = localStorage.getItem("mrt_sound_enabled") !== "0"; // default: on
 
 const soundToggle = document.getElementById("sound-enabled");

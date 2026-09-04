@@ -112,6 +112,36 @@ def get_counts() -> dict[str, int]:
     return {"artists": artists, "releases": releases}
 
 
+def backup_database(keep: int = 5) -> str | None:
+    """Save a timestamped copy of the database into BACKUP/, pruning old ones.
+
+    Never raises: returns the backup path, or None when anything goes wrong.
+    Callers must ensure no scan is mid-write; at startup (right after
+    init_db) the connection is idle, which is the safe moment.
+    """
+    import shutil
+    from datetime import datetime
+    try:
+        backup_dir = Path(DB_PATH).parent / "BACKUP"
+        backup_dir.mkdir(exist_ok=True)
+        try:
+            get_db().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = backup_dir / f"music-release-tracker-{stamp}.db"
+        shutil.copy(DB_PATH, dest)
+        existing = sorted(backup_dir.glob("music-release-tracker-*.db"))
+        for old in existing[:-keep] if len(existing) > keep else []:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return str(dest)
+    except Exception:
+        return None
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 

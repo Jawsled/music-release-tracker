@@ -39,6 +39,9 @@ def _add_log(level: str, message: str, artist: str = "", detail: str = ""):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    backup_path = db.backup_database()
+    if backup_path:
+        _add_log("INFO", f"Database backup saved to {backup_path}")
     try:
         counts = db.get_counts()
         _add_log("INFO", f"Using database {db.DB_PATH} "
