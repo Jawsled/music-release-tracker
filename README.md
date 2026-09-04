@@ -9,7 +9,7 @@ A local-first desktop app that tracks new album and EP releases from artists you
 ## Features
 
 - **Artist search:** Search MusicBrainz, iTunes and SoundCloud by name (platform filter included in the search box), or paste an MBID, a MusicBrainz / Apple Music / SoundCloud URL, or a SoundCloud permalink. Preview buttons and pills let you confirm you're adding the right artist before you commit.
-- **SoundCloud suggestions:** SoundCloud has no text search API, so display names are probed as profile URL variants (`siximpala`, `six-impala`, `six_impala`). Each suggestion shows the live follower count, which is usually the fastest way to tell same-name profiles apart. iTunes rows show album counts for the same reason.
+- **SoundCloud suggestions:** SoundCloud has no text search API, so display names are probed as profile URL variants. Each suggestion shows the live follower count, which is usually the fastest way to tell same-name profiles apart. iTunes rows show album counts for the same reason.
 - **Release feed:** Browse albums, EPs, singles and other releases sorted by date; filter by artist, release type, new-only, or hidden-only.
 - **Tracklists:** Fetch tracklists for album and EP releases, including track numbers, durations and featured-artist credits. Tracks also released as singles get a `SINGLE` badge.
 - **Streaming links:** Fetch external streaming links listed on the MusicBrainz release page (Spotify, Apple Music, Tidal, and more).
