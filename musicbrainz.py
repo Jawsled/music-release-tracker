@@ -44,8 +44,27 @@ def _retry_after_seconds(headers) -> float | None:
         return None
 
 
+async def _pace_request() -> None:
+    """Space request starts >=1s apart (MusicBrainz rate policy).
+
+    Only the timestamp check is serialized; network I/O happens outside the
+    lock so concurrent requests overlap in flight instead of queueing behind
+    each other (previously a 5-10s retry sleep blocked ALL requests).
+    """
+    global _last_request_time
+    while True:
+        async with _lock:
+            now = time.monotonic()
+            elapsed = now - _last_request_time
+            if elapsed >= 1.0:
+                _last_request_time = now
+                return
+            delay = 1.0 - elapsed
+        await asyncio.sleep(delay)
+
+
 async def _rate_limited_get(url: str, params: dict) -> dict:
-    """Make a GET request with rate limiting and serialization.
+    """Make a GET request with rate limiting (starts spaced >=1s apart).
 
     Retries automatically on:
       - 503 rate limiting (cooldown waits, honors Retry-After)
@@ -54,84 +73,78 @@ async def _rate_limited_get(url: str, params: dict) -> dict:
     Raises httpx.HTTPStatusError / httpx.RequestError once all retries are
     exhausted. Every retry/skip decision is logged so it shows up in the UI log.
     """
-    global _last_request_time
     last_err: Exception | None = None
 
     for attempt in range(max(MAX_503_RETRIES, MAX_NET_RETRIES) + 1):
-        async with _lock:
-            now = time.monotonic()
-            elapsed = now - _last_request_time
-            if elapsed < 1.0:
-                await asyncio.sleep(1.0 - elapsed)
-            _last_request_time = time.monotonic()
+        await _pace_request()
 
-            client = _get_client()
-            try:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                return resp.json()
+        client = _get_client()
+        try:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            return resp.json()
 
-            except httpx.HTTPStatusError as e:
-                last_err = e
-                status = e.response.status_code
-                if status == 503 and attempt < MAX_503_RETRIES:
-                    cooldown = COOLDOWN_503_RETRY if attempt > 0 else COOLDOWN_503
-                    retry_after = _retry_after_seconds(e.response.headers)
-                    if retry_after:
-                        cooldown = max(cooldown, min(retry_after, 60.0))
-                    logger.warning(
-                        f"MusicBrainz rate limit (503), retrying "
-                        f"{attempt + 1}/{MAX_503_RETRIES} in {cooldown:.0f}s",
-                        extra={"detail": url},
-                    )
-                    await asyncio.sleep(cooldown)
-                    continue
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            status = e.response.status_code
+            if status == 503 and attempt < MAX_503_RETRIES:
+                cooldown = COOLDOWN_503_RETRY if attempt > 0 else COOLDOWN_503
+                retry_after = _retry_after_seconds(e.response.headers)
+                if retry_after:
+                    cooldown = max(cooldown, min(retry_after, 60.0))
+                logger.warning(
+                    f"MusicBrainz rate limit (503), retrying "
+                    f"{attempt + 1}/{MAX_503_RETRIES} in {cooldown:.0f}s",
+                    extra={"detail": url},
+                )
+                await asyncio.sleep(cooldown)
+                continue
+            logger.error(
+                f"HTTP error {status} on {url}, giving up",
+                extra={"detail": str(e)},
+            )
+            raise
+
+        except httpx.TimeoutException as e:
+            last_err = e
+            if attempt >= MAX_NET_RETRIES:
                 logger.error(
-                    f"HTTP error {status} on {url}, giving up",
+                    f"Read timeout on {url} after {attempt + 1} attempts, giving up",
                     extra={"detail": str(e)},
                 )
                 raise
+            delay = NET_BACKOFF_BASE * (2 ** attempt)
+            logger.warning(
+                f"Read timeout, retrying {attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
+                extra={"detail": url},
+            )
+            await asyncio.sleep(delay)
+            continue
 
-            except httpx.TimeoutException as e:
-                last_err = e
-                if attempt >= MAX_NET_RETRIES:
-                    logger.error(
-                        f"Read timeout on {url} after {attempt + 1} attempts, giving up",
-                        extra={"detail": str(e)},
-                    )
-                    raise
-                delay = NET_BACKOFF_BASE * (2 ** attempt)
-                logger.warning(
-                    f"Read timeout, retrying {attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
-                    extra={"detail": url},
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            except httpx.RequestError as e:
-                last_err = e
-                if attempt >= MAX_NET_RETRIES:
-                    logger.error(
-                        f"Network error on {url} after {attempt + 1} attempts, giving up",
-                        extra={"detail": str(e)},
-                    )
-                    raise
-                delay = NET_BACKOFF_BASE * (2 ** attempt)
-                logger.warning(
-                    f"Network error ({type(e).__name__}), retrying "
-                    f"{attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
-                    extra={"detail": url},
-                )
-                await asyncio.sleep(delay)
-                continue
-
-            except Exception as e:
-                last_err = e
+        except httpx.RequestError as e:
+            last_err = e
+            if attempt >= MAX_NET_RETRIES:
                 logger.error(
-                    f"Unexpected error on {url}",
-                    extra={"detail": f"{type(e).__name__}: {e}"},
+                    f"Network error on {url} after {attempt + 1} attempts, giving up",
+                    extra={"detail": str(e)},
                 )
                 raise
+            delay = NET_BACKOFF_BASE * (2 ** attempt)
+            logger.warning(
+                f"Network error ({type(e).__name__}), retrying "
+                f"{attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
+                extra={"detail": str(e)},
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        except Exception as e:
+            last_err = e
+            logger.error(
+                f"Unexpected error on {url}",
+                extra={"detail": f"{type(e).__name__}: {e}"},
+            )
+            raise
 
     assert last_err is not None
     raise last_err
@@ -201,10 +214,12 @@ async def get_release_tracks(rg_id: str, main_mbid: str = "") -> list[dict]:
     main_mbid: MBID of the tracked artist; their own credit is filtered out
     of each track's credits so only featured/guest artists are listed.
     """
-    # Step 1 – find a release belonging to this release group
+    # Step 1 – find a release belonging to this release group.
+    # limit=1: only the first release is ever used, and the pacer already
+    # spaces requests >=1s apart, so no extra sleep is needed here.
     data = await _rate_limited_get(
         f"{BASE_URL}/release",
-        params={"release-group": rg_id, "fmt": "json"},
+        params={"release-group": rg_id, "fmt": "json", "limit": 1},
     )
 
     releases = data.get("releases") or []
@@ -217,7 +232,6 @@ async def get_release_tracks(rg_id: str, main_mbid: str = "") -> list[dict]:
         return []
 
     # Step 2 – fetch tracks for that specific release (include=recordings provides track info)
-    await asyncio.sleep(1.0)  # Rate limit: MusicBrainz requires ~1s between requests
     rel = await _rate_limited_get(
         f"{BASE_URL}/release/{release_mbid}",
         params={"inc": "recordings+artist-credits", "fmt": "json"},

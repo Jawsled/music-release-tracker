@@ -17,6 +17,7 @@ from pydantic import BaseModel
 import db
 import musicbrainz
 import itunes
+import soundcloud
 import logstore
 
 HOST = "127.0.0.1"
@@ -38,8 +39,56 @@ def _add_log(level: str, message: str, artist: str = "", detail: str = ""):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    # Run startup dedup if enabled
+    settings = db.get_all_settings()
+    if settings.get("startup_dedup") == "1":
+        _add_log("INFO", "Running startup duplicate check...")
+        hidden = _remove_startup_duplicates()
+        if hidden:
+            _add_log("INFO", f"Hidden {hidden} duplicate release(s)")
+        else:
+            _add_log("INFO", "No duplicates found")
+    # Check all artists for new releases if enabled (background, non-blocking)
+    if settings.get("startup_refresh") == "1":
+        asyncio.create_task(_startup_refresh())
+    # Retroactively fetch tracklists for MB albums/EPs missing track_titles
+    asyncio.create_task(_backfill_tracklists())
     webbrowser.open(f"http://{HOST}:{PORT}")
     yield
+
+
+async def _startup_refresh():
+    """Background scan for new releases at startup (no SSE client attached).
+
+    Mirrors the /api/check logic: one pass over all artists plus a single
+    retry pass for transient failures. Progress lands in the Scan Logs.
+    """
+    artists = db.get_all_artists()
+    if not artists:
+        return
+    _add_log("INFO", f"Startup refresh: checking {len(artists)} artist(s) for new releases...")
+    total_new = 0
+    failed: list[dict] = []
+    for artist in artists:
+        try:
+            titles = await _fetch_artist_new_titles(artist)
+        except Exception as e:
+            _add_log("ERROR", "Startup refresh failed, will retry at the end",
+                     artist=artist["name"], detail=_error_message(e))
+            failed.append(artist)
+            continue
+        _add_log("INFO", f"Checked OK - {len(titles)} new release(s)", artist=artist["name"])
+        total_new += len(titles)
+    for artist in failed:
+        try:
+            titles = await _fetch_artist_new_titles(artist)
+        except Exception as e:
+            _add_log("ERROR", "Startup refresh failed again, skipping",
+                     artist=artist["name"], detail=_error_message(e))
+            continue
+        _add_log("INFO", f"Checked OK on retry - {len(titles)} new release(s)", artist=artist["name"])
+        total_new += len(titles)
+    _add_log("INFO", f"Startup refresh complete. Found {total_new} new release(s).")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -56,10 +105,11 @@ templates.env.cache = {}  # Replace broken LRU cache with simple dict
 class ArtistSearchRequest(BaseModel):
     query: str
     source: str = ""  # empty = search both
+    sources: list[str] | None = None  # platform filter; None = all three
 
 class ArtistAddRequest(BaseModel):
-    source: str  # "musicbrainz" or "itunes"
-    id: str  # mbid for musicbrainz, artistId for itunes
+    source: str  # "musicbrainz", "itunes", or "soundcloud"
+    id: str  # mbid for musicbrainz, artistId for itunes, permalink for soundcloud
     name: str
     disambiguation: str = ""
 
@@ -162,6 +212,21 @@ async def search_artists(body: ArtistSearchRequest):
         except Exception:
             pass
 
+    # SoundCloud URL pastes resolve to the exact profile (unambiguous link).
+    # Plain words / spaced names fall through to the combined search below,
+    # which probes all selected platforms in parallel.
+    if body.source not in ("musicbrainz", "itunes"):
+        sc_url_match = _re.search(
+            r'(?:www\.|m\.)?soundcloud\.com/([A-Za-z0-9._-]+)', query
+        )
+        sc_short_match = _re.match(r'^https?://on\.soundcloud\.com/', query)
+
+        if sc_url_match or sc_short_match:
+            try:
+                return _mark_sc_tracked(await soundcloud.search_artist(query))
+            except Exception:
+                pass
+
     # Regular search
     # Load existing artists to check what's already tracked
     existing_artists = db.get_all_artists()
@@ -184,13 +249,56 @@ async def search_artists(body: ArtistSearchRequest):
             r["source"] = "itunes"
         return results
 
+    enabled = _enabled_sources()
+
     if body.source == "itunes":
+        if "itunes" not in enabled:
+            return []
         return await _search_itunes()
     elif body.source == "musicbrainz":
+        if "musicbrainz" not in enabled:
+            return []
         return await _search_mb()
+    elif body.source == "soundcloud":
+        if "soundcloud" not in enabled:
+            return []
+        try:
+            return _mark_sc_tracked(await soundcloud.search_artist(query))
+        except Exception as e:
+            import logging
+            logging.warning(f"SoundCloud search failed for '{query}': {e}")
+        return []
     else:
-                # Search both in parallel
-        mb_results, it_results = await asyncio.gather(_search_mb(), _search_itunes())
+        # Combined search across selected platforms (platform filter UI)
+        # intersected with globally enabled sources. A bare permalink-like
+        # word or spaced name also probes SoundCloud here instead of
+        # short-circuiting it, so MB/iTunes results are never shadowed.
+        wanted = {s.lower() for s in (body.sources or ["musicbrainz", "itunes", "soundcloud"])}
+        wanted &= {"musicbrainz", "itunes", "soundcloud"}
+        if not wanted:
+            wanted = {"musicbrainz", "itunes", "soundcloud"}
+        use = {s for s in wanted if s in enabled}
+        if not use:
+            return []
+
+        async def _search_sc():
+            try:
+                return await soundcloud.search_artist(query)
+            except Exception:
+                return []
+
+        coros = {}
+        if "musicbrainz" in use:
+            coros["musicbrainz"] = _search_mb()
+        if "itunes" in use:
+            coros["itunes"] = _search_itunes()
+        if "soundcloud" in use:
+            coros["soundcloud"] = _search_sc()
+        gathered = await asyncio.gather(*coros.values())
+        by_source = dict(zip(coros.keys(), gathered))
+        mb_results = by_source.get("musicbrainz", [])
+        it_results = by_source.get("itunes", [])
+        sc_results = by_source.get("soundcloud", [])
 
         # Build lookup maps by normalized name
         mb_by_name: dict[str, dict] = {}
@@ -203,6 +311,12 @@ async def search_artists(body: ArtistSearchRequest):
             key = _normalize_name(r["name"])
             it_by_name[key] = r
 
+        sc_by_name: dict[str, dict] = {}
+        for r in sc_results:
+            key = _normalize_name(r["name"])
+            # First hit wins; exact slug matches come first from the prober
+            sc_by_name.setdefault(key, r)
+
         # Merge: combine matching names, keep all unique names
         merged: dict[str, dict] = {}
         for key, r in mb_by_name.items():
@@ -210,6 +324,7 @@ async def search_artists(body: ArtistSearchRequest):
                 "name": r["name"],
                 "mbid": r.get("mbid", ""),
                 "itunes_artist_id": None,
+                "soundcloud_permalink": None,
                 "disambiguation": r.get("disambiguation", ""),
                 "type": r.get("type", ""),
                 "country": r.get("country", ""),
@@ -222,7 +337,8 @@ async def search_artists(body: ArtistSearchRequest):
             if key in merged:
                 # Name match: merge into existing entry
                 merged[key]["itunes_artist_id"] = r.get("itunes_artist_id")
-                merged[key]["source"] = "both"
+                if merged[key]["source"] == "musicbrainz":
+                    merged[key]["source"] = "both"
                 # Preserve iTunes country if not already set
                 if not merged[key].get("country") and r.get("country"):
                     merged[key]["country"] = r["country"]
@@ -234,12 +350,40 @@ async def search_artists(body: ArtistSearchRequest):
                     "name": r["name"],
                     "mbid": "",
                     "itunes_artist_id": r.get("itunes_artist_id"),
+                    "soundcloud_permalink": None,
                     "disambiguation": r.get("disambiguation", ""),
                     "type": "",
                     "country": r.get("country", ""),
                     "score": r.get("score", 0),
                     "source": "itunes",
                     "artistImageUrl": r.get("artistImageUrl", ""),
+                }
+
+        for key, r in sc_by_name.items():
+            if key in merged:
+                # Name match: link the SoundCloud profile into the entry
+                merged[key]["soundcloud_permalink"] = r.get("soundcloud_permalink")
+                if merged[key]["source"] in ("musicbrainz", "itunes", "both"):
+                    merged[key]["source"] += "+sc"
+                if r.get("artistImageUrl") and not merged[key].get("artistImageUrl"):
+                    merged[key]["artistImageUrl"] = r["artistImageUrl"]
+                if r.get("followers_count") is not None:
+                    merged[key]["followers_count"] = r["followers_count"]
+                # Prefer the higher score for ranking
+                merged[key]["score"] = max(merged[key].get("score", 0), r.get("score", 0))
+            else:
+                merged[key] = {
+                    "name": r["name"],
+                    "mbid": "",
+                    "itunes_artist_id": None,
+                    "soundcloud_permalink": r.get("soundcloud_permalink"),
+                    "disambiguation": r.get("disambiguation", ""),
+                    "type": r.get("type", ""),
+                    "country": r.get("country", ""),
+                    "score": r.get("score", 0),
+                    "source": "soundcloud",
+                    "artistImageUrl": r.get("artistImageUrl", ""),
+                    "followers_count": r.get("followers_count"),
                 }
 
         # Add already_tracked info for UI
@@ -269,18 +413,24 @@ def _normalize_name(name: str) -> str:
 
 def _normalize_release_title(title: str) -> str:
     """Normalize release title for duplicate detection.
-    
-    Strips iTunes classification suffixes like ' - Single' or ' - EP' and
-    normalizes whitespace/punctuation for comparison.
+
+    Uses user-configured ignore suffixes (defaults: ' - Single', ' - EP',
+    i.e. Apple Music classification suffixes that aren't part of the title).
     """
-    import re
-    # Strip iTunes classification suffixes
-    title = re.sub(r'\s*-\s*(Single|EP)\s*$', '', title, flags=re.IGNORECASE)
-    # Normalize: lowercase, strip punctuation, collapse whitespace
-    title = title.lower().strip()
-    title = re.sub(r'[^\w\s]', '', title)
-    title = re.sub(r'\s+', ' ', title)
-    return title
+    return db.normalize_release_title(title)
+
+
+def _mark_sc_tracked(results: list[dict]) -> list[dict]:
+    """Annotate every SoundCloud result with already_tracked info for the UI."""
+    for r in results:
+        existing = db.get_artist_by_soundcloud_permalink(r.get("soundcloud_permalink", ""))
+        if existing:
+            r["already_tracked"] = True
+            r["existing_mbid"] = existing.get("mbid", "")
+            r["existing_itunes_id"] = existing.get("itunes_artist_id")
+        else:
+            r["already_tracked"] = False
+    return results
 
 
 @app.post("/api/itunes/search")
@@ -288,6 +438,16 @@ async def search_itunes_artists(body: iTunesArtistSearchRequest):
     """Search for artists specifically on iTunes."""
     results = await itunes.search_artist(body.query, country=body.country)
     return results
+
+
+@app.get("/api/itunes/album-count")
+async def itunes_album_count(artist_id: int = Query(...), country: str = Query("us")):
+    """Return an artist's album count (for telling same-name artists apart)."""
+    try:
+        albums, capped = await itunes.get_artist_album_count(artist_id, country=country or "us")
+    except Exception as e:
+        return {"artist_id": artist_id, "albums": None, "capped": False, "error": _error_message(e)}
+    return {"artist_id": artist_id, "albums": albums, "capped": capped}
 
 
 @app.post("/api/artists")
@@ -311,6 +471,8 @@ async def add_artist(body: ArtistAddRequest):
         existing_by_id = db.get_artist_by_mbid(body.id)
     elif body.source == "itunes":
         existing_by_id = db.get_artist_by_itunes_id(int(body.id))
+    elif body.source == "soundcloud":
+        existing_by_id = db.get_artist_by_soundcloud_permalink(body.id)
 
     if existing_by_id:
         return {"status": "already_exists", "artist": existing_by_id}
@@ -330,6 +492,7 @@ async def add_artist(body: ArtistAddRequest):
             artist_id=existing_by_name["id"],
             mbid=body.id if body.source == "musicbrainz" else existing_by_name.get("mbid", ""),
             itunes_artist_id=int(body.id) if body.source == "itunes" else existing_by_name.get("itunes_artist_id"),
+            soundcloud_permalink=body.id if body.source == "soundcloud" else existing_by_name.get("soundcloud_permalink"),
         )
 
         # Import releases for the linked source
@@ -373,6 +536,28 @@ async def add_artist(body: ArtistAddRequest):
                 )
                 if inserted:
                     count += 1
+        elif body.source == "soundcloud":
+            releases = await soundcloud.get_artist_releases(body.id)
+            # Deduplicate: same as iTunes — exact normalized title set lookup.
+            existing_releases = db.get_releases(artist_id=artist["id"])
+            existing_titles = {_normalize_release_title(r["title"]) for r in existing_releases}
+            for rel in releases:
+                sc_title_norm = _normalize_release_title(rel["title"])
+                if sc_title_norm in existing_titles:
+                    continue
+                inserted = db.add_release(
+                    mbid=rel["mbid"],
+                    artist_id=artist["id"],
+                    title=rel["title"],
+                    release_type=rel["type"],
+                    release_date=rel.get("date", ""),
+                    notified=1,
+                    source="soundcloud",
+                    soundcloud_track_id=rel.get("soundcloud_track_id", ""),
+                    artwork_url=rel.get("artwork_url", ""),
+                )
+                if inserted:
+                    count += 1
 
         return {"status": "linked", "artist": artist, "releases_imported": count}
 
@@ -381,7 +566,8 @@ async def add_artist(body: ArtistAddRequest):
         mbid=body.id if body.source == "musicbrainz" else "",
         name=body.name,
         disambiguation=body.disambiguation,
-        itunes_artist_id=int(body.id) if body.source == "itunes" else None
+        itunes_artist_id=int(body.id) if body.source == "itunes" else None,
+        soundcloud_permalink=body.id if body.source == "soundcloud" else None,
     )
 
     # Import releases based on source
@@ -402,6 +588,17 @@ async def add_artist(body: ArtistAddRequest):
             )
             if inserted:
                 count += 1
+                # Fetch and store tracklist for albums/EPs (used for SC dedup)
+                if rel["type"] in ("Album", "EP"):
+                    try:
+                        tracks = await musicbrainz.get_release_tracks(rel["mbid"], body.id)
+                        if tracks:
+                            db.update_release_track_titles(
+                                db.get_release_by_mbid(rel["mbid"], artist["id"])["id"],
+                                [t["title"] for t in tracks],
+                            )
+                    except Exception:
+                        pass
     elif body.source == "itunes":
         releases = await itunes.get_artist_releases(int(body.id), artist_name=body.name)
         for rel in releases:
@@ -414,6 +611,31 @@ async def add_artist(body: ArtistAddRequest):
                 notified=1,
                 source="itunes",
                 itunes_collection_id=str(rel["id"]),
+                artwork_url=rel.get("artwork_url", ""),
+            )
+            if inserted:
+                count += 1
+    elif body.source == "soundcloud":
+        releases = await soundcloud.get_artist_releases(body.id)
+        # Deduplicate: check against existing release titles AND album/EP tracklists
+        existing_releases = db.get_releases(artist_id=artist["id"])
+        existing_titles = {_normalize_release_title(r["title"]) for r in existing_releases}
+        album_track_titles = db.get_artist_all_track_titles(artist["id"])
+        for rel in releases:
+            sc_title_norm = _normalize_release_title(rel["title"])
+            if sc_title_norm in existing_titles:
+                continue
+            if sc_title_norm in album_track_titles:
+                continue
+            inserted = db.add_release(
+                mbid=rel["mbid"],
+                artist_id=artist["id"],
+                title=rel["title"],
+                release_type=rel["type"],
+                release_date=rel.get("date", ""),
+                notified=1,
+                source="soundcloud",
+                soundcloud_track_id=rel.get("soundcloud_track_id", ""),
                 artwork_url=rel.get("artwork_url", ""),
             )
             if inserted:
@@ -440,6 +662,25 @@ async def unlink_artist_mb(artist_id: int):
     return {"status": "unlinked", "artist": artist}
 
 
+@app.post("/api/artists/{artist_id}/unlink-soundcloud")
+async def unlink_artist_soundcloud(artist_id: int):
+    artist = db.unlink_artist_soundcloud(artist_id)
+    return {"status": "unlinked", "artist": artist}
+
+
+class DisambiguationUpdate(BaseModel):
+    disambiguation: str = ""
+
+
+@app.post("/api/artists/{artist_id}/disambiguation")
+async def set_artist_disambiguation(artist_id: int, body: DisambiguationUpdate):
+    """Set a tracked artist's disambiguation note (free text, may be empty)."""
+    artist = db.update_artist_disambiguation(artist_id, body.disambiguation or "")
+    if artist is None:
+        return {"status": "error", "message": "Artist not found"}
+    return {"status": "ok", "artist": artist}
+
+
 @app.get("/api/artists/export")
 async def export_artists():
     """Export tracked artists as a JSON file."""
@@ -448,13 +689,14 @@ async def export_artists():
 
     artists = db.get_all_artists()
     payload = {
-        "version": 2,  # Bumped version due to itunes_artist_id inclusion
+        "version": 3,  # Bumped version due to soundcloud_permalink inclusion
         "artists": [
             {
                 "mbid": a["mbid"],
                 "name": a["name"],
                 "disambiguation": a["disambiguation"],
                 "itunes_artist_id": a.get("itunes_artist_id"),
+                "soundcloud_permalink": a.get("soundcloud_permalink"),
             }
             for a in artists
         ]
@@ -492,6 +734,7 @@ async def import_artists(request: Request):
         name = entry.get("name")
         disambiguation = entry.get("disambiguation", "")
         itunes_artist_id = entry.get("itunes_artist_id")
+        soundcloud_permalink = entry.get("soundcloud_permalink")
         if itunes_artist_id:
             try:
                 itunes_artist_id = int(itunes_artist_id)
@@ -505,11 +748,13 @@ async def import_artists(request: Request):
             existing = db.get_artist_by_mbid(mbid)
         if not existing and itunes_artist_id:
             existing = db.get_artist_by_itunes_id(itunes_artist_id)
+        if not existing and soundcloud_permalink:
+            existing = db.get_artist_by_soundcloud_permalink(soundcloud_permalink)
         if existing:
             skipped += 1
             continue
         try:
-            db.add_artist(mbid or "", name, disambiguation, itunes_artist_id=itunes_artist_id)
+            db.add_artist(mbid or "", name, disambiguation, itunes_artist_id=itunes_artist_id, soundcloud_permalink=soundcloud_permalink)
             added += 1
         except Exception as e:
             errors.append(f"Failed to add {name}: {e}")
@@ -523,6 +768,8 @@ async def list_releases(
     artist_id: Optional[int] = Query(None),
     type: Optional[str] = Query(None),
     unseen_only: bool = Query(False),
+    include_hidden: bool = Query(False),
+    hidden_only: bool = Query(False),
 ):
     # Parse comma-separated type filter; empty means "all"
     type_list = [t.strip() for t in type.split(",")] if type else None
@@ -530,12 +777,24 @@ async def list_releases(
         artist_id=artist_id,
         release_type=type_list,
         unseen_only=unseen_only,
+        include_hidden=include_hidden or hidden_only,
+        hidden_only=hidden_only,
     )
 
 @app.post("/api/releases/{release_id}/seen")
 async def mark_seen(release_id: int):
     db.mark_release_seen(release_id)
     return {"status": "ok"}
+
+@app.post("/api/releases/{release_id}/hide")
+async def hide_release(release_id: int):
+    db.set_release_visible(release_id, False)
+    return {"status": "hidden"}
+
+@app.post("/api/releases/{release_id}/unhide")
+async def unhide_release(release_id: int):
+    db.set_release_visible(release_id, True)
+    return {"status": "visible"}
 
 @app.post("/api/releases/all_seen")
 async def mark_all_seen():
@@ -566,6 +825,9 @@ async def get_release_tracks(release_id: str):
     if source == "itunes":
         collection_id = release.get("itunes_collection_id") or release_id
         tracks = await itunes.get_release_tracks(int(collection_id))
+    elif source == "soundcloud":
+        track_id = release.get("soundcloud_track_id") or release_id
+        tracks = await soundcloud.get_release_tracks(track_id)
     else:
         # Pass the tracked artist's MBID so their own credit is filtered out
         # of per-track "feat." listings
@@ -608,6 +870,8 @@ async def get_release_streaming(release_id: str):
     source = release.get("source", "musicbrainz")
     if source == "itunes":
         return {"mbid": release_id, "streaming": []}
+    if source == "soundcloud":
+        return {"mbid": release_id, "streaming": []}
 
     streaming = await musicbrainz.get_release_streaming_urls(release_id)
     return {"mbid": release_id, "streaming": streaming}
@@ -632,14 +896,22 @@ def _titles_match(a: str, b: str) -> bool:
 # --- Check endpoint (SSE) ---
 
 def _artist_sources(artist: dict) -> list[str]:
-    """Sources configured for an artist ('musicbrainz', 'itunes' or both)."""
+    """Sources configured for an artist, filtered by enabled settings."""
+    enabled = _enabled_sources()
     sources = []
-    if artist.get("mbid"):
+    if artist.get("mbid") and "musicbrainz" in enabled:
         sources.append("musicbrainz")
-    if artist.get("itunes_artist_id"):
+    if artist.get("itunes_artist_id") and "itunes" in enabled:
         sources.append("itunes")
-    # Default to musicbrainz if neither is set (legacy)
-    return sources or ["musicbrainz"]
+    if artist.get("soundcloud_permalink") and "soundcloud" in enabled:
+        sources.append("soundcloud")
+    if sources:
+        return sources
+    # Artist has IDs but all of them are disabled -> fetch nothing
+    if artist.get("mbid") or artist.get("itunes_artist_id") or artist.get("soundcloud_permalink"):
+        return []
+    # Legacy row with no IDs at all: keep old default so callers no-op safely
+    return enabled[:1] if enabled else ["musicbrainz"]
 
 
 async def _fetch_artist_new_titles(artist: dict) -> list[str]:
@@ -650,6 +922,7 @@ async def _fetch_artist_new_titles(artist: dict) -> list[str]:
     """
     has_mb = bool(artist.get("mbid"))
     has_itunes = bool(artist.get("itunes_artist_id"))
+    has_sc = bool(artist.get("soundcloud_permalink"))
 
     new_titles = []
     for source in _artist_sources(artist):
@@ -669,6 +942,19 @@ async def _fetch_artist_new_titles(artist: dict) -> list[str]:
                 )
                 if inserted:
                     new_titles.append(rel["title"])
+                    # Fetch and store tracklist for albums/EPs (used for SC dedup)
+                    if rel["type"] in ("Album", "EP"):
+                        try:
+                            tracks = await musicbrainz.get_release_tracks(rel["mbid"], artist.get("mbid", ""))
+                            if tracks:
+                                release_row = db.get_release_by_mbid(rel["mbid"], artist["id"])
+                                if release_row:
+                                    db.update_release_track_titles(
+                                        release_row["id"],
+                                        [t["title"] for t in tracks],
+                                    )
+                        except Exception:
+                            pass
         elif source == "itunes" and has_itunes:
             releases = await itunes.get_artist_releases(artist["itunes_artist_id"], artist_name=artist["name"])
             # Get existing MB releases for this artist to check for duplicates
@@ -688,6 +974,32 @@ async def _fetch_artist_new_titles(artist: dict) -> list[str]:
                     notified=0,
                     source="itunes",
                     itunes_collection_id=str(rel["id"]),
+                    artwork_url=rel.get("artwork_url", ""),
+                )
+                if inserted:
+                    new_titles.append(rel["title"])
+        elif source == "soundcloud" and has_sc:
+            releases = await soundcloud.get_artist_releases(artist["soundcloud_permalink"])
+            # Deduplicate: check against existing release titles AND album/EP tracklists.
+            existing_releases = db.get_releases(artist_id=artist["id"])
+            existing_titles = {_normalize_release_title(r["title"]) for r in existing_releases}
+            # Also collect track titles from album/EP tracklists
+            album_track_titles = db.get_artist_all_track_titles(artist["id"])
+            for rel in releases:
+                sc_title_norm = _normalize_release_title(rel["title"])
+                if sc_title_norm in existing_titles:
+                    continue
+                if sc_title_norm in album_track_titles:
+                    continue
+                inserted = db.add_release(
+                    mbid=rel["mbid"],
+                    artist_id=artist["id"],
+                    title=rel["title"],
+                    release_type=rel["type"],
+                    release_date=rel.get("date", ""),
+                    notified=0,
+                    source="soundcloud",
+                    soundcloud_track_id=rel.get("soundcloud_track_id", ""),
                     artwork_url=rel.get("artwork_url", ""),
                 )
                 if inserted:
@@ -720,7 +1032,7 @@ async def check_releases(skip: int = Query(0), artist_id: Optional[int] = Query(
 
         total = len(artists)
 
-        _add_log("INFO", f"Starting scan for {total} artist(s) (skip={skip})")
+        _add_log("INFO", f"Starting scan for {total} artist(s) (skip={skip}) — enabled sources: {', '.join(s.upper() for s in _enabled_sources())}")
 
         if total == 0 or skip >= total:
             yield _sse({"type": "done", "message": "No artists to check.", "summary": [], "skip": skip, "total_checked": 0})
@@ -732,15 +1044,16 @@ async def check_releases(skip: int = Query(0), artist_id: Optional[int] = Query(
         async def check_one(artist: dict) -> tuple[list[str], str]:
             """Check one artist. Returns (new_titles, "") or ([], error_message).
             A failure is logged here; callers decide whether to skip or retry."""
-            sources = ", ".join(s.upper() for s in _artist_sources(artist))
+            artist_sources = _artist_sources(artist)
+            sources_str = ", ".join(s.upper() for s in artist_sources)
             try:
                 titles = await _fetch_artist_new_titles(artist)
                 return titles, ""
             except Exception as e:
                 error_msg = _error_message(e)
-                _add_log("ERROR", f"Failed to fetch releases from {sources}, skipping for now",
+                _add_log("ERROR", f"Failed to fetch releases from {sources_str}, skipping for now",
                          artist=artist["name"], detail=error_msg)
-                return [], f"{artist['name']} ({sources}): {error_msg}"
+                return [], f"{artist['name']} ({sources_str}): {error_msg}"
 
         def record_success(artist: dict, new_titles: list[str]):
             _add_log("INFO", f"Checked OK - {len(new_titles)} new release(s)", artist=artist["name"])
@@ -752,10 +1065,11 @@ async def check_releases(skip: int = Query(0), artist_id: Optional[int] = Query(
 
         # --- Pass 1: everyone ---
         for i, artist in enumerate(artists[skip:], skip + 1):
-            sources = ", ".join(s.upper() for s in _artist_sources(artist))
+            artist_sources = _artist_sources(artist)
+            sources_str = ", ".join(s.upper() for s in artist_sources)
             yield _sse({
                 "type": "progress",
-                "message": f"Checking {sources} - artist {i} of {total}: {artist['name']}...",
+                "message": f"Checking {len(artist_sources)} source(s) ({sources_str}) - artist {i} of {total}: {artist['name']}...",
                 "current": i,
                 "total": total,
             })
@@ -821,6 +1135,189 @@ async def clear_logs():
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
+
+
+# --- Settings endpoints ---
+
+@app.get("/api/settings")
+async def get_settings():
+    """Return all settings."""
+    return db.get_all_settings()
+
+
+@app.post("/api/settings")
+async def save_settings(request: Request):
+    """Save settings."""
+    body = await request.json()
+    for key, value in body.items():
+        # Dedup lists have dedicated endpoints (JSON); skip here to avoid
+        # storing a Python-repr string accidentally.
+        if key in ("dedup_ignores", "explicit_map"):
+            continue
+        db.set_setting(key, str(value))
+    return {"status": "ok"}
+
+
+@app.get("/api/settings/dedup-ignores")
+async def get_dedup_ignores():
+    """Return user-defined title suffixes ignored for duplicate detection."""
+    return {"ignores": db.get_dedup_ignores(), "defaults": db.DEFAULT_DEDUP_IGNORES}
+
+
+@app.put("/api/settings/dedup-ignores")
+async def put_dedup_ignores(request: Request):
+    """Replace the title ignore list (validated, deduped)."""
+    body = await request.json()
+    ignores = body.get("ignores", [])
+    if not isinstance(ignores, list):
+        return {"status": "error", "message": "ignores must be a list"}
+    cleaned = db.set_dedup_ignores(ignores)
+    return {"status": "ok", "ignores": cleaned}
+
+
+@app.get("/api/settings/explicit-map")
+async def get_explicit_map():
+    """Return user-defined [censored, clean] pairs for duplicate detection."""
+    return {"mappings": db.get_explicit_map(), "defaults": db.DEFAULT_EXPLICIT_MAP}
+
+
+@app.put("/api/settings/explicit-map")
+async def put_explicit_map(request: Request):
+    """Replace the explicit-word mapping list (validated, deduped)."""
+    body = await request.json()
+    mappings = body.get("mappings", [])
+    if not isinstance(mappings, list):
+        return {"status": "error", "message": "mappings must be a list"}
+    cleaned = db.set_explicit_map(mappings)
+    return {"status": "ok", "mappings": cleaned}
+
+
+@app.post("/api/dedup")
+async def run_dedup():
+    """Run deduplication manually on all existing releases."""
+    hidden = _remove_startup_duplicates()
+    return {"hidden": hidden}
+
+
+# --- Startup dedup ---
+
+def _remove_startup_duplicates() -> int:
+    """Remove duplicate releases from the database.
+
+    Finds releases with matching (artist_id, normalized title) and keeps only
+    the one with the earliest first_seen_at. Returns the number removed.
+    """
+    def _norm(title: str) -> str:
+        return db.normalize_release_title(title)
+
+    conn = db.get_db()
+    hidden = 0
+    rows = conn.execute(
+        "SELECT id, artist_id, title FROM releases ORDER BY artist_id, first_seen_at"
+    ).fetchall()
+
+    # Group by (artist_id, normalized_title)
+    groups: dict[tuple[int, str], list[int]] = {}
+    for row in rows:
+        key = (row["artist_id"], _norm(row["title"]))
+        groups.setdefault(key, []).append(row["id"])
+
+    for ids in groups.values():
+        if len(ids) > 1:
+            # Keep the first (earliest first_seen_at), hide the rest
+            to_hide = ids[1:]
+            placeholders = ",".join("?" for _ in to_hide)
+            conn.execute(f"UPDATE releases SET is_visible = 0 WHERE id IN ({placeholders})", to_hide)
+            hidden += len(to_hide)
+
+    # Also hide SC releases whose titles appear in album/EP tracklists
+    import json
+    track_rows = conn.execute(
+        "SELECT artist_id, track_titles FROM releases WHERE track_titles != ''"
+    ).fetchall()
+    # Build set of (artist_id, normalized_track_title) from album/EP tracklists
+    album_tracks: set[tuple[int, str]] = set()
+    for tr in track_rows:
+        try:
+            tracks = json.loads(tr["track_titles"])
+            for t in tracks:
+                album_tracks.add((tr["artist_id"], _norm(t)))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    if album_tracks:
+        sc_rows = conn.execute(
+            "SELECT id, artist_id, title FROM releases WHERE source = 'soundcloud' AND is_visible = 1"
+        ).fetchall()
+        to_hide = []
+        for sr in sc_rows:
+            if (sr["artist_id"], _norm(sr["title"])) in album_tracks:
+                to_hide.append(sr["id"])
+        if to_hide:
+            placeholders = ",".join("?" for _ in to_hide)
+            conn.execute(f"UPDATE releases SET is_visible = 0 WHERE id IN ({placeholders})", to_hide)
+            hidden += len(to_hide)
+
+    conn.commit()
+    return hidden
+
+
+async def _backfill_tracklists():
+    """Fetch and store tracklists for MB album/EP releases that are missing them."""
+    import asyncio
+    conn = db.get_db()
+    rows = conn.execute(
+        """SELECT r.id, r.mbid, r.artist_id, a.mbid as artist_mbid
+           FROM releases r
+           JOIN artists a ON r.artist_id = a.id
+           WHERE r.source = 'musicbrainz'
+           AND r.release_type IN ('Album', 'EP')
+           AND (r.track_titles = '' OR r.track_titles IS NULL)"""
+    ).fetchall()
+
+    if not rows:
+        return
+
+    _add_log("INFO", f"Backfilling tracklists for {len(rows)} MB release(s)...")
+    # Bounded concurrency: request starts stay paced >=1s by the MB limiter,
+    # but in-flight requests overlap instead of running strictly serially.
+    sem = asyncio.Semaphore(4)
+    filled = 0
+
+    async def _fill_one(row) -> bool:
+        async with sem:
+            try:
+                tracks = await musicbrainz.get_release_tracks(row["mbid"], row["artist_mbid"] or "")
+            except Exception:
+                return False
+            if tracks:
+                db.update_release_track_titles(row["id"], [t["title"] for t in tracks])
+                return True
+            return False
+
+    for coro in asyncio.as_completed([_fill_one(r) for r in rows]):
+        try:
+            if await coro:
+                filled += 1
+        except Exception:
+            continue
+    if filled:
+        _add_log("INFO", f"Backfilled tracklists for {filled} release(s)")
+
+
+# --- Source settings helper ---
+
+def _enabled_sources() -> list[str]:
+    """Return list of enabled source keys from settings."""
+    settings = db.get_all_settings()
+    sources = []
+    if settings.get("source_musicbrainz", "1") == "1":
+        sources.append("musicbrainz")
+    if settings.get("source_itunes", "1") == "1":
+        sources.append("itunes")
+    if settings.get("source_soundcloud", "1") == "1":
+        sources.append("soundcloud")
+    return sources
 
 
 # --- Entry point ---

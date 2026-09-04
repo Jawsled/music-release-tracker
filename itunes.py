@@ -34,8 +34,27 @@ def _get_client() -> httpx.AsyncClient:
     return _client
 
 
+async def _pace_request() -> None:
+    """Space request starts >=1s apart.
+
+    Only the timestamp check is serialized; network I/O happens outside the
+    lock so concurrent requests overlap in flight instead of queueing behind
+    each other (previously a retry sleep blocked ALL requests).
+    """
+    global _last_request_time
+    while True:
+        async with _lock:
+            now = time.monotonic()
+            elapsed = now - _last_request_time
+            if elapsed >= 1.0:
+                _last_request_time = now
+                return
+            delay = 1.0 - elapsed
+        await asyncio.sleep(delay)
+
+
 async def _rate_limited_get(url: str, params: dict) -> dict:
-    """Make a GET request with rate limiting and serialization.
+    """Make a GET request with rate limiting (starts spaced >=1s apart).
 
     Retries automatically on:
       - 503 errors (cooldown waits)
@@ -44,63 +63,57 @@ async def _rate_limited_get(url: str, params: dict) -> dict:
     Raises the underlying exception once all retries are exhausted.
     Every retry is logged so it shows up in the UI log.
     """
-    global _last_request_time
     last_err: Exception | None = None
 
     for attempt in range(max(MAX_503_RETRIES, MAX_NET_RETRIES) + 1):
-        async with _lock:
-            now = time.monotonic()
-            elapsed = now - _last_request_time
-            if elapsed < 1.0:
-                await asyncio.sleep(1.0 - elapsed)
-            _last_request_time = time.monotonic()
+        await _pace_request()
 
-            client = _get_client()
-            try:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                return resp.json()
-            except httpx.HTTPStatusError as e:
-                last_err = e
-                if e.response.status_code == 503 and attempt < MAX_503_RETRIES:
-                    cooldown = COOLDOWN_503_RETRY if attempt > 0 else COOLDOWN_503
-                    logger.warning(
-                        f"iTunes rate limit (503), retrying "
-                        f"{attempt + 1}/{MAX_503_RETRIES} in {cooldown:.0f}s",
-                        extra={"detail": url},
-                    )
-                    await asyncio.sleep(cooldown)
-                    continue
-                logger.error(f"HTTP error {e.response.status_code} on {url}, giving up",
+        client = _get_client()
+        try:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            if e.response.status_code == 503 and attempt < MAX_503_RETRIES:
+                cooldown = COOLDOWN_503_RETRY if attempt > 0 else COOLDOWN_503
+                logger.warning(
+                    f"iTunes rate limit (503), retrying "
+                    f"{attempt + 1}/{MAX_503_RETRIES} in {cooldown:.0f}s",
+                    extra={"detail": url},
+                )
+                await asyncio.sleep(cooldown)
+                continue
+            logger.error(f"HTTP error {e.response.status_code} on {url}, giving up",
+                         extra={"detail": str(e)})
+            raise
+        except httpx.TimeoutException as e:
+            last_err = e
+            if attempt >= MAX_NET_RETRIES:
+                logger.error(f"Timeout on {url} after {attempt + 1} attempts, giving up",
                              extra={"detail": str(e)})
                 raise
-            except httpx.TimeoutException as e:
-                last_err = e
-                if attempt >= MAX_NET_RETRIES:
-                    logger.error(f"Timeout on {url} after {attempt + 1} attempts, giving up",
-                                 extra={"detail": str(e)})
-                    raise
-                delay = NET_BACKOFF_BASE * (2 ** attempt)
-                logger.warning(
-                    f"Timeout, retrying {attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
-                    extra={"detail": url},
-                )
-                await asyncio.sleep(delay)
-                continue
-            except httpx.RequestError as e:
-                last_err = e
-                if attempt >= MAX_NET_RETRIES:
-                    logger.error(f"Network error on {url} after {attempt + 1} attempts, giving up",
-                                 extra={"detail": str(e)})
-                    raise
-                delay = NET_BACKOFF_BASE * (2 ** attempt)
-                logger.warning(
-                    f"Network error ({type(e).__name__}), retrying "
-                    f"{attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
-                    extra={"detail": url},
-                )
-                await asyncio.sleep(delay)
-                continue
+            delay = NET_BACKOFF_BASE * (2 ** attempt)
+            logger.warning(
+                f"Timeout, retrying {attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
+                extra={"detail": url},
+            )
+            await asyncio.sleep(delay)
+            continue
+        except httpx.RequestError as e:
+            last_err = e
+            if attempt >= MAX_NET_RETRIES:
+                logger.error(f"Network error on {url} after {attempt + 1} attempts, giving up",
+                             extra={"detail": str(e)})
+                raise
+            delay = NET_BACKOFF_BASE * (2 ** attempt)
+            logger.warning(
+                f"Network error ({type(e).__name__}), retrying "
+                f"{attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
+                extra={"detail": url},
+            )
+            await asyncio.sleep(delay)
+            continue
 
     assert last_err is not None
     raise last_err
@@ -262,49 +275,55 @@ def normalize_date_for_sort(date_str: str) -> str:
     return "-".join(parts[:3])
 
 
+_album_count_cache: dict[tuple[int, str], tuple[int, bool]] = {}
+
+
+async def get_artist_album_count(artist_id: int, country: str = "us") -> tuple[int, bool]:
+    """Count an artist's albums on iTunes/Apple Music.
+
+    Single lookup request (entity=album); the response's resultCount covers
+    the artist entry plus releases, capped at the request limit. Returns
+    (albums, capped). Results are cached per session.
+    """
+    key = (int(artist_id), country or "us")
+    if key in _album_count_cache:
+        return _album_count_cache[key]
+
+    data = await _rate_limited_get(
+        LOOKUP_URL,
+        params={"id": key[0], "entity": "album", "limit": 200, "country": key[1]},
+    )
+    results = data.get("results", []) or []
+    # resultCount includes the artist entry itself; collections carry collectionId
+    albums = sum(1 for r in results if r.get("collectionId"))
+    capped = len(results) >= 200 and data.get("resultCount", 0) >= 200
+    _album_count_cache[key] = (albums, capped)
+    return albums, capped
+
+
 async def get_release_tracks(collection_id: int | str, country: str = "us") -> list[dict]:
     """Fetch tracks for an iTunes/Apple Music release by collection ID.
 
-    Uses the iTunes Lookup API to find the album, then fetches its tracks
-    via a song search scoped to that collection.
+    Single lookup request with entity=song: the response contains the
+    collection followed by all of its tracks (wrapperType=track), so no
+    fuzzy text search is needed.
     """
     collection_id = int(collection_id)
 
-    # Step 1 – look up the collection to get its name
-    lookup_data = await _rate_limited_get(
+    data = await _rate_limited_get(
         "https://itunes.apple.com/lookup",
-        params={"id": collection_id, "country": country},
+        params={"id": collection_id, "entity": "song", "limit": 200, "country": country},
     )
 
-    results = lookup_data.get("results", [])
+    results = data.get("results", [])
     if not results:
         return []
 
-    collection = results[0]
-    collection_name = collection.get("collectionName", "")
-    artist_name = collection.get("artistName", "")
-
-    if not collection_name or not artist_name:
-        return []
-
-    # Step 2 – search for songs in this collection
-    songs_data = await _rate_limited_get(
-        BASE_URL,
-        params={
-            "term": f"{artist_name} {collection_name}",
-            "entity": "song",
-            "limit": 200,
-            "country": country,
-        },
-    )
-
-    # Filter to only songs belonging to this collection
-    songs = [
-        s for s in songs_data.get("results", [])
-        if s.get("collectionId") == collection_id
-    ]
-
     # Sort by track number
+    songs = [
+        s for s in results
+        if s.get("wrapperType") == "track" and s.get("collectionId") == collection_id
+    ]
     songs.sort(key=lambda s: (s.get("trackNumber", 0), s.get("trackTimeMillis", 0)))
 
     seen_track_numbers = set()

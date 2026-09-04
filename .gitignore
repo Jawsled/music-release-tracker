@@ -1,4 +1,16 @@
 .venv/
 __pycache__/
 BACKUP/
-music-release-tracker.db
+.env
+
+# dbs (personal data)
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# OS junk
+Thumbs.db
+.DS_Store
