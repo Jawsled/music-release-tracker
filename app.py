@@ -78,23 +78,37 @@ async def _startup_refresh():
     _add_log("INFO", f"Startup refresh: checking {len(artists)} artist(s) for new releases...")
     total_new = 0
     failed: list[dict] = []
-    for artist in artists:
+    sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+
+    async def run_one(artist: dict) -> tuple[dict, list[str], bool]:
+        async with sem:
+            try:
+                return artist, await _fetch_artist_new_titles(artist), True
+            except Exception as e:
+                _add_log("ERROR", "Startup refresh failed, will retry at the end",
+                         artist=artist["name"], detail=_error_message(e))
+                failed.append(artist)
+                return artist, [], False
+
+    async def run_retry(artist: dict) -> tuple[dict, list[str], bool]:
         try:
-            titles = await _fetch_artist_new_titles(artist)
-        except Exception as e:
-            _add_log("ERROR", "Startup refresh failed, will retry at the end",
-                     artist=artist["name"], detail=_error_message(e))
-            failed.append(artist)
-            continue
-        _add_log("INFO", f"Checked OK - {len(titles)} new release(s)", artist=artist["name"])
-        total_new += len(titles)
-    for artist in failed:
-        try:
-            titles = await _fetch_artist_new_titles(artist)
+            return artist, await _fetch_artist_new_titles(artist), True
         except Exception as e:
             _add_log("ERROR", "Startup refresh failed again, skipping",
                      artist=artist["name"], detail=_error_message(e))
+            return artist, [], False
+
+    for coro in asyncio.as_completed([run_one(a) for a in artists]):
+        artist, titles, ok = await coro
+        if not ok:
             continue
+        _add_log("INFO", f"Checked OK - {len(titles)} new release(s)", artist=artist["name"])
+        total_new += len(titles)
+    for artist in list(failed):
+        _, titles, ok = await run_retry(artist)
+        if not ok:
+            continue
+        failed.remove(artist)
         _add_log("INFO", f"Checked OK on retry - {len(titles)} new release(s)", artist=artist["name"])
         total_new += len(titles)
     _add_log("INFO", f"Startup refresh complete. Found {total_new} new release(s).")
@@ -904,6 +918,29 @@ def _titles_match(a: str, b: str) -> bool:
 
 # --- Check endpoint (SSE) ---
 
+# Artists checked concurrently per scan. Request starts stay paced >=1s per
+# source by the API rate limiters, so this only overlaps latency — it cannot
+# hammer MusicBrainz/iTunes/SoundCloud.
+SCAN_CONCURRENCY = 5
+
+
+async def _check_one_artist(artist: dict) -> tuple[list[str], str]:
+    """Check one artist. Returns (new_titles, "") or ([], error_message).
+
+    Shared by the SSE scan and the startup refresh. A failure is logged
+    here; callers decide whether to skip or retry.
+    """
+    artist_sources = _artist_sources(artist)
+    sources_str = ", ".join(s.upper() for s in artist_sources)
+    try:
+        titles = await _fetch_artist_new_titles(artist)
+        return titles, ""
+    except Exception as e:
+        error_msg = _error_message(e)
+        _add_log("ERROR", f"Failed to fetch releases from {sources_str}, skipping for now",
+                 artist=artist["name"], detail=error_msg)
+        return [], f"{artist['name']} ({sources_str}): {error_msg}"
+
 def _artist_sources(artist: dict) -> list[str]:
     """Sources configured for an artist, filtered by enabled settings."""
     enabled = _enabled_sources()
@@ -1050,20 +1087,6 @@ async def check_releases(skip: int = Query(0), artist_id: Optional[int] = Query(
         summary: list[dict] = []
         failed_artists: list[dict] = []
 
-        async def check_one(artist: dict) -> tuple[list[str], str]:
-            """Check one artist. Returns (new_titles, "") or ([], error_message).
-            A failure is logged here; callers decide whether to skip or retry."""
-            artist_sources = _artist_sources(artist)
-            sources_str = ", ".join(s.upper() for s in artist_sources)
-            try:
-                titles = await _fetch_artist_new_titles(artist)
-                return titles, ""
-            except Exception as e:
-                error_msg = _error_message(e)
-                _add_log("ERROR", f"Failed to fetch releases from {sources_str}, skipping for now",
-                         artist=artist["name"], detail=error_msg)
-                return [], f"{artist['name']} ({sources_str}): {error_msg}"
-
         def record_success(artist: dict, new_titles: list[str]):
             _add_log("INFO", f"Checked OK - {len(new_titles)} new release(s)", artist=artist["name"])
             if new_titles:
@@ -1072,24 +1095,52 @@ async def check_releases(skip: int = Query(0), artist_id: Optional[int] = Query(
                     "new_releases": new_titles,
                 })
 
-        # --- Pass 1: everyone ---
-        for i, artist in enumerate(artists[skip:], skip + 1):
-            artist_sources = _artist_sources(artist)
-            sources_str = ", ".join(s.upper() for s in artist_sources)
-            yield _sse({
-                "type": "progress",
-                "message": f"Checking {len(artist_sources)} source(s) ({sources_str}) - artist {i} of {total}: {artist['name']}...",
-                "current": i,
-                "total": total,
-            })
+        # --- Pass 1: everyone, up to SCAN_CONCURRENCY artists at once ---
+        # Completions arrive out of order. `completed` counts finished artists
+        # (drives the progress bar); `resume_at` is the smallest unchecked
+        # 1-based index, so a pause/resume reconnect never skips anyone
+        # (re-checks are idempotent).
+        sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+        pending = artists[skip:]
+        base = skip  # 0-based offset of pending[0] in artists
+        done_idx: set[int] = set()
 
-            new_titles, error_msg = await check_one(artist)
-            if error_msg:
-                failed_artists.append(artist)
-                # Non-fatal: tell the UI about it but keep scanning
-                yield _sse({"type": "warning", "message": f"Skipped {error_msg}"})
-                continue
-            record_success(artist, new_titles)
+        async def run_one(offset: int, artist: dict) -> tuple[int, list[str], str]:
+            async with sem:
+                new_titles, error_msg = await _check_one_artist(artist)
+                return offset, new_titles, error_msg
+
+        tasks = [asyncio.create_task(run_one(n, a)) for n, a in enumerate(pending)]
+        try:
+            for coro in asyncio.as_completed(tasks):
+                offset, new_titles, error_msg = await coro
+                artist = pending[offset]
+                done_idx.add(offset)
+                completed = len(done_idx)
+                resume_at = next(
+                    (n for n in range(len(pending)) if n not in done_idx),
+                    len(pending),
+                )
+                if error_msg:
+                    failed_artists.append(artist)
+                    # Non-fatal: tell the UI about it but keep scanning
+                    yield _sse({"type": "warning", "message": f"Skipped {error_msg}"})
+                else:
+                    record_success(artist, new_titles)
+                yield _sse({
+                    "type": "progress",
+                    "message": f"artist {completed} of {total}: {artist['name']} checked",
+                    "current": base + resume_at,
+                    "completed": completed,
+                    "resume": base + resume_at,
+                    "total": total,
+                })
+        finally:
+            # Pause/close must not leave orphaned checks hammering the APIs
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         # --- Pass 2: one retry for artists that failed (transient timeouts / 503s) ---
         if failed_artists:
@@ -1099,10 +1150,12 @@ async def check_releases(skip: int = Query(0), artist_id: Optional[int] = Query(
                 "type": "progress",
                 "message": f"Retrying {retry_count} failed artist(s)...",
                 "current": total,
+                "completed": total,
+                "resume": total,
                 "total": total,
             })
             for artist in list(failed_artists):
-                new_titles, error_msg = await check_one(artist)
+                new_titles, error_msg = await _check_one_artist(artist)
                 if error_msg:
                     yield _sse({"type": "warning", "message": f"Skipped again {error_msg}"})
                     continue  # stays in failed_artists

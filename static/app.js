@@ -1327,9 +1327,14 @@ function runCheck(skip = 0) {
 
     if (data.type === "progress") {
       if (data.total && !totalArtists) totalArtists = data.total - skip; // remaining artists
-      if (typeof data.current === "number") currentSkip = data.current;
-      if (typeof data.current === "number" && totalArtists) {
-        const pct = Math.round((data.current / (skip + totalArtists)) * 100);
+      // `completed` counts finished artists (drives the bar); `resume` is the
+      // contiguous checkpoint pause/resume restarts from. Fall back to the
+      // legacy `current` field if an older server omits them.
+      const done = typeof data.completed === "number" ? data.completed : data.current;
+      if (typeof data.resume === "number") currentSkip = data.resume;
+      else if (typeof data.current === "number") currentSkip = data.current;
+      if (typeof done === "number" && totalArtists) {
+        const pct = Math.round(((skip + done) / (skip + totalArtists)) * 100);
         checkProgressBar.style.width = pct + "%";
 
         // Live percentage on button too
