@@ -2,7 +2,7 @@
 Music Release Tracker — Launcher
 
 Run this script to start the app. On first run it will:
-  1. Create a virtual environment (.venv/)
+  1. Create a launcher-only virtual environment (.venv-run/)
   2. Install dependencies from requirements.txt
   3. Start the app and open your browser
 
@@ -12,13 +12,15 @@ Usage:
     python run.py
 """
 
+
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
-VENV_DIR = APP_DIR / ".venv"
+# Keep the legacy launcher environment separate from uv's project environment.
+VENV_DIR = APP_DIR / ".venv-run"
 REQUIREMENTS = APP_DIR / "requirements.txt"
 MARKER = VENV_DIR / ".installed"
 

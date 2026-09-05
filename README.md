@@ -36,7 +36,7 @@ On Windows you can instead run `Music-Release-Tracker.bat`. To add it to the Sta
 C:\ProgramData\Microsoft\Windows\Start Menu\Programs
 ```
 
-That's it. On first run the app creates a virtual environment, installs dependencies automatically, then opens the web UI at `http://127.0.0.1:7070`.
+That's it. On first run the app creates a dedicated launcher environment, installs dependencies automatically, then opens the web UI at `http://127.0.0.1:7070`.
 
 ### Conda (optional)
 
@@ -107,7 +107,14 @@ Telegram support was dropped during a significant rewrite. Feel free to build yo
 - Python 3.8+
 - Internet connection (for MusicBrainz / iTunes / SoundCloud APIs)
 
-All dependencies are installed automatically by `run.py` (see [`requirements.txt`](requirements.txt)).
+The original launcher installs dependencies automatically into its dedicated `.venv-run/` environment from [`requirements.txt`](requirements.txt). If you use uv, the project environment is kept separately in `.venv/`:
+
+```bash
+uv sync
+uv run music-release-tracker
+```
+
+Do not point `run.py` at uv's `.venv`; the two launch methods intentionally use separate environments.
 
 ## Acknowledgements
 

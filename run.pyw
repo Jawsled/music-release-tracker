@@ -15,7 +15,8 @@ import threading
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
-VENV_DIR = APP_DIR / ".venv"
+# Keep the legacy launcher environment separate from uv's project environment.
+VENV_DIR = APP_DIR / ".venv-run"
 REQUIREMENTS = APP_DIR / "requirements.txt"
 MARKER = VENV_DIR / ".installed"
 
