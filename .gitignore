@@ -1,4 +1,5 @@
 .venv/
+.venv-run/
 __pycache__/
 BACKUP/
 .env
