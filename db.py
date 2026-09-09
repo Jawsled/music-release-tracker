@@ -213,6 +213,13 @@ def _artist_sort_key(name: str) -> str:
     return "".join(_NON_DECOMPOSABLE.get(c, c) for c in stripped)
 
 
+def get_artist_by_id(artist_id: int) -> dict | None:
+    """Look up an artist by internal row ID (explicit link target)."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM artists WHERE id = ?", (artist_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def get_artist_by_mbid(mbid: str) -> dict | None:
     conn = get_db()
     row = conn.execute("SELECT * FROM artists WHERE mbid = ?", (mbid,)).fetchone()

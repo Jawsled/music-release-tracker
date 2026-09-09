@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 
 import httpx
@@ -436,6 +437,116 @@ async def get_release_streaming_urls(rg_id: str) -> list[dict]:
     process_releases(other_releases)
 
     return out
+
+
+# Match the numeric artist ID at the tail of Apple Music / iTunes artist URLs.
+# Handles localized forms (/us/, /gb/), geo links, and query strings:
+#   music.apple.com/us/artist/name/12345, music.apple.com/artist/12345,
+#   itunes.apple.com/us/artist/.../12345?uo=4
+_APPLE_ARTIST_ID_RE = re.compile(r"/artist/(?:.*/)?(\d+)(?:[/?#]|$)")
+
+# First path segment of a SoundCloud profile URL.
+_SC_PERMALINK_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+_SC_RESERVED_FIRST_SEGMENTS = {
+    "you", "discover", "stream", "search", "people", "stations",
+    "charts", "genres", "albums", "tracks", "playlists",
+}
+
+
+def _extract_apple_artist_id(url: str) -> int | None:
+    """Extract the numeric artist ID from an Apple Music / iTunes artist URL."""
+    if not url:
+        return None
+    m = _APPLE_ARTIST_ID_RE.search(url)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_soundcloud_permalink(url: str) -> str | None:
+    """Extract the profile permalink from a SoundCloud profile URL."""
+    if not url or "soundcloud.com" not in url.lower():
+        return None
+    try:
+        from urllib.parse import urlparse
+        path_segs = [s for s in urlparse(url).path.split("/") if s]
+    except Exception:
+        return None
+    if not path_segs:
+        return None
+    first = path_segs[0]
+    if first.lower() in _SC_RESERVED_FIRST_SEGMENTS:
+        return None
+    if not _SC_PERMALINK_RE.match(first):
+        return None
+    return first.lower()
+
+
+async def get_artist_links(mbid: str) -> dict:
+    """Fetch an artist's external links from MusicBrainz in a single call.
+
+    Queries /artist/{mbid} with inc=url-rels and parses the relations once
+    for two purposes:
+      1. streaming: full streaming-service link list (same shape as
+         get_release_streaming_urls, for on-demand display).
+      2. confirmed IDs: the Apple Music artist ID and SoundCloud permalink
+         from the artist's official URL relationships. These are ground
+         truth for search-result badges and take precedence over fuzzy
+         name-based merging from iTunes text search / SC slug probing.
+
+    Returns {"streaming": [...], "itunes_artist_id": int|None,
+             "soundcloud_permalink": str|None}.
+    """
+    data = await _rate_limited_get(
+        f"{BASE_URL}/artist/{mbid}",
+        params={"inc": "url-rels", "fmt": "json"},
+    )
+
+    relations = data.get("relations") or []
+
+    seen_keys: set[str] = set()
+    streaming: list[dict] = []
+    itunes_artist_id: int | None = None
+    soundcloud_permalink: str | None = None
+
+    for rel in relations:
+        if rel.get("target-type") != "url":
+            continue
+        url_obj = rel.get("url") or {}
+        value = url_obj.get("resource", "")
+        if not value:
+            continue
+        type_str = rel.get("type", "") or ""
+        t = type_str.lower()
+
+        # Streaming display list (reuses release-level classifier, so
+        # "Apple Music Artist" / "SoundCloud" / generic "streaming" all work)
+        mapping = _classify_streaming_service(type_str, value)
+        if mapping and mapping["key"] not in seen_keys:
+            seen_keys.add(mapping["key"])
+            streaming.append({**mapping, "url": value})
+
+        # Confirmed IDs: first valid hit wins (localized Apple duplicates
+        # share the same numeric ID, so order doesn't matter)
+        if itunes_artist_id is None and (
+            "apple music" in t or "itunes" in t
+        ):
+            parsed = _extract_apple_artist_id(value)
+            if parsed:
+                itunes_artist_id = parsed
+        if soundcloud_permalink is None and "soundcloud" in t:
+            parsed_sc = _extract_soundcloud_permalink(value)
+            if parsed_sc:
+                soundcloud_permalink = parsed_sc
+
+    return {
+        "streaming": streaming,
+        "itunes_artist_id": itunes_artist_id,
+        "soundcloud_permalink": soundcloud_permalink,
+    }
 
 
 async def get_artist_releases(mbid: str) -> list[dict]:

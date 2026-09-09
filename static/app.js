@@ -125,11 +125,14 @@ function closeArtistDropdown() {
 // Close dropdown when clicking outside / Esc
 document.addEventListener("click", e => {
   const wrapper = document.getElementById("artist-filter-wrapper");
-  if (!wrapper.contains(e.target)) closeArtistDropdown();
+  if (wrapper && !wrapper.contains(e.target)) closeArtistDropdown();
+  const trackedWrapper = document.getElementById("tracked-filter-wrapper");
+  if (trackedWrapper && !trackedWrapper.contains(e.target)) closeTrackedDropdown();
 });
 document.addEventListener("keydown", e => {
   if (e.key === "Escape") {
     if (!artistDropdownMenu.classList.contains("hidden")) closeArtistDropdown();
+    if (typeof trackedDropdownMenu !== "undefined" && trackedDropdownMenu && !trackedDropdownMenu.classList.contains("hidden")) closeTrackedDropdown();
     if (typeof linkSourceModal !== "undefined" && !linkSourceModal.classList.contains("hidden")) closeLinkSourceModal();
     if (!checkPopup.classList.contains("hidden") && !scanRunning) closeCheckPopup();
     if (!logsPanel.classList.contains("hidden") || !settingsPanel.classList.contains("hidden")) closeSidePanels();
@@ -138,6 +141,9 @@ document.addEventListener("keydown", e => {
   }
   if (!artistDropdownMenu.classList.contains("hidden") && ["ArrowDown", "ArrowUp", "Enter"].includes(e.key)) {
     handleDropdownKey(e);
+  }
+  if (typeof trackedDropdownMenu !== "undefined" && trackedDropdownMenu && !trackedDropdownMenu.classList.contains("hidden") && ["ArrowDown", "ArrowUp", "Enter"].includes(e.key)) {
+    handleTrackedDropdownKey(e);
   }
 });
 
@@ -199,6 +205,154 @@ function selectArtist(id) {
   updateResetFiltersBtn();
   closeArtistDropdown();
   loadReleases();
+}
+
+// --- Tracked Artists Dropdown Logic (Artists tab; filters the artist list) ---
+let activeTrackedFilterId = "";   // selected tracked artist ID (empty = all)
+let _trackedArtists = [];         // full tracked list cache for this tab
+let _trackedFocusIdx = -1;
+let _trackedItems = [];           // {id, name}
+let _trackedDebounce = null;
+const trackedDropdownMenu = document.getElementById("tracked-dropdown-menu");
+const trackedDropdownList = document.getElementById("tracked-dropdown-list");
+const trackedFilterSearch = document.getElementById("tracked-filter-search");
+const filterTrackedBtn = document.getElementById("filter-tracked-btn");
+
+function _trackedAllLabel() {
+  return `All tracked artists (${_trackedArtists.length})`;
+}
+
+function _updateTrackedBtn() {
+  if (!filterTrackedBtn) return;
+  if (!activeTrackedFilterId) {
+    filterTrackedBtn.textContent = _trackedAllLabel();
+    filterTrackedBtn.title = "";
+  } else {
+    const a = _trackedArtists.find(x => String(x.id) === String(activeTrackedFilterId));
+    filterTrackedBtn.textContent = a ? a.name : _trackedAllLabel();
+    filterTrackedBtn.title = a ? a.name : "";
+  }
+}
+
+function toggleTrackedDropdown() {
+  const hidden = trackedDropdownMenu.classList.contains("hidden");
+  if (hidden) {
+    renderTrackedDropdown();
+    trackedDropdownMenu.classList.remove("hidden");
+    filterTrackedBtn.setAttribute("aria-expanded", "true");
+    trackedFilterSearch.value = "";
+    trackedFilterSearch.focus();
+    filterTrackedBtn.style.borderColor = "#8c8c8c";
+  } else {
+    closeTrackedDropdown();
+  }
+}
+
+function closeTrackedDropdown() {
+  if (!trackedDropdownMenu) return;
+  trackedDropdownMenu.classList.add("hidden");
+  if (filterTrackedBtn) {
+    filterTrackedBtn.setAttribute("aria-expanded", "false");
+    filterTrackedBtn.style.borderColor = "";
+  }
+  _trackedFocusIdx = -1;
+}
+
+function renderTrackedDropdown() {
+  const q = trackedFilterSearch.value.trim().toLowerCase();
+  const data = _trackedArtists || [];
+  const filtered = q ? data.filter(a => a.name.toLowerCase().includes(q)) : data;
+
+  _trackedItems = [{ id: "", name: _trackedAllLabel() }, ...filtered.map(a => ({ id: String(a.id), name: a.name }))];
+  _trackedFocusIdx = _trackedItems.findIndex(x => x.id === (activeTrackedFilterId || ""));
+  if (_trackedFocusIdx < 0) _trackedFocusIdx = 0;
+
+  const countEl = document.getElementById("tracked-dropdown-count");
+  if (countEl) countEl.textContent = filtered.length ? `${filtered.length} of ${data.length}` : (data.length ? "No matches" : "No artists tracked");
+
+  let html = `<div class="dropdown-item ${!activeTrackedFilterId ? 'active' : ''}" role="option" data-idx="0" onclick="selectTrackedArtist('')"><em>${esc(_trackedAllLabel())}</em></div>`;
+  filtered.forEach((a, i) => {
+    const activeClass = String(a.id) === String(activeTrackedFilterId) ? " active" : "";
+    html += `<div class="dropdown-item${activeClass}" role="option" data-idx="${i + 1}" onclick="selectTrackedArtist(${a.id})" title="${esc(a.name)}">${esc(a.name)}</div>`;
+  });
+  trackedDropdownList.innerHTML = html || '<p class="status-msg">No artists tracked yet.</p>';
+}
+
+function handleTrackedDropdownKey(e) {
+  e.preventDefault();
+  if (e.key === "ArrowDown") _trackedFocusIdx = Math.min(_trackedFocusIdx + 1, _trackedItems.length - 1);
+  if (e.key === "ArrowUp") _trackedFocusIdx = Math.max(_trackedFocusIdx - 1, 0);
+  if (e.key === "Enter" && _trackedItems[_trackedFocusIdx]) {
+    selectTrackedArtist(_trackedItems[_trackedFocusIdx].id);
+    return;
+  }
+  trackedDropdownList.querySelectorAll(".dropdown-item").forEach(el => {
+    el.classList.toggle("active", Number(el.dataset.idx) === _trackedFocusIdx);
+    if (Number(el.dataset.idx) === _trackedFocusIdx) el.scrollIntoView({ block: "nearest" });
+  });
+}
+
+function filterTrackedList() {
+  clearTimeout(_trackedDebounce);
+  _trackedDebounce = setTimeout(renderTrackedDropdown, 150);
+}
+
+function selectTrackedArtist(id) {
+  activeTrackedFilterId = id ? String(id) : "";
+  _updateTrackedBtn();
+  closeTrackedDropdown();
+  renderTrackedArtists();
+}
+
+function renderTrackedArtists() {
+  const visible = activeTrackedFilterId
+    ? _trackedArtists.filter(a => String(a.id) === String(activeTrackedFilterId))
+    : _trackedArtists;
+  if (!visible.length) {
+    artistListEl.innerHTML = activeTrackedFilterId
+      ? '<div class="empty-wrap"><h3>Artist not found</h3><p>The selected artist is no longer tracked.</p></div>'
+      : '<div class="empty-wrap"><h3>No artists tracked yet</h3><p>Search above or paste a MusicBrainz / Apple Music / SoundCloud link.</p></div>';
+    return;
+  }
+  artistListEl.innerHTML = visible.map(renderTrackedArtistItem).join("");
+}
+
+// --- Tracked-artist MB links viewer ---
+// On-demand panel showing the artist's MusicBrainz url-rels (streaming +
+// confirmed platform links). Same backend endpoint as the search badges;
+// results cached per MBID for the session.
+const _mbArtistLinksCache = {};
+
+async function toggleMbArtistLinks(mbid, btn) {
+  const item = btn ? btn.closest('.artist-item') : null;
+  if (!item) return;
+  const next = item.nextElementSibling;
+  if (next && next.classList && next.classList.contains('mb-links-panel')) {
+    next.remove();
+    return;
+  }
+  // Only one panel open at a time
+  document.querySelectorAll('.mb-links-panel').forEach(p => p.remove());
+  const panel = document.createElement('div');
+  panel.className = 'mb-links-panel';
+  panel.innerHTML = '<p class="status-msg">Loading links from MusicBrainz…</p>';
+  item.after(panel);
+  try {
+    let d = _mbArtistLinksCache[mbid];
+    if (!d) {
+      const resp = await fetch(`/api/mb-artists/${encodeURIComponent(mbid)}/links`);
+      d = await resp.json();
+      _mbArtistLinksCache[mbid] = d;
+    }
+    const streaming = (d && d.streaming) || [];
+    if (!streaming.length) {
+      panel.innerHTML = '<p class="status-msg">No streaming links on this artist\u2019s MusicBrainz page.</p>';
+      return;
+    }
+    panel.innerHTML = `<div class="result-sources">${streamingPillsHTML(streaming)}</div>`;
+  } catch {
+    panel.innerHTML = '<p class="status-msg error">Failed to load links.</p>';
+  }
 }
 
 // --- Type Chip Logic (multi-select; empty = all) ---
@@ -543,6 +697,18 @@ const STREAMING_ICONS = {
   youtube: "youtube.svg",
 };
 
+// Shared pill markup for streaming/external platform links (feed stream
+// section + tracked-artist MB links panel). Same look as the search-result
+// source badges: brand icon in original colors + label + ↗.
+function streamingPillsHTML(streaming) {
+  return (streaming || []).map(s => {
+    const icon = (typeof STREAMING_ICONS !== 'undefined' && STREAMING_ICONS[s.key])
+      ? `<img src="/static/assets/${STREAMING_ICONS[s.key]}" alt="" class="source-icon-inline" style="width:14px;height:14px;margin-left:0;">`
+      : '';
+    return `<a class="result-pill" href="${esc(s.url)}" target="_blank" rel="noopener" title="${esc(s.service)}">${icon}${esc(s.service)} ↗</a>`;
+  }).join("");
+}
+
 function renderStreaming(container, streaming) {
   if (!streaming || streaming.length === 0) {
     container.innerHTML = '<p class="tracklist-empty">No streaming links found for this release.</p>';
@@ -555,18 +721,7 @@ function renderStreaming(container, streaming) {
       <span class="tracklist-count">${streaming.length} link${streaming.length > 1 ? "s" : ""}</span>
     </div>
     <div class="streaming-list">
-      ${streaming.map(s => {
-        const icon = STREAMING_ICONS[s.key];
-        const iconHtml = icon
-          ? `<img class="stream-icon" src="/static/assets/${icon}" alt="${esc(s.service)}" loading="lazy">`
-          : "";
-        return `
-          <a class="stream-link stream-${esc(s.key)}" href="${esc(s.url)}" target="_blank" rel="noopener" title="${esc(s.service)}">
-            ${iconHtml}
-            <span class="stream-label">${esc(s.service)}</span>
-          </a>
-        `;
-      }).join("")}
+      ${streamingPillsHTML(streaming)}
     </div>
   `;
 }
@@ -683,14 +838,30 @@ const SEARCH_PAGE_SIZE = 15;
 
 function searchResultPills(a) {
   const pills = [];
+  // Confirmation titles stay as hover tooltips; the visible ✓ MB marker is
+  // rendered once to the right of the badges (see mbConfirmedTag below).
+  const appleTitle = a._confirmed_apple ? ' title="Apple Music ID confirmed via MusicBrainz relationships"' : '';
+  const scTitle = a._confirmed_sc ? ' title="SoundCloud profile confirmed via MusicBrainz relationships"' : '';
   if (a.source === 'soundcloud' && a.soundcloud_permalink) {
-    if (_srcEnabled('soundcloud')) pills.push(`<a class="result-pill" href="https://soundcloud.com/${esc(a.soundcloud_permalink)}" target="_blank" rel="noopener">${sourceIcon('soundcloud', 14)} SoundCloud ↗</a>`);
+    if (_srcEnabled('soundcloud')) pills.push(`<a class="result-pill" href="https://soundcloud.com/${esc(a.soundcloud_permalink)}" target="_blank" rel="noopener"${scTitle}>${sourceIcon('soundcloud', 14)} SoundCloud ↗</a>`);
   } else {
     if (a.mbid && _srcEnabled('musicbrainz')) pills.push(`<a class="result-pill" href="https://musicbrainz.org/artist/${esc(a.mbid)}" target="_blank" rel="noopener">${sourceIcon('musicbrainz', 14)} MusicBrainz ↗</a>`);
-    if (a.itunes_artist_id && _srcEnabled('itunes')) pills.push(`<a class="result-pill" href="https://music.apple.com/artist/${esc(String(a.name).toLowerCase().replace(/[^a-z0-9]/g, ''))}/${esc(a.itunes_artist_id)}" target="_blank" rel="noopener">${sourceIcon('itunes', 14)} Apple Music ↗</a>`);
-    if (a.soundcloud_permalink && _srcEnabled('soundcloud')) pills.push(`<a class="result-pill" href="https://soundcloud.com/${esc(a.soundcloud_permalink)}" target="_blank" rel="noopener">${sourceIcon('soundcloud', 14)} SoundCloud ↗</a>`);
+    if (a.itunes_artist_id && _srcEnabled('itunes')) pills.push(`<a class="result-pill" href="https://music.apple.com/artist/${esc(String(a.name).toLowerCase().replace(/[^a-z0-9]/g, ''))}/${esc(a.itunes_artist_id)}" target="_blank" rel="noopener"${appleTitle}>${sourceIcon('itunes', 14)} Apple Music ↗</a>`);
+    if (a.soundcloud_permalink && _srcEnabled('soundcloud')) pills.push(`<a class="result-pill" href="https://soundcloud.com/${esc(a.soundcloud_permalink)}" target="_blank" rel="noopener"${scTitle}>${sourceIcon('soundcloud', 14)} SoundCloud ↗</a>`);
   }
-  return pills.length ? `<div class="result-sources">${pills.join("")}</div>` : "";
+  pills.push(mbConfirmedTag(a));
+  const html = pills.join("");
+  return html ? `<div class="result-sources">${html}</div>` : "";
+}
+
+// Visible marker placed to the right of the source badges when MB URL
+// relationships confirmed the Apple Music / SoundCloud links.
+function mbConfirmedTag(a) {
+  const bits = [];
+  if (a._confirmed_apple) bits.push("Apple Music");
+  if (a._confirmed_sc) bits.push("SoundCloud");
+  if (!bits.length) return "";
+  return `<span class="mb-confirmed-tag" title="${esc(bits.join(" + "))} link${bits.length > 1 ? "s" : ""} confirmed via this artist's MusicBrainz page">✓ MB</span>`;
 }
 
 function formatFollowers(n) {
@@ -750,6 +921,87 @@ function enhanceItunesCounts(list, containerEl) {
   });
 }
 
+// --- MusicBrainz-confirmed artist links (Apple Music ID + SC permalink) ---
+// MB artist url-rels are ground truth: when present they override the fuzzy
+// name-based merge from iTunes text search / SC slug probing. Fetched lazily
+// per visible MB row so search stays instant (MB serves ~1 req/sec).
+const _mbLinksCache = {};
+const _mbLinksPending = new Set();
+
+function _applyMbLinksToEntry(a, d) {
+  if (!d) return false;
+  let changed = false;
+  if (d.itunes_artist_id) {
+    if (String(a.itunes_artist_id || "") !== String(d.itunes_artist_id)) {
+      a.itunes_artist_id = d.itunes_artist_id;
+      changed = true;
+    }
+    if (!a._confirmed_apple) { a._confirmed_apple = true; changed = true; }
+  }
+  if (d.soundcloud_permalink) {
+    if ((a.soundcloud_permalink || "").toLowerCase() !== String(d.soundcloud_permalink).toLowerCase()) {
+      a.soundcloud_permalink = d.soundcloud_permalink;
+      changed = true;
+    }
+    if (!a._confirmed_sc) { a._confirmed_sc = true; changed = true; }
+  }
+  if (d.streaming && !a._mb_streaming) a._mb_streaming = d.streaming;
+  return changed;
+}
+
+function _patchSearchRowPills(containerEl, index, a) {
+  const rows = containerEl ? containerEl.querySelectorAll('.search-result-item') : null;
+  const row = rows ? rows[index] : null;
+  if (!row || !row.isConnected) return;
+  const srcWrap = row.querySelector('.result-text');
+  if (srcWrap) {
+    const oldSources = srcWrap.querySelector('.result-sources');
+    const fresh = document.createElement('div');
+    fresh.innerHTML = searchResultPills(a);
+    const freshSources = fresh.firstElementChild;
+    if (oldSources && freshSources) oldSources.replaceWith(freshSources);
+    else if (freshSources) srcWrap.appendChild(freshSources);
+  }
+  // The Add button embeds a JSON snapshot at render time — refresh it so Add
+  // carries the confirmed IDs even though the row isn't fully re-rendered.
+  // NB: setAttribute values are NOT HTML-parsed, so unlike the onclick='...'
+  // markup above this must be raw JSON (no &quot; escaping).
+  const btn = row.querySelector('.add-btn');
+  if (btn) btn.setAttribute('onclick', `addArtist(${JSON.stringify(a)}, this)`);
+}
+
+function enrichSearchRowsWithMbLinks(list, containerEl) {
+  if (!containerEl || !list) return;
+  list.forEach((a, i) => {
+    const mbid = a.mbid;
+    if (!mbid) return;
+    // Backend already confirmed this row's links during search (it skipped
+    // the redundant platform searches) — nothing to fetch.
+    if (a._mb_enriched) return;
+    if (Object.hasOwn(_mbLinksCache, mbid)) {
+      if (_applyMbLinksToEntry(a, _mbLinksCache[mbid])) _patchSearchRowPills(containerEl, i, a);
+      return;
+    }
+    if (_mbLinksPending.has(mbid)) return;
+    _mbLinksPending.add(mbid);
+    fetch(`/api/mb-artists/${encodeURIComponent(mbid)}/links`)
+      .then(r => r.json())
+      .then(d => {
+        _mbLinksCache[mbid] = d;
+        // Upgrade every entry sharing this MBID (visible now or via paging),
+        // then patch the rows of this render in place.
+        for (const entry of _lastSearchResults) {
+          if (entry.mbid === mbid) _applyMbLinksToEntry(entry, d);
+        }
+        list.forEach((entry, j) => {
+          if (entry.mbid === mbid) _patchSearchRowPills(containerEl, j, entry);
+        });
+      })
+      .catch(() => { /* keep name-merged badges on failure */ })
+      .finally(() => _mbLinksPending.delete(mbid));
+  });
+}
+
 function renderSearchPage() {
   const moreWrap = document.getElementById("search-more-wrap");
   const visible = _lastSearchResults.slice(0, _searchVisibleCount);
@@ -776,6 +1028,7 @@ function renderSearchPage() {
   }).join("");
   if (moreWrap) moreWrap.classList.toggle("hidden", _lastSearchResults.length <= _searchVisibleCount);
   enhanceItunesCounts(visible, searchResults);
+  enrichSearchRowsWithMbLinks(visible, searchResults);
 }
 
 let _searchVisibleCount = SEARCH_PAGE_SIZE;
@@ -912,6 +1165,7 @@ async function addArtist(artist, btn) {
   let totalReleases = 0;
   let lastStatus = "";
   let failedSources = 0;
+  let conflictDetail = "";
 
   for (const s of sourcesToAdd) {
     try {
@@ -926,6 +1180,17 @@ async function addArtist(artist, btn) {
         })
       });
       const result = await resp.json();
+      if (result.status === "conflict") {
+        // That platform ID is already tracked under a different artist —
+        // same "already taken" outcome as the link-source modal. Skip only
+        // this source, keep the rest, and report who owns it.
+        failedSources += 1;
+        lastStatus = "conflict";
+        const owner = result.conflicting_artist ? result.conflicting_artist.name : "";
+        conflictDetail = owner ? ` (${s.source} already linked to “${owner}”)` : ` (${s.source} already linked elsewhere)`;
+        showToast(`“${artist.name}”${conflictDetail}`);
+        continue;
+      }
       lastStatus = result.status;
       totalReleases += result.releases_imported || 0;
     } catch {
@@ -938,6 +1203,15 @@ async function addArtist(artist, btn) {
     btn.textContent = "Error — retry";
     btn.disabled = false;
     showToast(`Could not add “${artist.name}” — check connection and retry`);
+    return;
+  }
+
+  if (lastStatus === "conflict" && !totalReleases) {
+    btn.textContent = "Already linked elsewhere — retry";
+    btn.disabled = false;
+    showToast(`Could not add “${artist.name}”${conflictDetail}`);
+    loadArtists();
+    _refreshArtistsCache();
     return;
   }
 
@@ -964,13 +1238,15 @@ async function loadArtists() {
   const resp = await fetch("/api/artists");
   const artists = await resp.json();
   await refreshEnabledSources();
-  const countEl = document.getElementById("tracked-count");
-  if (countEl) countEl.textContent = artists.length ? `(${artists.length})` : "";
+  _trackedArtists = artists;
+  if (activeTrackedFilterId && !_trackedArtists.some(a => String(a.id) === String(activeTrackedFilterId))) {
+    activeTrackedFilterId = "";
+  }
+  _updateTrackedBtn();
+  renderTrackedArtists();
+}
 
-  if (artists.length === 0) {
-    artistListEl.innerHTML = '<div class="empty-wrap"><h3>No artists tracked yet</h3><p>Search above or paste a MusicBrainz / Apple Music / SoundCloud link.</p></div>';
-  } else {
-    artistListEl.innerHTML = artists.map(a => {
+function renderTrackedArtistItem(a) {
       const hasMb = !!a.mbid;
       const hasItunes = !!a.itunes_artist_id;
       const hasSc = !!a.soundcloud_permalink;
@@ -1004,6 +1280,10 @@ async function loadArtists() {
       } else {
         sourceIcons += `<button class="source-icon-btn unlinked" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'soundcloud')" title="Link SoundCloud for ${esc(a.name)}" aria-label="Link SoundCloud for ${esc(a.name)}"><img src="/static/assets/soundcloud.svg" alt=""></button>`;
       }
+      }
+      // MB external links (on-demand viewer for the artist's url-rels)
+      if (hasMb) {
+        sourceIcons += `<button class="source-icon-btn mb-links-btn" onclick="toggleMbArtistLinks('${esc(a.mbid)}', this)" title="View external links from this artist's MusicBrainz page" aria-label="View external links for ${esc(a.name)}"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#aaa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>`;
       }
 
       // Build dropdown menu items (link/unlink hidden for disabled sources)
@@ -1054,8 +1334,6 @@ async function loadArtists() {
           </div>
         </div>
       `;
-    }).join("");
-  }
 }
 
 // --- Artist dropdown menu ---
@@ -2066,9 +2344,9 @@ async function searchLinkSource(query) {
   }
 }
 
-async function linkSource(artist, btn) {
+async function linkSource(artist, btn, force = false) {
   btn.disabled = true;
-  btn.textContent = "Linking...";
+  btn.textContent = force ? "Replacing..." : "Linking...";
 
   try {
     // Determine which source to link
@@ -2100,25 +2378,48 @@ async function linkSource(artist, btn) {
 
     if (!sourceToLink || !idToLink) {
       btn.textContent = "No valid source";
+      btn.disabled = false;
       return;
+    }
+
+    const payload = {
+      source: sourceToLink,
+      id: idToLink,
+      name: artist.name,
+      disambiguation: artist.disambiguation
+    };
+    // Explicit link target: the tracked row the modal was opened from.
+    // The backend links onto it directly instead of name-matching, so a
+    // SoundCloud display name ("Avicii Official") never spawns a new entry
+    // next to the tracked name ("Avicii").
+    if (sourceToLink === "soundcloud" && currentLinkArtistId != null) {
+      payload.artist_id = currentLinkArtistId;
+      if (force) payload.force = true;
     }
 
     const resp = await fetch("/api/artists", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        source: sourceToLink,
-        id: idToLink,
-        name: artist.name,
-        disambiguation: artist.disambiguation
-      })
+      body: JSON.stringify(payload)
     });
     const result = await resp.json();
+
+    if (result.status === "conflict") {
+      const owner = (result.conflicting_artist && result.conflicting_artist.name)
+        || (result.message || "").replace(/^already linked to\s*/i, "")
+        || "another artist";
+      showLinkConflict(btn, artist, `already linked to ${owner}`);
+      return;
+    }
 
     if (result.status === "already_exists") {
       btn.textContent = "Already linked";
     } else if (result.status === "linked") {
       btn.textContent = `Linked (${result.releases_imported || 0} releases)`;
+    } else if (result.status === "error") {
+      btn.textContent = result.message || "Error";
+      btn.disabled = false;
+      return;
     }
 
     // Close modal and refresh artist list
@@ -2128,6 +2429,39 @@ async function linkSource(artist, btn) {
     }, 1000);
   } catch {
     btn.textContent = "Error";
+    btn.disabled = false;
+  }
+}
+
+function showLinkConflict(btn, artist, message) {
+  btn.textContent = "Conflict";
+  const item = btn.closest(".search-result-item") || btn.parentElement;
+  if (item && !item.querySelector(".link-conflict-box")) {
+    const box = document.createElement("div");
+    box.className = "link-conflict-box";
+    const safeMsg = typeof esc === "function" ? esc(message) : message;
+    box.innerHTML = `<span class="link-conflict-msg">${safeMsg}. Replace + unlink from the other entry, or cancel?</span> `;
+    const replaceBtn = document.createElement("button");
+    replaceBtn.className = "add-btn";
+    replaceBtn.textContent = "Replace";
+    replaceBtn.onclick = (e) => {
+      e.stopPropagation();
+      box.remove();
+      linkSource(artist, btn, true);
+    };
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "link-btn";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.onclick = (e) => {
+      e.stopPropagation();
+      box.remove();
+      btn.disabled = false;
+      btn.textContent = "Link";
+    };
+    box.appendChild(replaceBtn);
+    box.appendChild(document.createTextNode(" "));
+    box.appendChild(cancelBtn);
+    item.appendChild(box);
   }
 }
 

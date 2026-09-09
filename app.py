@@ -135,6 +135,8 @@ class ArtistAddRequest(BaseModel):
     id: str  # mbid for musicbrainz, artistId for itunes, permalink for soundcloud
     name: str
     disambiguation: str = ""
+    artist_id: int | None = None  # explicit link target (link-source modal)
+    force: bool = False  # confirmed "replace + unlink from old owner" retry
 
 class iTunesArtistSearchRequest(BaseModel):
     query: str
@@ -310,18 +312,45 @@ async def search_artists(body: ArtistSearchRequest):
             except Exception:
                 return []
 
-        coros = {}
+        # MB-first: when the top MB hit exactly matches the query, its URL
+        # relationships may already confirm the Apple Music ID / SoundCloud
+        # profile — ground truth that makes the fuzzy iTunes text search and
+        # SC slug probing redundant. Skipping those saves several API calls
+        # (SC probing fans out to many oEmbed/v2 requests). Otherwise every
+        # selected platform is queried in parallel as before.
+        mb_results: list = []
+        it_results: list = []
+        sc_results: list = []
+        mb_confirmed: dict | None = None
         if "musicbrainz" in use:
-            coros["musicbrainz"] = _search_mb()
-        if "itunes" in use:
+            mb_results = await _search_mb()
+            if mb_results:
+                top = mb_results[0]
+                if top.get("mbid") and _normalize_name(top.get("name", "")) == _normalize_name(query):
+                    try:
+                        links = await musicbrainz.get_artist_links(top["mbid"])
+                    except Exception:
+                        links = None
+                    if links and (links.get("itunes_artist_id") or links.get("soundcloud_permalink")):
+                        mb_confirmed = {
+                            "mbid": top["mbid"],
+                            "name": top.get("name", ""),
+                            "itunes_artist_id": links.get("itunes_artist_id"),
+                            "soundcloud_permalink": links.get("soundcloud_permalink"),
+                            "streaming": links.get("streaming") or [],
+                        }
+
+        coros = {}
+        # Skip a platform search when MB already confirmed that platform's link
+        if "itunes" in use and not (mb_confirmed and mb_confirmed.get("itunes_artist_id")):
             coros["itunes"] = _search_itunes()
-        if "soundcloud" in use:
+        if "soundcloud" in use and not (mb_confirmed and mb_confirmed.get("soundcloud_permalink")):
             coros["soundcloud"] = _search_sc()
-        gathered = await asyncio.gather(*coros.values())
-        by_source = dict(zip(coros.keys(), gathered))
-        mb_results = by_source.get("musicbrainz", [])
-        it_results = by_source.get("itunes", [])
-        sc_results = by_source.get("soundcloud", [])
+        if coros:
+            gathered = await asyncio.gather(*coros.values())
+            by_source = dict(zip(coros.keys(), gathered))
+            it_results = by_source.get("itunes", [])
+            sc_results = by_source.get("soundcloud", [])
 
         # Build lookup maps by normalized name
         mb_by_name: dict[str, dict] = {}
@@ -409,6 +438,25 @@ async def search_artists(body: ArtistSearchRequest):
                     "followers_count": r.get("followers_count"),
                 }
 
+        # MB-confirmed IDs (from the skipped platform searches above) take
+        # precedence over anything name-merged and are flagged so the UI can
+        # show them as verified without refetching.
+        if mb_confirmed:
+            entry = merged.get(_normalize_name(mb_confirmed["name"]))
+            if entry is not None and entry.get("mbid") == mb_confirmed["mbid"]:
+                if mb_confirmed.get("itunes_artist_id"):
+                    entry["itunes_artist_id"] = mb_confirmed["itunes_artist_id"]
+                    entry["_confirmed_apple"] = True
+                    if entry.get("source") == "musicbrainz":
+                        entry["source"] = "both"
+                if mb_confirmed.get("soundcloud_permalink"):
+                    entry["soundcloud_permalink"] = mb_confirmed["soundcloud_permalink"]
+                    entry["_confirmed_sc"] = True
+                    if entry.get("source") in ("musicbrainz", "itunes", "both"):
+                        entry["source"] += "+sc"
+                entry["_mb_streaming"] = mb_confirmed.get("streaming") or []
+                entry["_mb_enriched"] = True
+
         # Add already_tracked info for UI
         result = []
         for r in merged.values():
@@ -488,6 +536,78 @@ async def add_artist(body: ArtistAddRequest):
         name = re.sub(r'\s+', ' ', name)
         return name
 
+    # Explicit link from the link-source modal (currently SoundCloud only):
+    # the user picked which tracked row to link onto, so the SoundCloud
+    # display name ("Avicii Official") must never spawn a new artist entry
+    # when it differs from the tracked name ("Avicii").
+    if body.source == "soundcloud" and body.artist_id is not None:
+        target = db.get_artist_by_id(body.artist_id)
+        if target is None:
+            return {"status": "error", "message": "Artist not found"}
+        permalink = (body.id or "").strip()
+        if not permalink:
+            return {"status": "error", "message": "Missing SoundCloud permalink"}
+
+        owner = db.get_artist_by_soundcloud_permalink(permalink)
+        if owner and owner["id"] == target["id"]:
+            return {"status": "already_exists", "artist": target}
+        if owner and owner["id"] != target["id"] and not body.force:
+            return {
+                "status": "conflict",
+                "message": f"already linked to {owner.get('name', '')}",
+                "conflicting_artist": {"id": owner["id"], "name": owner.get("name", "")},
+                "artist": target,
+            }
+        if owner and owner["id"] != target["id"] and body.force:
+            # Confirmed replace: unlink from the old owner first (also
+            # deletes the old owner's SC releases, same as manual unlink).
+            db.unlink_artist_soundcloud(owner["id"])
+            target = db.get_artist_by_id(body.artist_id)
+            if target is None:
+                return {"status": "error", "message": "Artist not found"}
+
+        # Target already points at a different profile: drop its old SC
+        # releases so two profiles' tracks don't mix under one row.
+        current = (target.get("soundcloud_permalink") or "").strip()
+        if current and current != permalink:
+            conn = db.get_db()
+            conn.execute(
+                "DELETE FROM releases WHERE artist_id = ? AND source = 'soundcloud'",
+                (target["id"],),
+            )
+            conn.commit()
+
+        artist = db.link_artist(
+            artist_id=target["id"],
+            mbid=target.get("mbid", ""),
+            itunes_artist_id=target.get("itunes_artist_id"),
+            soundcloud_permalink=permalink,
+        )
+
+        count = 0
+        releases = await soundcloud.get_artist_releases(permalink)
+        existing_releases = db.get_releases(artist_id=artist["id"])
+        existing_titles = {_normalize_release_title(r["title"]) for r in existing_releases}
+        for rel in releases:
+            sc_title_norm = _normalize_release_title(rel["title"])
+            if sc_title_norm in existing_titles:
+                continue
+            inserted = db.add_release(
+                mbid=rel["mbid"],
+                artist_id=artist["id"],
+                title=rel["title"],
+                release_type=rel["type"],
+                release_date=rel.get("date", ""),
+                notified=1,
+                source="soundcloud",
+                soundcloud_track_id=rel.get("soundcloud_track_id", ""),
+                artwork_url=rel.get("artwork_url", ""),
+            )
+            if inserted:
+                count += 1
+
+        return {"status": "linked", "artist": artist, "releases_imported": count}
+
     # Check if artist already exists by exact ID match
     existing_by_id = None
     if body.source == "musicbrainz":
@@ -510,6 +630,28 @@ async def add_artist(body: ArtistAddRequest):
             break
     
     if existing_by_name:
+        # Guard: the incoming source ID may already be owned by a DIFFERENT
+        # tracked artist (e.g. an MB-confirmed SC permalink that belongs to
+        # another name variant). Stealing it would corrupt both rows, so
+        # return the same conflict shape the link-source modal uses and let
+        # the UI show the existing "already taken" prompt.
+        owner = None
+        try:
+            if body.source == "musicbrainz" and body.id:
+                owner = db.get_artist_by_mbid(body.id)
+            elif body.source == "itunes" and body.id:
+                owner = db.get_artist_by_itunes_id(int(body.id))
+            elif body.source == "soundcloud" and body.id:
+                owner = db.get_artist_by_soundcloud_permalink(body.id)
+        except (ValueError, TypeError):
+            owner = None
+        if owner and owner["id"] != existing_by_name["id"]:
+            return {
+                "status": "conflict",
+                "message": f"already linked to {owner.get('name', '')}",
+                "conflicting_artist": {"id": owner["id"], "name": owner.get("name", "")},
+                "artist": existing_by_name,
+            }
         # Link the new source ID to existing artist
         artist = db.link_artist(
             artist_id=existing_by_name["id"],
@@ -898,6 +1040,31 @@ async def get_release_streaming(release_id: str):
 
     streaming = await musicbrainz.get_release_streaming_urls(release_id)
     return {"mbid": release_id, "streaming": streaming}
+
+
+@app.get("/api/mb-artists/{mbid}/links")
+async def get_mb_artist_links(mbid: str):
+    """Return an MB artist's streaming links plus confirmed platform IDs.
+
+    Single MusicBrainz lookup (inc=url-rels), parsed once for two purposes:
+      - streaming: full streaming-service link list for on-demand display.
+      - itunes_artist_id / soundcloud_permalink: ground truth from the
+        artist's official URL relationships. The frontend prefers these
+        over fuzzy name-based merges when rendering search badges.
+
+    Returns {"mbid": ..., "streaming": [...],
+             "itunes_artist_id": int|None,
+             "soundcloud_permalink": str|None}.
+    """
+    import re as _re
+    if not _re.match(
+        r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+        r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', mbid or ""
+    ):
+        return {"mbid": mbid, "streaming": [],
+                "itunes_artist_id": None, "soundcloud_permalink": None}
+    links = await musicbrainz.get_artist_links(mbid)
+    return {"mbid": mbid, **links}
 
 
 def _titles_match(a: str, b: str) -> bool:

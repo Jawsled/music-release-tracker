@@ -205,11 +205,18 @@
                 </div>
                 <button id="artist-search-btn">Search</button>
             </div>
-            <p class="search-hint">Pasting MBID or MusicBrainz / Apple Music / SoundCloud URL also works!.</p>
+            <p class="search-hint">Pasting MBID or MusicBrainz / Apple Music / SoundCloud URL also works!</p>
             <div id="search-results" class="search-results" aria-live="polite"></div>
             <div id="search-more-wrap" class="search-more-wrap hidden"><button class="check-btn" id="search-more-btn">Show more</button></div>
             <div class="artists-header-row">
-                <h2 class="artists-title">Tracked Artists <span id="tracked-count" class="tracked-count"></span></h2>
+                <div class="filter-dropdown" id="tracked-filter-wrapper">
+                    <button type="button" class="filter-btn" onclick="toggleTrackedDropdown()" id="filter-tracked-btn" aria-haspopup="listbox" aria-expanded="false">All tracked artists</button>
+                    <div class="dropdown-menu hidden" id="tracked-dropdown-menu" role="listbox">
+                        <input type="text" class="dropdown-search" placeholder="Search artists..." id="tracked-filter-search" oninput="filterTrackedList()" aria-label="Search tracked artists">
+                        <div class="dropdown-count" id="tracked-dropdown-count"></div>
+                        <div class="dropdown-list" id="tracked-dropdown-list"></div>
+                    </div>
+                </div>
                 <div class="import-export-bar">
                     <button id="export-artists-btn" class="link-btn" onclick="exportArtists()" title="Download tracked artists as JSON">Export</button>
                     <button id="import-btn" class="link-btn" title="Import artists from a JSON file">Import</button>
@@ -241,7 +248,7 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=18"></script>
+    <script src="/static/app.js?v=19"></script>
     <div id="toast-container" class="toast-container" aria-live="polite"></div>
 </body>
 </html>
