@@ -16,12 +16,15 @@ _last_request_time: float = 0.0
 _lock = asyncio.Lock()
 _client: httpx.AsyncClient = None
 
-COOLDOWN_503 = 5.0       # seconds to wait before first retry on 503
-COOLDOWN_503_RETRY = 10.0  # seconds to wait before second retry on 503
-MAX_503_RETRIES = 2       # max retries on 503 before giving up
+COOLDOWN_503 = 5.0       # base wait for first 503/429 retry; doubles each retry
+COOLDOWN_503_MAX = 60.0  # cap for a single 503/429 backoff (before Retry-After)
+MAX_503_RETRIES = 4       # max retries on 503/429 before giving up
 
 MAX_NET_RETRIES = 3       # max retries for timeouts / connection errors
 NET_BACKOFF_BASE = 2.0    # base backoff for network errors; doubles each retry (2s, 4s, 8s)
+
+# Upstream throttling statuses worth retrying (MB uses 503; 429 is the
+# standard rate-limit code and is handled identically as a safety net).
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -35,13 +38,30 @@ def _get_client() -> httpx.AsyncClient:
 
 
 def _retry_after_seconds(headers) -> float | None:
-    """Parse the Retry-After header (seconds form) if present."""
+    """Parse the Retry-After header if present.
+
+    Supports both forms from RFC 7231: delay-seconds ("5") and HTTP-date
+    ("Wed, 21 Oct 2015 07:28:00 GMT"). Returns None when missing/unparsable.
+    """
     raw = headers.get("Retry-After") if headers else None
     if not raw:
         return None
+    raw = raw.strip()
     try:
         return max(0.0, float(raw))
     except (ValueError, TypeError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(raw)
+        if dt is None:
+            return None
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (dt - now).total_seconds())
+    except Exception:
         return None
 
 
@@ -68,15 +88,22 @@ async def _rate_limited_get(url: str, params: dict) -> dict:
     """Make a GET request with rate limiting (starts spaced >=1s apart).
 
     Retries automatically on:
-      - 503 rate limiting (cooldown waits, honors Retry-After)
+      - 503/429 rate limiting (exponential cooldown, honors Retry-After)
       - timeouts (e.g. ReadTimeout) and connection errors (exponential backoff)
 
     Raises httpx.HTTPStatusError / httpx.RequestError once all retries are
     exhausted. Every retry/skip decision is logged so it shows up in the UI log.
+    Callers serving on-demand HTTP endpoints should catch these and return a
+    graceful 502/503/504 JSON payload instead of letting the exception bubble
+    up as an unhandled ASGI error.
     """
     last_err: Exception | None = None
+    throttle_retries = 0
+    net_retries = 0
 
-    for attempt in range(max(MAX_503_RETRIES, MAX_NET_RETRIES) + 1):
+    # Total attempts bounded so a mix of 503s + timeouts still terminates.
+    max_attempts = MAX_503_RETRIES + MAX_NET_RETRIES + 1
+    for _ in range(max_attempts):
         await _pace_request()
 
         client = _get_client()
@@ -88,16 +115,24 @@ async def _rate_limited_get(url: str, params: dict) -> dict:
         except httpx.HTTPStatusError as e:
             last_err = e
             status = e.response.status_code
-            if status == 503 and attempt < MAX_503_RETRIES:
-                cooldown = COOLDOWN_503_RETRY if attempt > 0 else COOLDOWN_503
+            if status in (503, 429):
+                if throttle_retries >= MAX_503_RETRIES:
+                    logger.error(
+                        f"MusicBrainz rate limit ({status}) on {url} after "
+                        f"{throttle_retries + 1} attempts, giving up",
+                        extra={"detail": str(e)},
+                    )
+                    raise
+                cooldown = min(COOLDOWN_503 * (2 ** throttle_retries), COOLDOWN_503_MAX)
                 retry_after = _retry_after_seconds(e.response.headers)
                 if retry_after:
-                    cooldown = max(cooldown, min(retry_after, 60.0))
+                    cooldown = max(cooldown, min(retry_after, 120.0))
                 logger.warning(
-                    f"MusicBrainz rate limit (503), retrying "
-                    f"{attempt + 1}/{MAX_503_RETRIES} in {cooldown:.0f}s",
+                    f"MusicBrainz rate limit ({status}), retrying "
+                    f"{throttle_retries + 1}/{MAX_503_RETRIES} in {cooldown:.0f}s",
                     extra={"detail": url},
                 )
+                throttle_retries += 1
                 await asyncio.sleep(cooldown)
                 continue
             logger.error(
@@ -108,34 +143,36 @@ async def _rate_limited_get(url: str, params: dict) -> dict:
 
         except httpx.TimeoutException as e:
             last_err = e
-            if attempt >= MAX_NET_RETRIES:
+            if net_retries >= MAX_NET_RETRIES:
                 logger.error(
-                    f"Read timeout on {url} after {attempt + 1} attempts, giving up",
+                    f"Read timeout on {url} after {net_retries + 1} attempts, giving up",
                     extra={"detail": str(e)},
                 )
                 raise
-            delay = NET_BACKOFF_BASE * (2 ** attempt)
+            delay = NET_BACKOFF_BASE * (2 ** net_retries)
             logger.warning(
-                f"Read timeout, retrying {attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
+                f"Read timeout, retrying {net_retries + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
                 extra={"detail": url},
             )
+            net_retries += 1
             await asyncio.sleep(delay)
             continue
 
         except httpx.RequestError as e:
             last_err = e
-            if attempt >= MAX_NET_RETRIES:
+            if net_retries >= MAX_NET_RETRIES:
                 logger.error(
-                    f"Network error on {url} after {attempt + 1} attempts, giving up",
+                    f"Network error on {url} after {net_retries + 1} attempts, giving up",
                     extra={"detail": str(e)},
                 )
                 raise
-            delay = NET_BACKOFF_BASE * (2 ** attempt)
+            delay = NET_BACKOFF_BASE * (2 ** net_retries)
             logger.warning(
                 f"Network error ({type(e).__name__}), retrying "
-                f"{attempt + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
+                f"{net_retries + 1}/{MAX_NET_RETRIES} in {delay:.0f}s",
                 extra={"detail": str(e)},
             )
+            net_retries += 1
             await asyncio.sleep(delay)
             continue
 

@@ -9,7 +9,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -972,11 +972,31 @@ async def get_unseen_count():
     return {"count": count}
 
 
+def _upstream_error_status(e: Exception) -> int:
+    """Map an upstream fetch failure to a downstream HTTP status.
+
+    503/429 (throttling) -> 503, timeouts -> 504, everything else -> 502.
+    Used by on-demand endpoints so a MusicBrainz outage degrades to an
+    empty payload instead of an unhandled ASGI exception (HTTP 500).
+    """
+    response = getattr(e, "response", None)
+    status = getattr(response, "status_code", None)
+    if status in (503, 429):
+        return 503
+    if isinstance(e, httpx.TimeoutException):
+        return 504
+    if isinstance(e, (httpx.HTTPStatusError, httpx.RequestError)):
+        return 502
+    return 502
+
+
 @app.get("/api/releases/{release_id}/tracks")
 async def get_release_tracks(release_id: str):
     """Fetch and return tracklist for a release.
 
     Routes to MusicBrainz or iTunes API based on the release source.
+    On upstream failure (e.g. MusicBrainz 503) returns an empty tracklist
+    with an `error` message and a 502/503/504 status instead of raising.
     """
     # Look up release to determine source and artist
     release = db.get_release_by_id(release_id)
@@ -987,16 +1007,24 @@ async def get_release_tracks(release_id: str):
     artist_id = release["artist_id"]
 
     # Fetch tracks from the appropriate API
-    if source == "itunes":
-        collection_id = release.get("itunes_collection_id") or release_id
-        tracks = await itunes.get_release_tracks(int(collection_id))
-    elif source == "soundcloud":
-        track_id = release.get("soundcloud_track_id") or release_id
-        tracks = await soundcloud.get_release_tracks(track_id)
-    else:
-        # Pass the tracked artist's MBID so their own credit is filtered out
-        # of per-track "feat." listings
-        tracks = await musicbrainz.get_release_tracks(release_id, main_mbid=release.get("artist_mbid") or "")
+    try:
+        if source == "itunes":
+            collection_id = release.get("itunes_collection_id") or release_id
+            tracks = await itunes.get_release_tracks(int(collection_id))
+        elif source == "soundcloud":
+            track_id = release.get("soundcloud_track_id") or release_id
+            tracks = await soundcloud.get_release_tracks(track_id)
+        else:
+            # Pass the tracked artist's MBID so their own credit is filtered out
+            # of per-track "feat." listings
+            tracks = await musicbrainz.get_release_tracks(release_id, main_mbid=release.get("artist_mbid") or "")
+    except Exception as e:
+        msg = _error_message(e)
+        logger.warning(f"Tracklist fetch failed for {release_id}: {msg}")
+        return JSONResponse(
+            status_code=_upstream_error_status(e),
+            content={"mbid": release_id, "tracks": [], "error": msg},
+        )
 
     # Find all single titles locally for this artist
     single_titles: set[str] = set()
@@ -1027,6 +1055,8 @@ async def get_release_streaming(release_id: str):
 
     Streaming links only exist in MusicBrainz's url-rels, so iTunes-sourced
     releases simply return an empty list (the UI hides the section then).
+    On upstream failure (e.g. MusicBrainz 503) returns an empty list with
+    an `error` message and a 502/503/504 status instead of raising.
     """
     release = db.get_release_by_id(release_id)
     if not release:
@@ -1038,7 +1068,15 @@ async def get_release_streaming(release_id: str):
     if source == "soundcloud":
         return {"mbid": release_id, "streaming": []}
 
-    streaming = await musicbrainz.get_release_streaming_urls(release_id)
+    try:
+        streaming = await musicbrainz.get_release_streaming_urls(release_id)
+    except Exception as e:
+        msg = _error_message(e)
+        logger.warning(f"Streaming fetch failed for {release_id}: {msg}")
+        return JSONResponse(
+            status_code=_upstream_error_status(e),
+            content={"mbid": release_id, "streaming": [], "error": msg},
+        )
     return {"mbid": release_id, "streaming": streaming}
 
 
@@ -1055,6 +1093,9 @@ async def get_mb_artist_links(mbid: str):
     Returns {"mbid": ..., "streaming": [...],
              "itunes_artist_id": int|None,
              "soundcloud_permalink": str|None}.
+    On upstream failure (e.g. MusicBrainz 503 after retries) returns empty
+    links with an `error` message and a 502/503/504 status instead of
+    raising (which previously surfaced as an ASGI exception / HTTP 500).
     """
     import re as _re
     if not _re.match(
@@ -1063,7 +1104,17 @@ async def get_mb_artist_links(mbid: str):
     ):
         return {"mbid": mbid, "streaming": [],
                 "itunes_artist_id": None, "soundcloud_permalink": None}
-    links = await musicbrainz.get_artist_links(mbid)
+    try:
+        links = await musicbrainz.get_artist_links(mbid)
+    except Exception as e:
+        msg = _error_message(e)
+        logger.warning(f"Artist links fetch failed for {mbid}: {msg}")
+        return JSONResponse(
+            status_code=_upstream_error_status(e),
+            content={"mbid": mbid, "streaming": [],
+                     "itunes_artist_id": None, "soundcloud_permalink": None,
+                     "error": msg},
+        )
     return {"mbid": mbid, **links}
 
 
