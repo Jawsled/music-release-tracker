@@ -459,9 +459,16 @@ function renderReleaseCard(r) {
 
   // Build the correct "View" URL based on source
   let viewUrl;
-  if (source === "soundcloud" && r.mbid) {
-    // SoundCloud: link to the track page
-    viewUrl = `https://soundcloud.com/${esc(r.mbid)}`;
+  if (source === "soundcloud") {
+    // SoundCloud: the stored permalink/set URL. Singles keep only their
+    // numeric track id in mbid (it is the uniqueness key), and
+    // soundcloud.com/{artist}/{numeric_id} does not resolve — so without a
+    // stored URL the honest fallback is a search for the release.
+    if (r.mb_url) {
+      viewUrl = r.mb_url;
+    } else {
+      viewUrl = `https://soundcloud.com/search?q=${encodeURIComponent(`${r.artist_name} ${r.title}`)}`;
+    }
   } else if (source === "itunes" && r.itunes_collection_id) {
     // iTunes: link to Apple Music album page
     viewUrl = `https://music.apple.com/us/album/${esc(r.title.toLowerCase().replace(/[^a-z0-9]/g, ''))}/${r.itunes_collection_id}`;

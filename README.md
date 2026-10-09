@@ -80,15 +80,14 @@ SQLite database (`music-release-tracker.db`) with three tables:
 | Table | Columns |
 | --- | --- |
 | `artists` | internal ID, `mbid`, `name`, `disambiguation`, `itunes_artist_id`, `soundcloud_permalink`, `added_at` |
-| `releases` | internal ID, `mbid` (iTunes/SoundCloud IDs also live here), artist ID, `source` (`musicbrainz`/`itunes`/`soundcloud`), `title`, `release_type`, `release_date`, `first_seen_at`, `notified`, `release_day_notified` *(unused)*, `mb_url`, `itunes_collection_id`, `soundcloud_track_id`, `artwork_url`, `credits`, `track_titles`, `is_visible` |
+| `releases` | internal ID, `mbid` (iTunes/SoundCloud IDs also live here), artist ID, `source` (`musicbrainz`/`itunes`/`soundcloud`), `title`, `release_type`, `release_date`, `first_seen_at`, `notified`, `release_day_notified` *(unused)*, `mb_url`, `itunes_collection_id`, `soundcloud_track_id`, `soundcloud_playlist_id`, `artwork_url`, `credits`, `track_titles`, `is_visible` |
 | `meta` | key/value store for settings (keys prefixed with `setting_`) and internal state |
 
 ## Known Issues
 
-- **iTunes quirks:** iTunes provides no release type (everything is `collectionType=Album`), so suffix-based classification is used. Fixing this properly would require the modern Apple Music API key, and the iTunes catalog is less frequently maintained. Some releases only surface via UPC lookup. iTunes also exposes no follower counts, so search rows show album counts instead to help tell same-name artists apart.
+- **iTunes quirks:** iTunes provides no release type (everything is `collectionType=Album`), so suffix-based classification is used. Fixing this properly would require the modern Apple Music API key. Also the iTunes catalog is less frequently maintained. Some releases only surface via UPC lookup. iTunes also exposes no follower counts, so search rows show album counts instead to help tell same-name artists apart.
 - **Near-duplicate titles:** Deduplication can still miss releases whose titles differ in ways no rule covers. Fully censored words (`****`) cannot be mapped to anything, by design.
 - **MusicBrainz credits:** The scan works at the *release group* level (individual releases are only fetched on demand for tracklists/streaming links), so credited artists don't appear during a release-group scan.
-- **SoundCloud quirks:** SoundCloud provides no release groups, so everything is treated as a Single. There is also no public search API, so name search probes likely profile URL variants and may miss exotic spellings. Pasting the exact profile URL always works. Follower counts come from SoundCloud's API and reflect the live profile.
 
 ### Telegram (removed)
 

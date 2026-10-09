@@ -153,6 +153,35 @@ def _upgrade_artwork(url: str | None) -> str | None:
     )
 
 
+def _iso_date(value: str | None) -> str:
+    """Normalize a SoundCloud timestamp to YYYY-MM-DD.
+
+    Accepts both ISO 8601 ('2013-12-09T08:20:33+00:00') and the slash
+    format the API returns for created_at ('2013/12/09 08:20:33 +0000').
+    """
+    if not value:
+        return ""
+    raw = str(value).strip()
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    match = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", raw)
+    if match:
+        year, month, day = match.groups()
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    return raw[:10]
+
+
+def _int_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_handle(raw: str) -> str:
     return raw.strip().lstrip("@").lower()
 
@@ -553,17 +582,9 @@ def _track_to_release(track: dict) -> dict:
     """Convert a SoundCloud track to a release dict matching the app's format."""
     permalink_url = track.get("permalink_url", "")
     title = (track.get("title") or "").strip() or "Untitled"
-    created_at = track.get("created_at", "")
 
     # Normalize date to YYYY-MM-DD
-    date_str = ""
-    if created_at:
-        try:
-            from datetime import datetime
-            dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-            date_str = dt.strftime("%Y-%m-%d")
-        except Exception:
-            date_str = created_at[:10] if len(created_at) >= 10 else ""
+    date_str = _iso_date(track.get("created_at"))
 
     artwork = _upgrade_artwork(track.get("artwork_url"))
     user = track.get("user", {})
@@ -581,14 +602,173 @@ def _track_to_release(track: dict) -> dict:
     }
 
 
+def _playlist_kind(pl: dict) -> str:
+    """Normalized playlist_type/set_type value ('album', 'ep', 'single', ...)."""
+    for key in ("playlist_type", "set_type"):
+        value = str(pl.get(key) or "").strip().lower()
+        if value:
+            return value
+    return ""
+
+
+def _playlist_type(pl: dict) -> str | None:
+    """Classify a playlist as Album/EP, or None when it is not a release.
+
+    SoundCloud flags every release (albums, EPs and singles alike) with
+    is_album=True; playlist_type/set_type carries the actual kind, so it
+    is checked first. Single sets are skipped because their track is
+    already imported as a Single, and plain sets/compilations are not
+    releases.
+    """
+    kind = _playlist_kind(pl)
+    if kind == "ep":
+        return "EP"
+    if kind == "album":
+        return "Album"
+    if kind in ("single", "compilation", "playlist"):
+        return None
+    # Unknown/empty type: fall back to SoundCloud's own album flag
+    return "Album" if pl.get("is_album") is True else None
+
+
+def _playlist_release_date(pl: dict) -> str:
+    """Release date from release_year/month_day, else the upload date."""
+    year = _int_or_none(pl.get("release_year"))
+    if year:
+        parts = [f"{year:04d}"]
+        month = _int_or_none(pl.get("release_month"))
+        if month:
+            parts.append(f"{month:02d}")
+            day = _int_or_none(pl.get("release_day"))
+            if day:
+                parts.append(f"{day:02d}")
+        return "-".join(parts)
+    return _iso_date(pl.get("created_at"))
+
+
+def _playlist_to_release(pl: dict) -> dict | None:
+    """Convert an album/EP playlist to a release dict (None when not one)."""
+    release_type = _playlist_type(pl)
+    playlist_id = pl.get("id")
+    if not release_type or playlist_id is None:
+        return None
+    track_count = _int_or_none(pl.get("track_count")) or len(pl.get("tracks") or [])
+    if not track_count:
+        return None
+
+    title = (pl.get("title") or "").strip() or "Untitled"
+    artwork = _upgrade_artwork(pl.get("artwork_url"))
+
+    return {
+        "mbid": str(playlist_id),
+        "title": title,
+        "type": release_type,
+        "date": _playlist_release_date(pl),
+        "url": pl.get("permalink_url", ""),
+        "artwork_url": artwork or "",
+        "soundcloud_playlist_id": str(playlist_id),
+        "soundcloud_track_id": "",
+        "credits": [],
+    }
+
+
+async def _fetch_user_playlists(user_id: int) -> list[dict]:
+    """Fetch all playlists (sets) for a SoundCloud user (paginated)."""
+    client = _get_client()
+    client_id, app_version = await _creds.get(client)
+
+    all_playlists: list[dict] = []
+    next_href = _with_creds(
+        f"{API_URL}/users/{user_id}/playlists?limit={PAGE_LIMIT}&offset=0",
+        client_id,
+        app_version,
+    )
+
+    for _ in range(MAX_PAGES):
+        if not next_href:
+            break
+        try:
+            data = await _rate_limited_get(next_href)
+        except Exception:
+            break
+        for playlist in data.get("collection", []):
+            all_playlists.append(playlist)
+        next_href_raw = data.get("next_href")
+        if next_href_raw:
+            next_href = _with_creds(next_href_raw, client_id, app_version)
+        else:
+            break
+
+    return all_playlists
+
+
+async def _fetch_playlist_tracks_pages(playlist_id: str) -> list[dict]:
+    """Fetch a playlist's tracks via the paginated tracks endpoint."""
+    client = _get_client()
+    client_id, app_version = await _creds.get(client)
+
+    all_tracks: list[dict] = []
+    next_href = _with_creds(
+        f"{API_URL}/playlists/{playlist_id}/tracks?limit={PAGE_LIMIT}&offset=0",
+        client_id,
+        app_version,
+    )
+
+    for _ in range(MAX_PAGES):
+        if not next_href:
+            break
+        try:
+            data = await _rate_limited_get(next_href)
+        except Exception:
+            break
+        all_tracks.extend(data.get("collection", []))
+        next_href_raw = data.get("next_href")
+        next_href = _with_creds(next_href_raw, client_id, app_version) if next_href_raw else ""
+
+    return all_tracks
+
+
+def _playlist_track_entry(track: dict, number: int) -> dict:
+    """Map one of a playlist's tracks to the app's track format."""
+    return {
+        "number": str(number),
+        "title": (track.get("title") or "").strip() or "Untitled",
+        "length": track.get("duration") or 0,
+        "credits": [],
+    }
+
+
 async def get_artist_releases(permalink: str) -> list[dict]:
-    """Fetch all tracks for a SoundCloud user, returning each as a Single release."""
+    """Fetch a user's album/EP playlists and their tracks.
+
+    Album/EP playlists become Album/EP releases with a tracklist; every
+    track is still returned as a Single, so tracks that also live on an
+    album get the SINGLE badge in that album's tracklist (same as the
+    other providers).
+    """
     user = await _fetch_user(permalink)
     if not user or not user.get("id"):
         return []
 
-    tracks = await _fetch_user_tracks(user["id"])
-    return [_track_to_release(t) for t in tracks]
+    playlists, tracks = await asyncio.gather(
+        _fetch_user_playlists(user["id"]),
+        _fetch_user_tracks(user["id"]),
+        return_exceptions=True,
+    )
+    if isinstance(playlists, BaseException):
+        logger.warning(f"SoundCloud playlist fetch failed: {playlists}")
+        playlists = []
+    if isinstance(tracks, BaseException):
+        logger.warning(f"SoundCloud track fetch failed: {tracks}")
+        tracks = []
+
+    releases = []
+    for pl in playlists:
+        release = _playlist_to_release(pl)
+        if release:
+            releases.append(release)
+    releases.extend(_track_to_release(t) for t in tracks)
+    return releases
 
 
 async def get_release_tracks(track_id: str) -> list[dict]:
@@ -615,3 +795,47 @@ async def get_release_tracks(track_id: str) -> list[dict]:
             "credits": [],
         }
     ]
+
+
+async def get_track_permalink_url(track_id: str) -> str:
+    """Fetch a single track's canonical web URL (permalink_url).
+
+    Rows imported before URLs were stored only kept the numeric track id,
+    which is not a resolvable public URL form — this recovers the real one.
+    Returns "" when the track is gone or the request fails.
+    """
+    try:
+        track = await _sc_get_json(f"{API_URL}/tracks/{track_id}")
+    except Exception:
+        return ""
+    return track.get("permalink_url", "") or ""
+
+
+async def get_playlist_permalink_url(playlist_id: str) -> str:
+    """Fetch an album/EP playlist's canonical web URL (permalink_url)."""
+    try:
+        playlist = await _sc_get_json(f"{API_URL}/playlists/{playlist_id}")
+    except Exception:
+        return ""
+    return playlist.get("permalink_url", "") or ""
+
+
+async def get_playlist_tracks(playlist_id: str) -> list[dict]:
+    """Fetch the tracklist of an album/EP playlist.
+
+    Uses the tracks embedded in the playlist object, falling back to the
+    paginated /playlists/{id}/tracks endpoint when they are omitted.
+    """
+    try:
+        client = _get_client()
+        client_id, app_version = await _creds.get(client)
+        url = _with_creds(f"{API_URL}/playlists/{playlist_id}", client_id, app_version)
+        playlist = await _rate_limited_get(url)
+    except Exception:
+        return []
+
+    tracks = playlist.get("tracks") or []
+    if not tracks and _int_or_none(playlist.get("track_count")):
+        tracks = await _fetch_playlist_tracks_pages(playlist_id)
+
+    return [_playlist_track_entry(t, i) for i, t in enumerate(tracks, start=1)]

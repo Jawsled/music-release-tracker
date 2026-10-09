@@ -1,12 +1,85 @@
 from __future__ import annotations
 
+import asyncio
+import re
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 
 DB_PATH = str(Path(__file__).resolve().parent / "music-release-tracker.db")
 
 _conn: sqlite3.Connection | None = None
+
+# While > 0, write helpers defer commits so a whole unit of work (one
+# artist's scan/import) lands in a single transaction. See batch().
+_batch_depth = 0
+
+
+class _TaskReentrantLock:
+    """Async lock a task may re-acquire (batch() may nest in one call path).
+
+    Different tasks still serialize — two concurrent scans never interleave
+    their uncommitted rows into one transaction — while a task that opens
+    a second batch() inside an existing one simply joins it.
+    """
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task | None = None
+        self._depth = 0
+
+    async def __aenter__(self):
+        task = asyncio.current_task()
+        if self._owner is not None and self._owner is task:
+            self._depth += 1
+            return self
+        await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+        return self
+
+    async def __aexit__(self, *exc):
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+        return False
+
+
+_batch_lock = _TaskReentrantLock()
+
+
+@asynccontextmanager
+async def batch():
+    """Group writes into one commit (typically per artist / per import).
+
+    Nests safely: only the outermost exit commits, and any exception rolls
+    the whole group back. Reads on the same connection still see the
+    group's uncommitted rows, so in-batch dedup checks stay correct.
+    """
+    global _batch_depth
+    conn = get_db()
+    async with _batch_lock:
+        _batch_depth += 1
+        try:
+            yield
+        except BaseException:
+            _batch_depth -= 1
+            if _batch_depth == 0:
+                conn.rollback()
+            raise
+        else:
+            _batch_depth -= 1
+            if _batch_depth == 0:
+                conn.commit()
+
+
+def _maybe_commit():
+    """Commit unless a batch() group is open (it commits on exit)."""
+    if _batch_depth == 0:
+        get_db().commit()
 
 
 def get_db() -> sqlite3.Connection:
@@ -62,6 +135,7 @@ def init_db():
         "ALTER TABLE releases ADD COLUMN credits TEXT DEFAULT ''",
         "ALTER TABLE artists ADD COLUMN soundcloud_permalink TEXT",
         "ALTER TABLE releases ADD COLUMN soundcloud_track_id TEXT",
+        "ALTER TABLE releases ADD COLUMN soundcloud_playlist_id TEXT",
         "ALTER TABLE releases ADD COLUMN track_titles TEXT DEFAULT ''",
         "ALTER TABLE releases ADD COLUMN is_visible INTEGER DEFAULT 1",
     ]
@@ -93,6 +167,28 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    conn.commit()
+
+    # Indexes for the hot lookup paths (scan dedup, unseen queries, feed
+    # ordering). IF NOT EXISTS keeps this a no-op on databases that already
+    # carry them, while fresh installs get them from the start.
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_releases_artist ON releases(artist_id)",
+        "CREATE INDEX IF NOT EXISTS idx_releases_artist_mbid ON releases(artist_id, mbid)",
+        "CREATE INDEX IF NOT EXISTS idx_releases_artist_itunes ON releases(artist_id, itunes_collection_id)",
+        "CREATE INDEX IF NOT EXISTS idx_releases_artist_sc_track ON releases(artist_id, soundcloud_track_id)",
+        "CREATE INDEX IF NOT EXISTS idx_releases_artist_sc_playlist ON releases(artist_id, soundcloud_playlist_id)",
+        "CREATE INDEX IF NOT EXISTS idx_releases_unseen ON releases(notified, is_visible)",
+        "CREATE INDEX IF NOT EXISTS idx_releases_visible_date ON releases(is_visible, release_date, first_seen_at)",
+        "CREATE INDEX IF NOT EXISTS idx_artists_mbid ON artists(mbid)",
+        "CREATE INDEX IF NOT EXISTS idx_artists_itunes ON artists(itunes_artist_id)",
+        "CREATE INDEX IF NOT EXISTS idx_artists_sc ON artists(soundcloud_permalink)",
+    ]
+    for sql in indexes:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass  # index exists under a different definition
     conn.commit()
 
     # Fold any WAL content back into the main .db file so that copying just
@@ -160,7 +256,7 @@ def add_artist(
         "INSERT INTO artists (mbid, name, disambiguation, itunes_artist_id, soundcloud_permalink, added_at) VALUES (?, ?, ?, ?, ?, ?)",
         (mbid, name, disambiguation, itunes_artist_id, soundcloud_permalink, _now_iso()),
     )
-    conn.commit()
+    _maybe_commit()
     if soundcloud_permalink:
         row = conn.execute("SELECT * FROM artists WHERE soundcloud_permalink = ?", (soundcloud_permalink,)).fetchone()
     elif itunes_artist_id:
@@ -173,7 +269,7 @@ def add_artist(
 def remove_artist(artist_id: int):
     conn = get_db()
     conn.execute("DELETE FROM artists WHERE id = ?", (artist_id,))
-    conn.commit()
+    _maybe_commit()
 
 
 def get_all_artists() -> list[dict]:
@@ -265,7 +361,7 @@ def link_artist(
             "UPDATE artists SET soundcloud_permalink = ? WHERE id = ?",
             (soundcloud_permalink, artist_id),
         )
-    conn.commit()
+    _maybe_commit()
     row = conn.execute("SELECT * FROM artists WHERE id = ?", (artist_id,)).fetchone()
     return dict(row)
 
@@ -283,7 +379,7 @@ def unlink_artist_itunes(artist_id: int) -> dict:
         "UPDATE artists SET itunes_artist_id = NULL WHERE id = ?",
         (artist_id,),
     )
-    conn.commit()
+    _maybe_commit()
     row = conn.execute("SELECT * FROM artists WHERE id = ?", (artist_id,)).fetchone()
     return dict(row)
 
@@ -301,7 +397,7 @@ def unlink_artist_mb(artist_id: int) -> dict:
         "UPDATE artists SET mbid = NULL WHERE id = ?",
         (artist_id,),
     )
-    conn.commit()
+    _maybe_commit()
     row = conn.execute("SELECT * FROM artists WHERE id = ?", (artist_id,)).fetchone()
     return dict(row)
 
@@ -317,7 +413,7 @@ def unlink_artist_soundcloud(artist_id: int) -> dict:
         "UPDATE artists SET soundcloud_permalink = NULL WHERE id = ?",
         (artist_id,),
     )
-    conn.commit()
+    _maybe_commit()
     row = conn.execute("SELECT * FROM artists WHERE id = ?", (artist_id,)).fetchone()
     return dict(row)
 
@@ -329,7 +425,7 @@ def update_artist_disambiguation(artist_id: int, disambiguation: str) -> dict | 
         "UPDATE artists SET disambiguation = ? WHERE id = ?",
         ((disambiguation or "").strip()[:200], artist_id),
     )
-    conn.commit()
+    _maybe_commit()
     row = conn.execute("SELECT * FROM artists WHERE id = ?", (artist_id,)).fetchone()
     return dict(row) if row else None
 
@@ -349,6 +445,7 @@ def add_release(
     artwork_url: str = "",
     credits: str = "",
     soundcloud_track_id: str | None = None,
+    soundcloud_playlist_id: str | None = None,
 ) -> bool:
     """Insert a release, or update release_date if it already exists.
     
@@ -358,31 +455,38 @@ def add_release(
 
     credits: JSON string of credited artists (from MusicBrainz artist-credit).
     Existing rows are silently backfilled when credit data arrives or changes —
-    this does NOT count as a new release.
+    this does NOT count as a new release. Missing/changed mb_url is backfilled
+    the same way, so rows imported before a source stored URLs still get a
+    working link on the next sync.
     """
     conn = get_db()
     # For non-MB releases, use their own ID as uniqueness key
     if source == "itunes":
         unique_key = itunes_collection_id or mbid
     elif source == "soundcloud":
-        unique_key = soundcloud_track_id or mbid
+        unique_key = soundcloud_playlist_id or soundcloud_track_id or mbid
     else:
         unique_key = mbid
 
     # Build the uniqueness query based on available identifiers
-    if soundcloud_track_id:
+    if soundcloud_playlist_id:
         existing = conn.execute(
-            "SELECT id, release_date, credits FROM releases WHERE artist_id = ? AND soundcloud_track_id = ?",
+            "SELECT id, release_date, credits, mb_url FROM releases WHERE artist_id = ? AND soundcloud_playlist_id = ?",
+            (artist_id, soundcloud_playlist_id),
+        ).fetchone()
+    elif soundcloud_track_id:
+        existing = conn.execute(
+            "SELECT id, release_date, credits, mb_url FROM releases WHERE artist_id = ? AND soundcloud_track_id = ?",
             (artist_id, soundcloud_track_id),
         ).fetchone()
     elif itunes_collection_id:
         existing = conn.execute(
-            "SELECT id, release_date, credits FROM releases WHERE artist_id = ? AND (mbid = ? OR itunes_collection_id = ?)",
+            "SELECT id, release_date, credits, mb_url FROM releases WHERE artist_id = ? AND (mbid = ? OR itunes_collection_id = ?)",
             (artist_id, unique_key, unique_key),
         ).fetchone()
     else:
         existing = conn.execute(
-            "SELECT id, release_date, credits FROM releases WHERE artist_id = ? AND mbid = ?",
+            "SELECT id, release_date, credits, mb_url FROM releases WHERE artist_id = ? AND mbid = ?",
             (artist_id, unique_key),
         ).fetchone()
 
@@ -401,16 +505,24 @@ def add_release(
                 "UPDATE releases SET credits = ? WHERE id = ?",
                 (credits, existing["id"]),
             )
-        conn.commit()
+        # Backfill/refresh mb_url when missing or changed (not counted as new).
+        # Rows imported before source URLs were stored (e.g. SoundCloud tracks)
+        # get their real permalink URL on the next sync.
+        if mb_url and existing["mb_url"] != mb_url:
+            conn.execute(
+                "UPDATE releases SET mb_url = ? WHERE id = ?",
+                (mb_url, existing["id"]),
+            )
+        _maybe_commit()
         return changed  # True only for inserts / date updates
 
     conn.execute(
         """INSERT INTO releases
-           (mbid, artist_id, source, title, release_type, release_date, first_seen_at, notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (unique_key, artist_id, source, title, release_type, release_date, _now_iso(), notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id),
+           (mbid, artist_id, source, title, release_type, release_date, first_seen_at, notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (unique_key, artist_id, source, title, release_type, release_date, _now_iso(), notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id),
     )
-    conn.commit()
+    _maybe_commit()
     return True
 
 
@@ -423,7 +535,8 @@ def get_releases(
 ) -> list[dict]:
     conn = get_db()
     query = """
-        SELECT r.*, a.name as artist_name, a.mbid as artist_mbid
+        SELECT r.*, a.name as artist_name, a.mbid as artist_mbid,
+               a.soundcloud_permalink as artist_soundcloud_permalink
         FROM releases r
         JOIN artists a ON r.artist_id = a.id
         WHERE 1=1
@@ -454,20 +567,20 @@ def mark_release_seen(release_id: int):
     """Mark a single release as seen (notified)."""
     conn = get_db()
     conn.execute("UPDATE releases SET notified = 1 WHERE id = ?", (release_id,))
-    conn.commit()
+    _maybe_commit()
 
 
 def set_release_visible(release_id: int, visible: bool):
     """Show or hide a release in the feed."""
     conn = get_db()
     conn.execute("UPDATE releases SET is_visible = ? WHERE id = ?", (1 if visible else 0, release_id))
-    conn.commit()
+    _maybe_commit()
 
 
 def mark_all_releases_seen():
     conn = get_db()
     conn.execute("UPDATE releases SET notified = 1")
-    conn.commit()
+    _maybe_commit()
 
 
 
@@ -488,7 +601,7 @@ def get_releases_due_today() -> list[dict]:
 def mark_release_day_notified(release_id: int):
     conn = get_db()
     conn.execute("UPDATE releases SET release_day_notified = 1 WHERE id = ?", (release_id,))
-    conn.commit()
+    _maybe_commit()
 
 
 def get_unseen_count() -> int:
@@ -558,7 +671,17 @@ def update_release_track_titles(release_id: int, track_titles: list[str]):
         "UPDATE releases SET track_titles = ? WHERE id = ?",
         (json.dumps(track_titles), release_id),
     )
-    conn.commit()
+    _maybe_commit()
+
+
+def update_release_mb_url(release_id: int, mb_url: str):
+    """Store a release's source page URL (backfill for rows imported without one)."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE releases SET mb_url = ? WHERE id = ?",
+        (mb_url, release_id),
+    )
+    _maybe_commit()
 
 
 def get_artist_all_track_titles(artist_id: int) -> set[str]:
@@ -730,6 +853,99 @@ def _explicit_to_token_pattern(censored: str):
     return re.compile(body + r"\Z", re.IGNORECASE)
 
 
+# Compiled dedup/explicit rules, rebuilt only when the underlying settings
+# change (see _invalidate_rule_cache). Without this, every title
+# normalization re-read both settings from SQLite and recompiled every
+# rule's regex — the single hottest CPU path during scans.
+_compiled_rules: dict | None = None
+_rule_version = 0
+
+
+def _invalidate_rule_cache():
+    """Drop compiled rules; called whenever a setting_ meta row is written."""
+    global _compiled_rules, _rule_version
+    _compiled_rules = None
+    _rule_version += 1
+
+
+def _get_compiled_rules() -> dict:
+    """Compile (once) the default dedup/explicit rules from settings."""
+    global _compiled_rules
+    if _compiled_rules is None:
+        ignores = get_dedup_ignores()
+        explicit_map = get_explicit_map()
+        # Closed-paren tags match anywhere; the rest only match at the end
+        global_patterns = []
+        suffix_rules = []
+        for s in [s for s in ignores if s and s.strip()]:
+            gp = _rule_to_global_pattern(s)
+            if gp is not None:
+                global_patterns.append(gp)
+            else:
+                suffix_rules.append(s)
+        # Longest rules first for stability
+        suffix_rules = sorted(suffix_rules, key=len, reverse=True)
+        _compiled_rules = {
+            "global": global_patterns,
+            "suffix": [(_rule_to_suffix_pattern(s), len(s)) for s in suffix_rules],
+            "explicit": sorted(
+                ((_explicit_to_token_pattern(c), clean)
+                 for c, clean in explicit_map if c and clean),
+                key=lambda pc: len(pc[0].pattern),
+                reverse=True,
+            ),
+        }
+    return _compiled_rules
+
+
+@lru_cache(maxsize=65536)
+def _normalize_title_cached(title: str, version: int) -> str:
+    """Core normalization against the cached rules.
+
+    lru_cache keyed on (title, _rule_version): a settings write bumps the
+    version, so stale entries can never be served after a rule change.
+    Scans re-check the same thousands of titles every pass, so the hit
+    rate is what makes repeated scans cheap.
+    """
+    rules = _compiled_rules if _compiled_rules is not None else _get_compiled_rules()
+    return _apply_rules(title, rules)
+
+
+def _apply_rules(title: str, rules: dict) -> str:
+    """Apply precompiled rules to one title (steps 1-4 of the docstring)."""
+    text = (title or "").strip()
+    token_patterns = rules["explicit"]
+    if token_patterns and "*" in text:
+        words = []
+        for token in text.split():
+            if "*" in token:
+                for pattern, clean in token_patterns:
+                    if pattern.match(token):
+                        token = clean
+                        break
+            words.append(token)
+        text = " ".join(words)
+    for pattern in rules["global"]:
+        new_text = pattern.sub("", text)
+        if new_text != text:
+            text = re.sub(r"\s+", " ", new_text).strip()
+    # Cap passes to avoid pathological loops
+    for _ in range(20):
+        stripped_any = False
+        for pattern, _size in rules["suffix"]:
+            new_text = pattern.sub("", text).strip()
+            if new_text != text:
+                text = new_text
+                stripped_any = True
+                break
+        if not stripped_any or not text:
+            break
+    text = text.lower().strip()
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text
+
+
 def normalize_release_title(title: str, ignores: list[str] | None = None,
                               explicit_map: list | None = None) -> str:
     """Normalize a release/track title for duplicate detection.
@@ -744,31 +960,18 @@ def normalize_release_title(title: str, ignores: list[str] | None = None,
     3. Strips each remaining rule from the end of the title
        (case-insensitive, repeatedly; unclosed '*' stays greedy).
     4. Lowercases, strips punctuation and collapses whitespace.
+
+    With the default rules (the app's only call pattern) results are
+    cached per (title, settings version). Explicit ignores/explicit_map
+    arguments compile fresh rules per call and stay uncached.
     """
-    import re
+    if ignores is None and explicit_map is None:
+        return _normalize_title_cached(title or "", _rule_version)
     if ignores is None:
         ignores = get_dedup_ignores()
-    text = (title or "").strip()
     if explicit_map is None:
         explicit_map = get_explicit_map()
-    if explicit_map and "*" in text:
-        token_patterns = sorted(
-            ((_explicit_to_token_pattern(c), clean)
-             for c, clean in explicit_map if c and clean),
-            key=lambda pc: len(pc[0].pattern),
-            reverse=True,
-        )
-        words = []
-        for token in text.split():
-            if "*" in token:
-                for pattern, clean in token_patterns:
-                    if pattern.match(token):
-                        token = clean
-                        break
-            words.append(token)
-        text = " ".join(words)
     active = [s for s in ignores if s and s.strip()]
-    # Closed-paren tags match anywhere; the rest only match at the end
     global_patterns = []
     suffix_rules = []
     for s in active:
@@ -777,27 +980,18 @@ def normalize_release_title(title: str, ignores: list[str] | None = None,
             global_patterns.append(gp)
         else:
             suffix_rules.append(s)
-    for pattern in global_patterns:
-        new_text = pattern.sub("", text)
-        if new_text != text:
-            text = re.sub(r"\s+", " ", new_text).strip()
-    # Longest rules first for stability; cap passes to avoid pathological loops
     suffix_rules = sorted(suffix_rules, key=len, reverse=True)
-    patterns = [(_rule_to_suffix_pattern(s), len(s)) for s in suffix_rules]
-    for _ in range(20):
-        stripped_any = False
-        for pattern, _size in patterns:
-            new_text = pattern.sub("", text).strip()
-            if new_text != text:
-                text = new_text
-                stripped_any = True
-                break
-        if not stripped_any or not text:
-            break
-    text = text.lower().strip()
-    text = re.sub(r'[^\w\s]', '', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text
+    rules = {
+        "global": global_patterns,
+        "suffix": [(_rule_to_suffix_pattern(s), len(s)) for s in suffix_rules],
+        "explicit": sorted(
+            ((_explicit_to_token_pattern(c), clean)
+             for c, clean in explicit_map if c and clean),
+            key=lambda pc: len(pc[0].pattern),
+            reverse=True,
+        ),
+    }
+    return _apply_rules(title, rules)
 
 
 # --- Explicit-word mappings (censored -> clean) ---
@@ -892,6 +1086,11 @@ def set_explicit_map(pairs) -> list[list[str]]:
     return cleaned
 
 
+# Settings are read on hot paths (per artist during scans, per search) but
+# written rarely, so the full dict is cached until the next write.
+_settings_cache: dict[str, str] | None = None
+
+
 def set_meta(key: str, value: str):
     conn = get_db()
     conn.execute(
@@ -899,18 +1098,29 @@ def set_meta(key: str, value: str):
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
-    conn.commit()
+    if key.startswith("setting_"):
+        _invalidate_settings_cache()
+    _maybe_commit()
 
 
 def get_all_settings() -> dict[str, str]:
     """Return all settings as a dict. Settings are stored in the meta table
     with keys prefixed by 'setting_'."""
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT key, value FROM meta WHERE key LIKE 'setting_%'"
-    ).fetchall()
-    # Strip the 'setting_' prefix for the returned keys
-    return {row["key"][8:]: row["value"] for row in rows}
+    global _settings_cache
+    if _settings_cache is None:
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT key, value FROM meta WHERE key LIKE 'setting_%'"
+        ).fetchall()
+        # Strip the 'setting_' prefix for the returned keys
+        _settings_cache = {row["key"][8:]: row["value"] for row in rows}
+    return dict(_settings_cache)
+
+
+def _invalidate_settings_cache():
+    global _settings_cache
+    _settings_cache = None
+    _invalidate_rule_cache()
 
 
 def set_setting(key: str, value: str):

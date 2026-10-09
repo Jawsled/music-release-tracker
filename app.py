@@ -62,6 +62,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_startup_refresh())
     # Retroactively fetch tracklists for MB albums/EPs missing track_titles
     asyncio.create_task(_backfill_tracklists())
+    # Retroactively fetch canonical URLs for SoundCloud releases missing one
+    asyncio.create_task(_backfill_sc_urls())
     webbrowser.open(f"http://{HOST}:{PORT}")
     yield
 
@@ -586,25 +588,28 @@ async def add_artist(body: ArtistAddRequest):
 
         count = 0
         releases = await soundcloud.get_artist_releases(permalink)
-        existing_releases = db.get_releases(artist_id=artist["id"])
-        existing_titles = {_normalize_release_title(r["title"]) for r in existing_releases}
-        for rel in releases:
-            sc_title_norm = _normalize_release_title(rel["title"])
-            if sc_title_norm in existing_titles:
-                continue
-            inserted = db.add_release(
-                mbid=rel["mbid"],
-                artist_id=artist["id"],
-                title=rel["title"],
-                release_type=rel["type"],
-                release_date=rel.get("date", ""),
-                notified=1,
-                source="soundcloud",
-                soundcloud_track_id=rel.get("soundcloud_track_id", ""),
-                artwork_url=rel.get("artwork_url", ""),
-            )
-            if inserted:
-                count += 1
+        async with db.batch():
+            existing_releases = db.get_releases(artist_id=artist["id"])
+            existing_titles = {_normalize_release_title(r["title"]) for r in existing_releases}
+            for rel in releases:
+                sc_title_norm = _normalize_release_title(rel["title"])
+                if sc_title_norm in existing_titles:
+                    continue
+                inserted = db.add_release(
+                    mbid=rel["mbid"],
+                    artist_id=artist["id"],
+                    title=rel["title"],
+                    release_type=rel["type"],
+                    release_date=rel.get("date", ""),
+                    notified=1,
+                    source="soundcloud",
+                    soundcloud_track_id=rel.get("soundcloud_track_id", ""),
+                    soundcloud_playlist_id=rel.get("soundcloud_playlist_id") or None,
+                    artwork_url=rel.get("artwork_url", ""),
+                    mb_url=rel.get("url", ""),
+                )
+                if inserted:
+                    count += 1
 
         return {"status": "linked", "artist": artist, "releases_imported": count}
 
@@ -662,8 +667,91 @@ async def add_artist(body: ArtistAddRequest):
 
         # Import releases for the linked source
         count = 0
+        async with db.batch():
+            if body.source == "musicbrainz":
+                releases = await musicbrainz.get_artist_releases(body.id)
+                for rel in releases:
+                    inserted = db.add_release(
+                        mbid=rel["mbid"],
+                        artist_id=artist["id"],
+                        title=rel["title"],
+                        release_type=rel["type"],
+                        release_date=rel["date"],
+                        notified=1,
+                        source="musicbrainz",
+                        mb_url=rel.get("url", ""),
+                        credits=json.dumps(rel.get("credits") or []),
+                    )
+                    if inserted:
+                        count += 1
+            elif body.source == "itunes":
+                releases = await itunes.get_artist_releases(int(body.id), artist_name=body.name)
+                # Get existing MB releases for this artist to check for duplicates
+                existing_releases = db.get_releases(artist_id=artist["id"])
+                mb_titles = {_normalize_release_title(r["title"]) for r in existing_releases if r.get("source") == "musicbrainz"}
+                for rel in releases:
+                    # Skip iTunes releases that duplicate MB releases (ignoring - Single/- EP suffix)
+                    itunes_title_norm = _normalize_release_title(rel["title"])
+                    if itunes_title_norm in mb_titles:
+                        continue
+                    inserted = db.add_release(
+                        mbid=str(rel["id"]),
+                        artist_id=artist["id"],
+                        title=rel["title"],
+                        release_type=rel["type"],
+                        release_date=rel.get("date", ""),
+                        notified=1,
+                        source="itunes",
+                        itunes_collection_id=str(rel["id"]),
+                        artwork_url=rel.get("artwork_url", ""),
+                    )
+                    if inserted:
+                        count += 1
+            elif body.source == "soundcloud":
+                releases = await soundcloud.get_artist_releases(body.id)
+                # Deduplicate: same as iTunes — exact normalized title set lookup.
+                existing_releases = db.get_releases(artist_id=artist["id"])
+                existing_titles = {_normalize_release_title(r["title"]) for r in existing_releases}
+                for rel in releases:
+                    sc_title_norm = _normalize_release_title(rel["title"])
+                    if sc_title_norm in existing_titles:
+                        continue
+                    inserted = db.add_release(
+                        mbid=rel["mbid"],
+                        artist_id=artist["id"],
+                        title=rel["title"],
+                        release_type=rel["type"],
+                        release_date=rel.get("date", ""),
+                        notified=1,
+                        source="soundcloud",
+                        soundcloud_track_id=rel.get("soundcloud_track_id", ""),
+                        soundcloud_playlist_id=rel.get("soundcloud_playlist_id") or None,
+                        artwork_url=rel.get("artwork_url", ""),
+                        mb_url=rel.get("url", ""),
+                    )
+                    if inserted:
+                        count += 1
+
+        return {"status": "linked", "artist": artist, "releases_imported": count}
+
+    # Create new artist entry
+    artist = db.add_artist(
+        mbid=body.id if body.source == "musicbrainz" else "",
+        name=body.name,
+        disambiguation=body.disambiguation,
+        itunes_artist_id=int(body.id) if body.source == "itunes" else None,
+        soundcloud_permalink=body.id if body.source == "soundcloud" else None,
+    )
+
+    # Import releases based on source
+    count = 0
+    async with db.batch():
         if body.source == "musicbrainz":
             releases = await musicbrainz.get_artist_releases(body.id)
+            # (release row id, release-group mbid) for new albums/EPs —
+            # tracklists fetched in parallel after the loop instead of
+            # one awaited request per album.
+            pending_tracklists: list[tuple[int, str]] = []
             for rel in releases:
                 inserted = db.add_release(
                     mbid=rel["mbid"],
@@ -678,16 +766,15 @@ async def add_artist(body: ArtistAddRequest):
                 )
                 if inserted:
                     count += 1
+                    # Fetch and store tracklist for albums/EPs (used for SC dedup)
+                    if rel["type"] in ("Album", "EP"):
+                        release_row = db.get_release_by_mbid(rel["mbid"], artist["id"])
+                        if release_row:
+                            pending_tracklists.append((release_row["id"], rel["mbid"]))
+            await _fetch_tracklists_parallel(pending_tracklists, body.id)
         elif body.source == "itunes":
             releases = await itunes.get_artist_releases(int(body.id), artist_name=body.name)
-            # Get existing MB releases for this artist to check for duplicates
-            existing_releases = db.get_releases(artist_id=artist["id"])
-            mb_titles = {_normalize_release_title(r["title"]) for r in existing_releases if r.get("source") == "musicbrainz"}
             for rel in releases:
-                # Skip iTunes releases that duplicate MB releases (ignoring - Single/- EP suffix)
-                itunes_title_norm = _normalize_release_title(rel["title"])
-                if itunes_title_norm in mb_titles:
-                    continue
                 inserted = db.add_release(
                     mbid=str(rel["id"]),
                     artist_id=artist["id"],
@@ -703,12 +790,15 @@ async def add_artist(body: ArtistAddRequest):
                     count += 1
         elif body.source == "soundcloud":
             releases = await soundcloud.get_artist_releases(body.id)
-            # Deduplicate: same as iTunes — exact normalized title set lookup.
+            # Deduplicate: check against existing release titles AND album/EP tracklists
             existing_releases = db.get_releases(artist_id=artist["id"])
             existing_titles = {_normalize_release_title(r["title"]) for r in existing_releases}
+            album_track_titles = db.get_artist_all_track_titles(artist["id"])
             for rel in releases:
                 sc_title_norm = _normalize_release_title(rel["title"])
                 if sc_title_norm in existing_titles:
+                    continue
+                if sc_title_norm in album_track_titles:
                     continue
                 inserted = db.add_release(
                     mbid=rel["mbid"],
@@ -719,92 +809,12 @@ async def add_artist(body: ArtistAddRequest):
                     notified=1,
                     source="soundcloud",
                     soundcloud_track_id=rel.get("soundcloud_track_id", ""),
+                    soundcloud_playlist_id=rel.get("soundcloud_playlist_id") or None,
                     artwork_url=rel.get("artwork_url", ""),
+                    mb_url=rel.get("url", ""),
                 )
                 if inserted:
                     count += 1
-
-        return {"status": "linked", "artist": artist, "releases_imported": count}
-
-    # Create new artist entry
-    artist = db.add_artist(
-        mbid=body.id if body.source == "musicbrainz" else "",
-        name=body.name,
-        disambiguation=body.disambiguation,
-        itunes_artist_id=int(body.id) if body.source == "itunes" else None,
-        soundcloud_permalink=body.id if body.source == "soundcloud" else None,
-    )
-
-    # Import releases based on source
-    count = 0
-    if body.source == "musicbrainz":
-        releases = await musicbrainz.get_artist_releases(body.id)
-        for rel in releases:
-            inserted = db.add_release(
-                mbid=rel["mbid"],
-                artist_id=artist["id"],
-                title=rel["title"],
-                release_type=rel["type"],
-                release_date=rel["date"],
-                notified=1,
-                source="musicbrainz",
-                mb_url=rel.get("url", ""),
-                credits=json.dumps(rel.get("credits") or []),
-            )
-            if inserted:
-                count += 1
-                # Fetch and store tracklist for albums/EPs (used for SC dedup)
-                if rel["type"] in ("Album", "EP"):
-                    try:
-                        tracks = await musicbrainz.get_release_tracks(rel["mbid"], body.id)
-                        if tracks:
-                            db.update_release_track_titles(
-                                db.get_release_by_mbid(rel["mbid"], artist["id"])["id"],
-                                [t["title"] for t in tracks],
-                            )
-                    except Exception:
-                        pass
-    elif body.source == "itunes":
-        releases = await itunes.get_artist_releases(int(body.id), artist_name=body.name)
-        for rel in releases:
-            inserted = db.add_release(
-                mbid=str(rel["id"]),
-                artist_id=artist["id"],
-                title=rel["title"],
-                release_type=rel["type"],
-                release_date=rel.get("date", ""),
-                notified=1,
-                source="itunes",
-                itunes_collection_id=str(rel["id"]),
-                artwork_url=rel.get("artwork_url", ""),
-            )
-            if inserted:
-                count += 1
-    elif body.source == "soundcloud":
-        releases = await soundcloud.get_artist_releases(body.id)
-        # Deduplicate: check against existing release titles AND album/EP tracklists
-        existing_releases = db.get_releases(artist_id=artist["id"])
-        existing_titles = {_normalize_release_title(r["title"]) for r in existing_releases}
-        album_track_titles = db.get_artist_all_track_titles(artist["id"])
-        for rel in releases:
-            sc_title_norm = _normalize_release_title(rel["title"])
-            if sc_title_norm in existing_titles:
-                continue
-            if sc_title_norm in album_track_titles:
-                continue
-            inserted = db.add_release(
-                mbid=rel["mbid"],
-                artist_id=artist["id"],
-                title=rel["title"],
-                release_type=rel["type"],
-                release_date=rel.get("date", ""),
-                notified=1,
-                source="soundcloud",
-                soundcloud_track_id=rel.get("soundcloud_track_id", ""),
-                artwork_url=rel.get("artwork_url", ""),
-            )
-            if inserted:
-                count += 1
 
     return {"status": "added", "artist": artist, "releases_imported": count}
 
@@ -1012,8 +1022,12 @@ async def get_release_tracks(release_id: str):
             collection_id = release.get("itunes_collection_id") or release_id
             tracks = await itunes.get_release_tracks(int(collection_id))
         elif source == "soundcloud":
-            track_id = release.get("soundcloud_track_id") or release_id
-            tracks = await soundcloud.get_release_tracks(track_id)
+            playlist_id = release.get("soundcloud_playlist_id")
+            if playlist_id:
+                tracks = await soundcloud.get_playlist_tracks(playlist_id)
+            else:
+                track_id = release.get("soundcloud_track_id") or release_id
+                tracks = await soundcloud.get_release_tracks(track_id)
         else:
             # Pass the tracked artist's MBID so their own credit is filtered out
             # of per-track "feat." listings
@@ -1183,91 +1197,100 @@ async def _fetch_artist_new_titles(artist: dict) -> list[str]:
 
     Returns the titles of newly inserted releases. Raises on API/network
     failure so callers can decide to skip/retry.
+
+    All of one artist's writes land in a single transaction (batch()), so a
+    mid-artist failure leaves no partial state behind.
     """
     has_mb = bool(artist.get("mbid"))
     has_itunes = bool(artist.get("itunes_artist_id"))
     has_sc = bool(artist.get("soundcloud_permalink"))
 
     new_titles = []
-    for source in _artist_sources(artist):
-        if source == "musicbrainz" and has_mb:
-            releases = await musicbrainz.get_artist_releases(artist["mbid"])
-            for rel in releases:
-                inserted = db.add_release(
-                    mbid=rel["mbid"],
-                    artist_id=artist["id"],
-                    title=rel["title"],
-                    release_type=rel["type"],
-                    release_date=rel["date"],
-                    notified=0,
-                    source="musicbrainz",
-                    mb_url=rel.get("url", ""),
-                    credits=json.dumps(rel.get("credits") or []),
-                )
-                if inserted:
-                    new_titles.append(rel["title"])
-                    # Fetch and store tracklist for albums/EPs (used for SC dedup)
-                    if rel["type"] in ("Album", "EP"):
-                        try:
-                            tracks = await musicbrainz.get_release_tracks(rel["mbid"], artist.get("mbid", ""))
-                            if tracks:
-                                release_row = db.get_release_by_mbid(rel["mbid"], artist["id"])
-                                if release_row:
-                                    db.update_release_track_titles(
-                                        release_row["id"],
-                                        [t["title"] for t in tracks],
-                                    )
-                        except Exception:
-                            pass
-        elif source == "itunes" and has_itunes:
-            releases = await itunes.get_artist_releases(artist["itunes_artist_id"], artist_name=artist["name"])
-            # Get existing MB releases for this artist to check for duplicates
-            existing_releases = db.get_releases(artist_id=artist["id"])
-            mb_titles = {_normalize_release_title(r["title"]) for r in existing_releases if r.get("source") == "musicbrainz"}
-            for rel in releases:
-                # Skip iTunes releases that duplicate MB releases (ignoring - Single/- EP suffix)
-                itunes_title_norm = _normalize_release_title(rel["title"])
-                if itunes_title_norm in mb_titles:
-                    continue
-                inserted = db.add_release(
-                    mbid=str(rel["id"]),
-                    artist_id=artist["id"],
-                    title=rel["title"],
-                    release_type=rel["type"],
-                    release_date=rel.get("date", ""),
-                    notified=0,
-                    source="itunes",
-                    itunes_collection_id=str(rel["id"]),
-                    artwork_url=rel.get("artwork_url", ""),
-                )
-                if inserted:
-                    new_titles.append(rel["title"])
-        elif source == "soundcloud" and has_sc:
-            releases = await soundcloud.get_artist_releases(artist["soundcloud_permalink"])
-            # Deduplicate: check against existing release titles AND album/EP tracklists.
-            existing_releases = db.get_releases(artist_id=artist["id"])
-            existing_titles = {_normalize_release_title(r["title"]) for r in existing_releases}
-            # Also collect track titles from album/EP tracklists
-            album_track_titles = db.get_artist_all_track_titles(artist["id"])
-            for rel in releases:
-                sc_title_norm = _normalize_release_title(rel["title"])
-                if sc_title_norm in existing_titles:
-                    continue
-                if sc_title_norm in album_track_titles:
-                    continue
-                inserted = db.add_release(
-                    mbid=rel["mbid"],
-                    artist_id=artist["id"],
-                    title=rel["title"],
-                    release_type=rel["type"],
-                    release_date=rel.get("date", ""),
-                    notified=0,
-                    source="soundcloud",
-                    soundcloud_track_id=rel.get("soundcloud_track_id", ""),
-                    artwork_url=rel.get("artwork_url", ""),
-                )
-                if inserted:
-                    new_titles.append(rel["title"])
+    # (release row id, release-group mbid) for new albums/EPs whose
+    # tracklists still need fetching — collected in the MusicBrainz branch,
+    # fetched in parallel right after it so the SoundCloud branch's dedup
+    # still sees them (same ordering as the previous inline await).
+    pending_tracklists: list[tuple[int, str]] = []
+    async with db.batch():
+        for source in _artist_sources(artist):
+            if source == "musicbrainz" and has_mb:
+                releases = await musicbrainz.get_artist_releases(artist["mbid"])
+                for rel in releases:
+                    inserted = db.add_release(
+                        mbid=rel["mbid"],
+                        artist_id=artist["id"],
+                        title=rel["title"],
+                        release_type=rel["type"],
+                        release_date=rel["date"],
+                        notified=0,
+                        source="musicbrainz",
+                        mb_url=rel.get("url", ""),
+                        credits=json.dumps(rel.get("credits") or []),
+                    )
+                    if inserted:
+                        new_titles.append(rel["title"])
+                        # Fetch and store tracklist for albums/EPs (used for SC dedup)
+                        if rel["type"] in ("Album", "EP"):
+                            release_row = db.get_release_by_mbid(rel["mbid"], artist["id"])
+                            if release_row:
+                                pending_tracklists.append((release_row["id"], rel["mbid"]))
+                # Fetch this pass's tracklists before the SoundCloud branch
+                # below dedups against them — same ordering as the old
+                # inline await, just not serialized request-by-request.
+                if pending_tracklists:
+                    await _fetch_tracklists_parallel(pending_tracklists, artist.get("mbid", ""))
+                    pending_tracklists.clear()
+            elif source == "itunes" and has_itunes:
+                releases = await itunes.get_artist_releases(artist["itunes_artist_id"], artist_name=artist["name"])
+                # Get existing MB releases for this artist to check for duplicates
+                existing_releases = db.get_releases(artist_id=artist["id"])
+                mb_titles = {_normalize_release_title(r["title"]) for r in existing_releases if r.get("source") == "musicbrainz"}
+                for rel in releases:
+                    # Skip iTunes releases that duplicate MB releases (ignoring - Single/- EP suffix)
+                    itunes_title_norm = _normalize_release_title(rel["title"])
+                    if itunes_title_norm in mb_titles:
+                        continue
+                    inserted = db.add_release(
+                        mbid=str(rel["id"]),
+                        artist_id=artist["id"],
+                        title=rel["title"],
+                        release_type=rel["type"],
+                        release_date=rel.get("date", ""),
+                        notified=0,
+                        source="itunes",
+                        itunes_collection_id=str(rel["id"]),
+                        artwork_url=rel.get("artwork_url", ""),
+                    )
+                    if inserted:
+                        new_titles.append(rel["title"])
+            elif source == "soundcloud" and has_sc:
+                releases = await soundcloud.get_artist_releases(artist["soundcloud_permalink"])
+                # Deduplicate: check against existing release titles AND album/EP tracklists.
+                existing_releases = db.get_releases(artist_id=artist["id"])
+                existing_titles = {_normalize_release_title(r["title"]) for r in existing_releases}
+                # Also collect track titles from album/EP tracklists
+                album_track_titles = db.get_artist_all_track_titles(artist["id"])
+                for rel in releases:
+                    sc_title_norm = _normalize_release_title(rel["title"])
+                    if sc_title_norm in existing_titles:
+                        continue
+                    if sc_title_norm in album_track_titles:
+                        continue
+                    inserted = db.add_release(
+                        mbid=rel["mbid"],
+                        artist_id=artist["id"],
+                        title=rel["title"],
+                        release_type=rel["type"],
+                        release_date=rel.get("date", ""),
+                        notified=0,
+                        source="soundcloud",
+                        soundcloud_track_id=rel.get("soundcloud_track_id", ""),
+                        soundcloud_playlist_id=rel.get("soundcloud_playlist_id") or None,
+                        artwork_url=rel.get("artwork_url", ""),
+                        mb_url=rel.get("url", ""),
+                    )
+                    if inserted:
+                        new_titles.append(rel["title"])
 
     return new_titles
 
@@ -1583,6 +1606,82 @@ async def _backfill_tracklists():
             continue
     if filled:
         _add_log("INFO", f"Backfilled tracklists for {filled} release(s)")
+
+
+async def _backfill_sc_urls():
+    """Fetch canonical SoundCloud URLs for releases imported without one.
+
+    Singles stored only their numeric track id (used as the uniqueness key),
+    and older rows predate URL storage entirely, so their "View" link fell
+    back to soundcloud.com/{artist}/{numeric_id}, which does not resolve.
+    The v2 tracks/playlists endpoints return the real permalink_url, which
+    also heals any row a scan's add_release backfill can't reach (tracks
+    that have scrolled past the tracked-artist pagination window).
+    """
+    conn = db.get_db()
+    rows = conn.execute(
+        """SELECT id, soundcloud_track_id, soundcloud_playlist_id
+             FROM releases
+            WHERE source = 'soundcloud'
+              AND (mb_url = '' OR mb_url IS NULL)"""
+    ).fetchall()
+
+    if not rows:
+        return
+
+    _add_log("INFO", f"Backfilling SoundCloud URLs for {len(rows)} release(s)...")
+    sem = asyncio.Semaphore(4)
+    filled = 0
+
+    async def _fill_one(row) -> bool:
+        async with sem:
+            url = ""
+            if row["soundcloud_playlist_id"]:
+                url = await soundcloud.get_playlist_permalink_url(row["soundcloud_playlist_id"])
+            elif row["soundcloud_track_id"]:
+                url = await soundcloud.get_track_permalink_url(row["soundcloud_track_id"])
+            if not url:
+                return False
+            db.update_release_mb_url(row["id"], url)
+            return True
+
+    for coro in asyncio.as_completed([_fill_one(r) for r in rows]):
+        try:
+            if await coro:
+                filled += 1
+        except Exception:
+            continue
+    if filled:
+        _add_log("INFO", f"Backfilled URLs for {filled} SoundCloud release(s)")
+
+
+# Bounded concurrency for tracklist fetches. Request starts stay spaced
+# >=1s apart by the MusicBrainz pacer, so this only overlaps network
+# latency — an artist with many new albums no longer pays ~2 paced
+# requests per album strictly serially inside the scan loop.
+_TRACKLIST_CONCURRENCY = 4
+
+
+async def _fetch_tracklists_parallel(pending: list[tuple[int, str]], artist_mbid: str = ""):
+    """Fetch tracklists for (release_id, release_mbid) pairs concurrently.
+
+    Failures are swallowed per release, exactly like the previous inline
+    await; a failed fetch is retried by the startup backfill on next boot.
+    """
+    if not pending:
+        return
+    sem = asyncio.Semaphore(_TRACKLIST_CONCURRENCY)
+
+    async def _fill(release_id: int, release_mbid: str):
+        async with sem:
+            try:
+                tracks = await musicbrainz.get_release_tracks(release_mbid, artist_mbid or "")
+            except Exception:
+                return
+            if tracks:
+                db.update_release_track_titles(release_id, [t["title"] for t in tracks])
+
+    await asyncio.gather(*(_fill(rid, mbid) for rid, mbid in pending))
 
 
 # --- Source settings helper ---
