@@ -4,7 +4,7 @@ import asyncio
 import re
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -89,6 +89,13 @@ def get_db() -> sqlite3.Connection:
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA foreign_keys = ON")
         _conn.execute("PRAGMA journal_mode = WAL")
+        # Local single-user app: NORMAL is durability-safe under WAL (a power
+        # cut can lose the last transaction, never corrupt the database) and
+        # drops the fsync-per-commit cost. The rest keep hot reads in memory.
+        _conn.execute("PRAGMA synchronous = NORMAL")
+        _conn.execute("PRAGMA temp_store = MEMORY")
+        _conn.execute("PRAGMA cache_size = -20000")  # ~20 MB page cache
+        _conn.execute("PRAGMA mmap_size = 268435456")  # 256 MB
     return _conn
 
 
@@ -125,6 +132,12 @@ def init_db():
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS api_cache (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            fetched_at TEXT NOT NULL
         );
     """)
 
@@ -196,6 +209,13 @@ def init_db():
     # carries the full data. Cheap and safe to run on every startup.
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.OperationalError:
+        pass
+
+    # Drop cache entries nothing has touched in months (deleted releases leave
+    # orphans behind) so the cache can't grow without bound.
+    try:
+        cache_prune()
     except sqlite3.OperationalError:
         pass
 
@@ -526,41 +546,114 @@ def add_release(
     return True
 
 
+def _release_filters(
+    artist_id: int | None = None,
+    release_type: list[str] | None = None,
+    unseen_only: bool = False,
+    include_hidden: bool = False,
+    hidden_only: bool = False,
+) -> tuple[str, list]:
+    """Build the shared WHERE clause + params for release queries.
+
+    Used by both get_releases() (page fetch) and count_releases() so the feed
+    total and its rows can never disagree about which releases match.
+    """
+    where: list[str] = []
+    params: list = []
+
+    if hidden_only:
+        where.append("r.is_visible = 0")
+    elif not include_hidden:
+        where.append("r.is_visible = 1")
+    if artist_id is not None:
+        where.append("r.artist_id = ?")
+        params.append(artist_id)
+    if release_type:
+        placeholders = ", ".join("?" for _ in release_type)
+        where.append(f"r.release_type IN ({placeholders})")
+        params.extend(release_type)
+    if unseen_only:
+        where.append("r.notified = 0")
+
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    return clause, params
+
+
+# Feed ordering. id is appended as a tiebreaker so the ordering is total,
+# which is what makes the cursor below unambiguous when two releases share a
+# date and a first_seen_at.
+_RELEASE_ORDER = " ORDER BY r.release_date DESC, r.first_seen_at DESC, r.id DESC"
+
+
 def get_releases(
     artist_id: int | None = None,
     release_type: list[str] | None = None,
     unseen_only: bool = False,
     include_hidden: bool = False,
     hidden_only: bool = False,
+    limit: int | None = None,
+    cursor: tuple[str, str, int] | None = None,
 ) -> list[dict]:
-    conn = get_db()
-    query = """
-        SELECT r.*, a.name as artist_name, a.mbid as artist_mbid,
-               a.soundcloud_permalink as artist_soundcloud_permalink
-        FROM releases r
-        JOIN artists a ON r.artist_id = a.id
-        WHERE 1=1
+    """Fetch releases, newest first.
+
+    ``limit``/``cursor`` drive feed pagination. ``cursor`` is the
+    (release_date, first_seen_at, id) of the last row already shown; only rows
+    strictly older than it are returned. A cursor (rather than OFFSET) means
+    hiding/marking a visible card can't make the next page skip a release.
+    Without ``limit`` every matching row is returned (internal callers).
     """
-    params: list = []
+    conn = get_db()
+    clause, params = _release_filters(
+        artist_id=artist_id,
+        release_type=release_type,
+        unseen_only=unseen_only,
+        include_hidden=include_hidden,
+        hidden_only=hidden_only,
+    )
 
-    if hidden_only:
-        query += " AND r.is_visible = 0"
-    elif not include_hidden:
-        query += " AND r.is_visible = 1"
-    if artist_id is not None:
-        query += " AND r.artist_id = ?"
-        params.append(artist_id)
-    if release_type:
-        placeholders = ", ".join("?" for _ in release_type)
-        query += f" AND r.release_type IN ({placeholders})"
-        params.extend(release_type)
-    if unseen_only:
-        query += " AND r.notified = 0"
+    query = (
+        "SELECT r.*, a.name as artist_name, a.mbid as artist_mbid, "
+        "a.soundcloud_permalink as artist_soundcloud_permalink "
+        "FROM releases r JOIN artists a ON r.artist_id = a.id" + clause
+    )
 
-    query += " ORDER BY r.release_date DESC, r.first_seen_at DESC"
+    if cursor is not None:
+        c_date, c_time, c_id = cursor
+        query += (
+            " AND (r.release_date < ?"
+            " OR (r.release_date = ? AND r.first_seen_at < ?)"
+            " OR (r.release_date = ? AND r.first_seen_at = ? AND r.id < ?))"
+        )
+        params.extend([c_date, c_date, c_time, c_date, c_time, c_id])
+
+    query += _RELEASE_ORDER
+
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(int(limit))
 
     rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def count_releases(
+    artist_id: int | None = None,
+    release_type: list[str] | None = None,
+    unseen_only: bool = False,
+    include_hidden: bool = False,
+    hidden_only: bool = False,
+) -> int:
+    """Total releases matching the same filters get_releases() uses."""
+    conn = get_db()
+    clause, params = _release_filters(
+        artist_id=artist_id,
+        release_type=release_type,
+        unseen_only=unseen_only,
+        include_hidden=include_hidden,
+        hidden_only=hidden_only,
+    )
+    row = conn.execute("SELECT COUNT(*) AS c FROM releases r" + clause, params).fetchone()
+    return row["c"] if row else 0
 
 
 def mark_release_seen(release_id: int):
@@ -653,6 +746,43 @@ def get_release_by_id(release_id: str) -> dict | None:
         (release_id, release_id),
     ).fetchone()
     return dict(row) if row else None
+
+
+# --- API response cache ---
+# Persisted TTL cache for on-demand upstream reads (tracklists, streaming
+# links, an artist's MB links). Entries are keyed "<kind>:<args>" and carry an
+# ISO fetch time; cache.py owns the TTLs. The table predates this code (a
+# previously-removed cache layer used the same key convention), so reusing it
+# keeps the schema stable and drops straight onto existing databases.
+
+def cache_get(key: str) -> tuple[str, str] | None:
+    """Return (value_json, fetched_at) for a cached entry, or None."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT value, fetched_at FROM api_cache WHERE key = ?", (key,)
+    ).fetchone()
+    return (row["value"], row["fetched_at"]) if row else None
+
+
+def cache_put(key: str, value: str):
+    """Store/refresh one cache entry. ``value`` is a JSON string."""
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO api_cache (key, value, fetched_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+        "fetched_at = excluded.fetched_at",
+        (key, value, _now_iso()),
+    )
+    _maybe_commit()
+
+
+def cache_prune(max_age_days: int = 90) -> int:
+    """Delete cache entries older than ``max_age_days``; returns rows removed."""
+    conn = get_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    cur = conn.execute("DELETE FROM api_cache WHERE fetched_at < ?", (cutoff,))
+    _maybe_commit()
+    return cur.rowcount or 0
 
 
 # --- Meta (key/value state) ---

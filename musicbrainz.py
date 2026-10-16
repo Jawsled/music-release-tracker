@@ -399,7 +399,11 @@ async def get_release_streaming_urls(rg_id: str) -> list[dict]:
     """
     limit = 100
     offset = 0
-    max_pages = 10  # safety cap: 1000 releases is far beyond any real group
+    # A release group almost never needs more than one page (100 releases), and
+    # each page costs a >=1s paced request. Cap the walk at three pages so a
+    # pathological group can't turn an expand into a many-second stall; the
+    # standard-edition-first pass below finds the usual links in page one.
+    max_pages = 3
 
     # Collect ALL releases with their streaming URLs
     all_releases: list[dict] = []

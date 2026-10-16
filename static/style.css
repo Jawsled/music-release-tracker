@@ -69,6 +69,7 @@ main { max-width: 800px; margin: 0 auto; padding: 1.5rem; }
 .release-item:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(0,0,0,0.4); }
 .release-item.unseen { border-left: 3px solid #8c8c8c; }
 .release-item.is-hidden { opacity: 0.65; }
+.release-sentinel { color: #666; font-size: 0.82rem; text-align: center; padding: 1.25rem 0; min-height: 1px; }
 
 /* Clickable card area */
 .release-card { display: flex; gap: 1rem; padding: 0.75rem 1rem 0.75rem 0.75rem; align-items: center; cursor: pointer; user-select: none; }

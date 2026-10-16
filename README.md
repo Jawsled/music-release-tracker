@@ -75,13 +75,16 @@ A `Music-Release-Tracker (conda).bat` launcher is included if you prefer running
 
 ## Database
 
-SQLite database (`music-release-tracker.db`) with three tables:
+SQLite database (`music-release-tracker.db`) with four tables:
 
 | Table | Columns |
 | --- | --- |
 | `artists` | internal ID, `mbid`, `name`, `disambiguation`, `itunes_artist_id`, `soundcloud_permalink`, `added_at` |
 | `releases` | internal ID, `mbid` (iTunes/SoundCloud IDs also live here), artist ID, `source` (`musicbrainz`/`itunes`/`soundcloud`), `title`, `release_type`, `release_date`, `first_seen_at`, `notified`, `release_day_notified` *(unused)*, `mb_url`, `itunes_collection_id`, `soundcloud_track_id`, `soundcloud_playlist_id`, `artwork_url`, `credits`, `track_titles`, `is_visible` |
 | `meta` | key/value store for settings (keys prefixed with `setting_`) and internal state |
+| `api_cache` | upstream response cache: `key` (`<kind>:<id>`), `value` (JSON), `fetched_at` |
+
+Cover art for MusicBrainz releases is proxied through `/api/covers/{mbid}` and cached on disk in `.cache/covers/` (regenerable — safe to delete). The feed loads one page at a time and appends more as you scroll. Tracklists, streaming links, and an artist's MusicBrainz links are cached in `api_cache` (TTLs in `cache.py`; entries untouched for 90 days are pruned at startup).
 
 ## Known Issues
 

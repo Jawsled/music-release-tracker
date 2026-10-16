@@ -20,7 +20,79 @@ function getRoute() {
 }
 
 window.addEventListener("hashchange", () => navigateTo(getRoute()));
-navigateTo(getRoute());
+// NOTE: the initial navigateTo(getRoute()) call lives at the bottom of the file
+// (see "--- Init ---"). It used to run here, but loadReleases() reads module
+// state (e.g. _releaseRequestSeq, filterUnseen) declared further down, so
+// calling it this early threw a TDZ ReferenceError on every page load.
+
+// --- HTML helpers ---
+// esc() escapes any value for interpolation into HTML (text or attribute
+// context). It is a pure string function (no placeholder element) and unlike
+// the old version escapes quotes too, so values dropped into attributes can't
+// break out of them.
+function esc(value) {
+  if (value == null) return "";
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Marks a string as trusted HTML so `html` won't re-escape it. It stringifies
+// like a plain string, so a raw()/html() result can still be assigned to
+// innerHTML or dropped into an ordinary template literal. A plain constructor
+// (not a class) so it is hoisted and can be referenced from top-level code
+// that runs earlier in the file.
+function SafeHtml(markup) { this.markup = String(markup); }
+SafeHtml.prototype.toString = function () { return this.markup; };
+function raw(markup) { return new SafeHtml(markup); }
+
+function _renderValue(value) {
+  if (value instanceof SafeHtml) return value.markup;
+  if (Array.isArray(value)) return value.map(_renderValue).join("");
+  return esc(value);
+}
+
+// Tagged template that escapes every interpolated value by default — the safe
+// way to build markup from data. Splice in already-safe fragments (built with
+// `html` or wrapped in raw()) and they pass through verbatim.
+function html(strings, ...values) {
+  let out = strings[0];
+  for (let i = 0; i < values.length; i++) {
+    out += _renderValue(values[i]);
+    out += strings[i + 1];
+  }
+  return raw(out);
+}
+
+// --- HTTP helpers ---
+// Thin wrapper over fetch: JSON in/out, and HTTP errors become exceptions
+// (pass allowError to inspect a non-2xx response instead of throwing).
+async function apiRaw(path, { method = "GET", json, body, headers, allowError = false } = {}) {
+  const init = { method, headers: { ...headers } };
+  if (json !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(json);
+  } else if (body !== undefined) {
+    init.body = body;
+  }
+  const resp = await fetch(path, init);
+  if (!resp.ok && !allowError) {
+    const err = new Error(`${method} ${path} → ${resp.status} ${resp.statusText}`);
+    err.status = resp.status;
+    err.response = resp;
+    throw err;
+  }
+  return resp;
+}
+
+async function api(path, opts) {
+  const resp = await apiRaw(path, opts);
+  const text = await resp.text();
+  return text ? JSON.parse(text) : null;
+}
 
 // --- Source icon helper ---
 function sourceIcon(source, size = 16) {
@@ -30,8 +102,8 @@ function sourceIcon(source, size = 16) {
     soundcloud: '/static/assets/soundcloud.svg'
   };
   const src = icons[source];
-  if (!src) return '';
-  return `<img src="${src}" alt="" class="source-icon-inline" style="width:${size}px;height:${size}px;">`;
+  if (!src) return raw('');
+  return raw(`<img src="${src}" alt="" class="source-icon-inline" style="width:${size}px;height:${size}px;">`);
 }
 
 // --- Feed Tab ---
@@ -70,8 +142,7 @@ function _updateCheckBtn() {
 // Refresh the artists cache
 async function _refreshArtistsCache() {
   try {
-    const resp = await fetch("/api/artists");
-    _artistsCache = await resp.json();
+    _artistsCache = await api("/api/artists");
     _updateCheckBtn();
   } catch {
     // silent fail
@@ -81,6 +152,169 @@ async function _refreshArtistsCache() {
 // Refresh cache periodically and after mutations (skip when tab hidden)
 _refreshArtistsCache();
 setInterval(() => { if (!document.hidden) _refreshArtistsCache(); }, 15000);
+
+// --- Delegated event handling ---
+// Generated markup used to embed JavaScript — and sometimes whole JSON
+// snapshots — inside inline onclick="..." attributes. That is fragile (a quote
+// or newline in a title/name could break out of the attribute) and pushes
+// strings through the HTML parser. Instead, dynamic controls now declare what
+// they do with data-action + data-* params, and a single document-level
+// listener dispatches to the matching handler. Row objects that don't fit in
+// attributes (search results) live in _rowData and are referenced by a key.
+function dataAttrs(attrs) {
+  let out = "";
+  for (const key of Object.keys(attrs)) {
+    const value = attrs[key];
+    if (value === undefined || value === null) continue;
+    out += ` data-${key}="${esc(value)}"`;
+  }
+  return out;
+}
+
+const _rowData = new Map();
+let _rowDataSeq = 0;
+function registerRow(obj) {
+  const key = `r${++_rowDataSeq}`;
+  _rowData.set(key, obj);
+  return key;
+}
+
+const ACTIONS = {
+  "select-artist": el => selectArtist(el.dataset.id),
+  "select-tracked-artist": el => selectTrackedArtist(el.dataset.id),
+  "goto-artists": () => { location.hash = "#/artists"; },
+  "show-all-releases": () => {
+    filterUnseen.checked = false;
+    updateResetFiltersBtn();
+    loadReleases();
+  },
+  "reset-filters": () => resetFilters(),
+  "toggle-tracklist": el => toggleTracklist(el),
+  "toggle-streaming": el => toggleStreaming(el),
+  "hide-release": el => hideRelease(Number(el.dataset.id), el),
+  "unhide-release": el => unhideRelease(Number(el.dataset.id), el),
+  "mark-seen": el => markSeen(Number(el.dataset.id), el),
+  "retry-tracklist": el => {
+    const item = el.closest(".release-item");
+    if (!item) return;
+    delete tracklistCache[item.dataset.mbid];
+    const section = item.querySelector(".tracklist-section");
+    if (section) {
+      section.classList.remove("expanded");
+      setCardExpanded(item, "track", false);
+    }
+    toggleTracklist(item.querySelector(".release-card"));
+  },
+  "copy-tracklist": el => copyTracklist(el.dataset.mbid, el),
+  "toggle-mb-links": el => toggleMbArtistLinks(el.dataset.mbid, el),
+  "check-artist": el => checkSingleArtist(Number(el.dataset.id)),
+  "edit-disambiguation": el => editDisambiguation(Number(el.dataset.id), el),
+  "confirm-remove": el => confirmRemoveArtist(Number(el.dataset.id), el),
+  "confirm-unlink": el => confirmUnlinkArtist(Number(el.dataset.id), el.dataset.source, el),
+  "do-remove-artist": el => doRemoveArtist(Number(el.dataset.id)),
+  "do-unlink-artist": el => doUnlinkArtist(Number(el.dataset.id), el.dataset.source),
+  "load-artists": () => loadArtists(),
+  "save-disambiguation": el => saveDisambiguation(Number(el.dataset.id)),
+  "toggle-artist-menu": el => toggleArtistMenu(el),
+  "open-link-source": el => openLinkSourceModal(Number(el.dataset.id), el.dataset.name, el.dataset.source),
+  "add-artist": el => addArtist(_rowData.get(el.dataset.key), el),
+  "link-source": el => linkSource(_rowData.get(el.dataset.key), el),
+  "jump-to-artist": el => jumpToArtistFromSummary(el.dataset.artist),
+  "remove-dedup-rule": el => removeDedupRule(Number(el.dataset.index)),
+  "remove-explicit-map": el => removeExplicitMapRule(Number(el.dataset.index)),
+  "search-link-source": () => searchLinkSource(),
+
+  // Static UI from templates/index.html
+  "close-side-panels": () => closeSidePanels(),
+  "clear-logs": () => clearLogs(),
+  "toggle-logs-panel": () => toggleLogsPanel(),
+  "set-log-level": el => setLogLevel(el),
+  "toggle-settings-panel": () => toggleSettingsPanel(),
+  "run-dedup": () => runDedup(),
+  "add-dedup-rule": () => addDedupRule(),
+  "add-explicit-map-rule": () => addExplicitMapRule(),
+  "toggle-artist-dropdown": () => toggleArtistDropdown(),
+  "toggle-type": el => toggleType(el),
+  "close-check-popup": () => closeCheckPopup(),
+  "toggle-pause-check": () => togglePauseCheck(),
+  "retry-failed": () => retryFailed(),
+  "view-new-results": () => viewNewResults(),
+  "toggle-search-source-menu": () => toggleSearchSourceMenu(),
+  "toggle-tracked-dropdown": () => toggleTrackedDropdown(),
+  "export-artists": () => exportArtists(),
+  "close-link-source-modal": () => closeLinkSourceModal(),
+};
+
+// Change/input handlers for static controls (checkboxes, text inputs).
+const CHANGE_ACTIONS = {
+  "save-settings": () => saveSettings(true),
+  "load-releases": () => loadReleases(),
+  "update-search-sources": () => updateSearchSources(),
+};
+const INPUT_ACTIONS = {
+  "load-logs": () => loadLogs(),
+  "filter-artist-list": () => filterArtistList(),
+  "filter-tracked-list": () => filterTrackedList(),
+};
+
+document.addEventListener("click", e => {
+  // Plain navigation links (artist / source / view URLs) keep their default
+  // behaviour and must not also trigger a surrounding card action.
+  const link = e.target.closest("a[href]");
+  if (link && !link.hasAttribute("data-action")) return;
+  // Only the innermost action fires, so a button inside a card never also
+  // toggles the card.
+  const el = e.target.closest("[data-action]");
+  if (!el) return;
+  const action = ACTIONS[el.dataset.action];
+  if (action) action(el, e);
+});
+
+// Keyboard activation for the card body (role="button"). Real <button>
+// elements already raise a click on Enter/Space, so they are excluded here to
+// avoid toggling twice.
+document.addEventListener("keydown", e => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const el = e.target.closest('[data-action][role="button"]');
+  if (!el) return;
+  e.preventDefault();
+  const action = ACTIONS[el.dataset.action];
+  if (action) action(el, e);
+});
+
+document.addEventListener("change", e => {
+  const el = e.target.closest("[data-change-action]");
+  if (!el) return;
+  const action = CHANGE_ACTIONS[el.dataset.changeAction];
+  if (action) action(el, e);
+});
+
+document.addEventListener("input", e => {
+  const el = e.target.closest("[data-input-action]");
+  if (!el) return;
+  const action = INPUT_ACTIONS[el.dataset.inputAction];
+  if (action) action(el, e);
+});
+
+// <img> error fallbacks. `error` does not bubble, so this runs in the capture
+// phase. data-cover-fallback carries the initials to swap in; data-hide-on-error
+// just hides the broken image. Replaces the old inline onerror="..." handlers.
+document.addEventListener("error", e => {
+  const img = e.target;
+  if (!img || img.tagName !== "IMG") return;
+  if (img.hasAttribute("data-hide-on-error")) {
+    img.style.display = "none";
+    return;
+  }
+  const initials = img.getAttribute("data-cover-fallback");
+  if (initials != null) {
+    const fallback = document.createElement("div");
+    fallback.className = "cover-fallback";
+    fallback.setAttribute("aria-hidden", "true");
+    fallback.textContent = initials;
+    img.replaceWith(fallback);
+  }
+}, true);
 
 // --- Toast helper ---
 function showToast(message, actionLabel, actionFn, timeout = 5000) {
@@ -164,10 +398,10 @@ function renderArtistDropdown() {
   const countEl = document.getElementById("artist-dropdown-count");
   if (countEl) countEl.textContent = filtered.length ? `${filtered.length} of ${data.length}` : (data.length ? "No matches" : "No artists tracked");
 
-  let html = `<div class="dropdown-item ${!activeArtistFilterId ? 'active' : ''}" role="option" data-idx="0" onclick="selectArtist('')"><em>All Artists</em></div>`;
+  let html = `<div class="dropdown-item ${!activeArtistFilterId ? 'active' : ''}" role="option" data-idx="0"${dataAttrs({ action: "select-artist", id: "" })}><em>All Artists</em></div>`;
   filtered.forEach((a, i) => {
     const activeClass = String(a.id) === String(activeArtistFilterId) ? " active" : "";
-    html += `<div class="dropdown-item${activeClass}" role="option" data-idx="${i + 1}" onclick="selectArtist(${a.id})" title="${esc(a.name)}">${esc(a.name)}</div>`;
+    html += `<div class="dropdown-item${activeClass}" role="option" data-idx="${i + 1}"${dataAttrs({ action: "select-artist", id: a.id })} title="${esc(a.name)}">${esc(a.name)}</div>`;
   });
   artistDropdownList.innerHTML = html || '<p class="status-msg">No artists tracked yet.</p>';
 }
@@ -270,10 +504,10 @@ function renderTrackedDropdown() {
   const countEl = document.getElementById("tracked-dropdown-count");
   if (countEl) countEl.textContent = filtered.length ? `${filtered.length} of ${data.length}` : (data.length ? "No matches" : "No artists tracked");
 
-  let html = `<div class="dropdown-item ${!activeTrackedFilterId ? 'active' : ''}" role="option" data-idx="0" onclick="selectTrackedArtist('')"><em>${esc(_trackedAllLabel())}</em></div>`;
+  let html = `<div class="dropdown-item ${!activeTrackedFilterId ? 'active' : ''}" role="option" data-idx="0"${dataAttrs({ action: "select-tracked-artist", id: "" })}><em>${esc(_trackedAllLabel())}</em></div>`;
   filtered.forEach((a, i) => {
     const activeClass = String(a.id) === String(activeTrackedFilterId) ? " active" : "";
-    html += `<div class="dropdown-item${activeClass}" role="option" data-idx="${i + 1}" onclick="selectTrackedArtist(${a.id})" title="${esc(a.name)}">${esc(a.name)}</div>`;
+    html += `<div class="dropdown-item${activeClass}" role="option" data-idx="${i + 1}"${dataAttrs({ action: "select-tracked-artist", id: a.id })} title="${esc(a.name)}">${esc(a.name)}</div>`;
   });
   trackedDropdownList.innerHTML = html || '<p class="status-msg">No artists tracked yet.</p>';
 }
@@ -340,8 +574,7 @@ async function toggleMbArtistLinks(mbid, btn) {
   try {
     let d = _mbArtistLinksCache[mbid];
     if (!d) {
-      const resp = await fetch(`/api/mb-artists/${encodeURIComponent(mbid)}/links`);
-      d = await resp.json();
+      d = await api(`/api/mb-artists/${encodeURIComponent(mbid)}/links`);
       _mbArtistLinksCache[mbid] = d;
     }
     const streaming = (d && d.streaming) || [];
@@ -392,7 +625,18 @@ function resetFilters() {
   loadReleases();
 }
 
-async function loadReleases() {
+// --- Feed paging state ---
+// The feed loads one page at a time and appends more as the sentinel nears the
+// viewport, instead of shipping/rendering the whole library at once.
+const RELEASE_PAGE_SIZE = 60;
+let _releaseCursor = "";        // opaque X-Next-Cursor from the last page
+let _releaseTotal = 0;          // X-Total-Count for the active filters
+let _releaseLoaded = 0;         // cards currently rendered
+let _releaseLoadingMore = false;
+let _releaseRequestSeq = 0;     // guards against stale responses after a filter change
+let _releaseObserver = null;
+
+function _releaseFilterParams() {
   const params = new URLSearchParams();
   if (activeArtistFilterId) params.set("artist_id", activeArtistFilterId);
   // Send selected types as comma-separated; empty means "all"
@@ -401,25 +645,134 @@ async function loadReleases() {
   }
   if (filterUnseen.checked) params.set("unseen_only", "true");
   if (document.getElementById("filter-hidden").checked) params.set("hidden_only", "true");
+  return params;
+}
 
-  const resp = await fetch(`/api/releases?${params}`);
-  const releases = await resp.json();
+function _releaseEmptyStateHTML() {
+  const totalArtists = (_artistsCache || []).length;
+  if (totalArtists === 0) {
+    return `<div class="empty-wrap"><h3>No releases yet</h3><p>Add artists to start tracking.</p><button class="check-btn"${dataAttrs({ action: "goto-artists" })}>Find artists</button></div>`;
+  }
+  if (filterUnseen.checked) {
+    return `<div class="empty-wrap"><h3>You're all caught up</h3><p>No new releases match your filters.</p><button class="link-btn"${dataAttrs({ action: "show-all-releases" })}>Show all releases</button></div>`;
+  }
+  if (activeArtistFilterId || activeTypeFilters.length < 4) {
+    return `<div class="empty-wrap"><h3>No matches</h3><p>Nothing matches the current filters.</p><button class="link-btn"${dataAttrs({ action: "reset-filters" })}>Reset filters</button></div>`;
+  }
+  return '<p class="empty-state">No releases yet. Check your artists for new releases.</p>';
+}
 
-  if (releases.length === 0) {
-    const totalArtists = (_artistsCache || []).length;
-    if (totalArtists === 0) {
-      releaseList.innerHTML = `<div class="empty-wrap"><h3>No releases yet</h3><p>Add artists to start tracking.</p><button class="check-btn" onclick="location.hash='#/artists'">Find artists</button></div>`;
-    } else if (filterUnseen.checked) {
-      releaseList.innerHTML = `<div class="empty-wrap"><h3>You're all caught up</h3><p>No new releases match your filters.</p><button class="link-btn" onclick="filterUnseen.checked=false;updateResetFiltersBtn();loadReleases()">Show all releases</button></div>`;
-    } else if (activeArtistFilterId || activeTypeFilters.length < 4) {
-      releaseList.innerHTML = `<div class="empty-wrap"><h3>No matches</h3><p>Nothing matches the current filters.</p><button class="link-btn" onclick="resetFilters()">Reset filters</button></div>`;
-    } else {
-      releaseList.innerHTML = '<p class="empty-state">No releases yet. Check your artists for new releases.</p>';
-    }
-  } else {
-    releaseList.innerHTML = releases.map(r => renderReleaseCard(r)).join("");
+function _renderReleaseCards(releases) {
+  return releases.map(r => renderReleaseCard(r)).join("");
+}
+
+function _teardownReleaseObserver() {
+  if (_releaseObserver) {
+    _releaseObserver.disconnect();
+    _releaseObserver = null;
+  }
+  const sentinel = document.getElementById("release-sentinel");
+  if (sentinel) sentinel.remove();
+}
+
+function _setupReleaseObserver() {
+  _teardownReleaseObserver();
+  if (!_releaseCursor || _releaseLoaded >= _releaseTotal) return;
+
+  const sentinel = document.createElement("div");
+  sentinel.id = "release-sentinel";
+  sentinel.className = "release-sentinel";
+  sentinel.onclick = () => _loadMoreReleases();
+  releaseList.appendChild(sentinel);
+
+  if (typeof IntersectionObserver === "undefined") {
+    // Fallback for very old browsers: an explicit click target.
+    sentinel.textContent = "Load more";
+    return;
   }
 
+  _releaseObserver = new IntersectionObserver(entries => {
+    if (entries.some(e => e.isIntersecting)) _loadMoreReleases();
+  }, { rootMargin: "800px 0px" });
+  _releaseObserver.observe(sentinel);
+}
+
+async function _loadMoreReleases() {
+  if (_releaseLoadingMore || !_releaseCursor) return;
+  _releaseLoadingMore = true;
+  const seq = _releaseRequestSeq;
+
+  const sentinel = document.getElementById("release-sentinel");
+  if (sentinel) sentinel.textContent = "Loading more…";
+
+  try {
+    const params = _releaseFilterParams();
+    params.set("limit", RELEASE_PAGE_SIZE);
+    params.set("cursor", _releaseCursor);
+    const resp = await apiRaw(`/api/releases?${params}`);
+    if (seq !== _releaseRequestSeq) return; // filters changed mid-flight
+
+    const releases = await resp.json();
+    _releaseCursor = resp.headers.get("X-Next-Cursor") || "";
+    if (!releases.length) { _teardownReleaseObserver(); return; }
+
+    _releaseLoaded += releases.length;
+    const cardsHtml = _renderReleaseCards(releases);
+    const current = document.getElementById("release-sentinel");
+    if (current) current.insertAdjacentHTML("beforebegin", cardsHtml);
+    else releaseList.insertAdjacentHTML("beforeend", cardsHtml);
+
+    if (!_releaseCursor || _releaseLoaded >= _releaseTotal) {
+      _teardownReleaseObserver();
+    } else if (_releaseObserver) {
+      if (sentinel) sentinel.textContent = "";
+    } else if (sentinel) {
+      // No IntersectionObserver: keep the click target armed for the next page.
+      sentinel.textContent = "Load more";
+    }
+  } catch {
+    // The sentinel stays put (and is clickable) so the user can retry.
+    if (sentinel) sentinel.textContent = "Couldn't load more — click to retry.";
+  } finally {
+    _releaseLoadingMore = false;
+  }
+}
+
+async function loadReleases() {
+  // New load: invalidate any in-flight page request and reset paging.
+  const seq = ++_releaseRequestSeq;
+  _releaseCursor = "";
+  _releaseTotal = 0;
+  _releaseLoaded = 0;
+  _teardownReleaseObserver();
+
+  const params = _releaseFilterParams();
+  params.set("limit", RELEASE_PAGE_SIZE);
+
+  let releases;
+  try {
+    const resp = await apiRaw(`/api/releases?${params}`);
+    if (seq !== _releaseRequestSeq) return;
+    releases = await resp.json();
+    _releaseCursor = resp.headers.get("X-Next-Cursor") || "";
+    const total = parseInt(resp.headers.get("X-Total-Count") || "", 10);
+    _releaseTotal = Number.isFinite(total) ? total : releases.length;
+  } catch {
+    if (seq !== _releaseRequestSeq) return;
+    releaseList.innerHTML = '<p class="empty-state">Failed to load releases.</p>';
+    return;
+  }
+  if (seq !== _releaseRequestSeq) return;
+
+  if (!releases.length) {
+    releaseList.innerHTML = _releaseEmptyStateHTML();
+    updateUnseenBadge();
+    return;
+  }
+
+  _releaseLoaded = releases.length;
+  releaseList.innerHTML = _renderReleaseCards(releases);
+  _setupReleaseObserver();
   updateUnseenBadge();
 }
 
@@ -447,10 +800,10 @@ function renderReleaseCard(r) {
   const expandable = hasTracklist;
   // When expandable we inject cardClass via wrapper below; build opening tag accordingly
   const openTag = expandable
-    ? `<div class="release-card" onclick="toggleTracklist(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleTracklist(this);}" tabindex="0" role="button" aria-expanded="false">`
+    ? `<div class="release-card"${dataAttrs({ action: "toggle-tracklist" })} tabindex="0" role="button" aria-expanded="false">`
     : `<div class="release-card static">`;
   const artistLink = r.artist_mbid
-    ? `<a href="https://musicbrainz.org/artist/${esc(r.artist_mbid)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${esc(r.artist_name)}</a>`
+    ? `<a href="https://musicbrainz.org/artist/${esc(r.artist_mbid)}" target="_blank" rel="noopener">${esc(r.artist_name)}</a>`
     : esc(r.artist_name);
 
   // Determine source icon and view URL
@@ -480,25 +833,28 @@ function renderReleaseCard(r) {
   }
 
   // Determine cover art URL (null => initials fallback instead of broken icon)
+  // MusicBrainz covers go through the local disk-cached proxy: CAA is slow and
+  // hundreds of release groups have no art, which the proxy remembers so the
+  // browser never re-requests them.
   let coverUrl = null;
   if (source === 'soundcloud' && r.artwork_url) {
     coverUrl = r.artwork_url;
   } else if (source === 'itunes' && r.artwork_url) {
     coverUrl = r.artwork_url;
-  } else if (source === 'musicbrainz') {
-    coverUrl = `https://coverartarchive.org/release-group/${esc(r.mbid)}/front-250`;
+  } else if (source === 'musicbrainz' && r.mbid) {
+    coverUrl = `/api/covers/${encodeURIComponent(r.mbid)}`;
   }
   const coverHtml = coverUrl
-    ? `<img class="release-cover" src="${coverUrl}" alt="" loading="lazy" onerror="this.outerHTML='<div class=&quot;cover-fallback&quot; aria-hidden=&quot;true&quot;>${esc(initialsFor(r.artist_name))}</div>'">`
+    ? `<img class="release-cover" src="${coverUrl}" alt="" width="64" height="64" decoding="async" loading="lazy" data-cover-fallback="${esc(initialsFor(r.artist_name))}">`
     : `<div class="cover-fallback" aria-hidden="true">${esc(initialsFor(r.artist_name))}</div>`;
 
     // Streaming links only exist for MusicBrainz-sourced releases.
   const hasStreaming = source === "musicbrainz";
   const streamBtn = hasStreaming
-    ? `<button class="expand-btn" data-expanded="false" onclick="event.stopPropagation();toggleStreaming(this)" aria-expanded="false">Stream ▾</button>`
+    ? `<button class="expand-btn" data-expanded="false"${dataAttrs({ action: "toggle-streaming" })} aria-expanded="false">Stream ▾</button>`
     : "";
   const trackBtn = hasTracklist
-    ? `<button class="expand-btn" data-expanded="false" onclick="event.stopPropagation();toggleTracklist(this.closest('.release-item').querySelector('.release-card'))" aria-expanded="false">Tracklist ▾</button>`
+    ? `<button class="expand-btn" data-expanded="false"${dataAttrs({ action: "toggle-tracklist" })} aria-expanded="false">Tracklist ▾</button>`
     : "";
 
   // Credited artists (e.g. featured guests / collabs), excluding the tracked artist
@@ -517,8 +873,8 @@ function renderReleaseCard(r) {
             ${esc(r.release_type)} · ${esc(r.release_date || "Unknown date")}
             <span class="hint-group">
               ${r.is_visible === 0
-                ? `<button class="expand-btn" onclick="event.stopPropagation();unhideRelease(${r.id}, this)" title="Restore to feed">Unhide</button>`
-                : `<button class="hide-btn-inline" onclick="event.stopPropagation();hideRelease(${r.id}, this)" title="Hide from feed" aria-label="Hide ${esc(r.title)} from feed">
+                ? `<button class="expand-btn"${dataAttrs({ action: "unhide-release", id: r.id })} title="Restore to feed">Unhide</button>`
+                : `<button class="hide-btn-inline"${dataAttrs({ action: "hide-release", id: r.id })} title="Hide from feed" aria-label="Hide ${esc(r.title)} from feed">
                 <img src="/static/assets/hidden.svg" alt="">
               </button>`}
               ${trackBtn}
@@ -527,10 +883,10 @@ function renderReleaseCard(r) {
           </div>
         </div>
         <div class="release-actions">
-          <a class="release-source-link" href="${esc(viewUrl)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="View on ${source === 'musicbrainz' ? 'MusicBrainz' : source === 'itunes' ? 'Apple Music' : 'SoundCloud'}">
+          <a class="release-source-link" href="${esc(viewUrl)}" target="_blank" rel="noopener" title="View on ${source === 'musicbrainz' ? 'MusicBrainz' : source === 'itunes' ? 'Apple Music' : 'SoundCloud'}">
             ${sourceBadge}
           </a>
-          ${r.notified === 0 ? `<button class="release-badge" onclick="event.stopPropagation();markSeen(${r.id}, this)" aria-label="Mark ${esc(r.title)} as seen">NEW</button>` : ""}
+          ${r.notified === 0 ? `<button class="release-badge"${dataAttrs({ action: "mark-seen", id: r.id })} aria-label="Mark ${esc(r.title)} as seen">NEW</button>` : ""}
         </div>
       </div>
       <div class="tracklist-section"></div>
@@ -584,15 +940,14 @@ function toggleTracklist(cardEl) {
 
   // Fetch tracks
   section.innerHTML = '<div class="tracklist-list"><div class="track-skeleton"><span style="width:2rem"></span><span style="flex:1"></span></div><div class="track-skeleton"><span style="width:2rem"></span><span style="flex:1"></span></div><div class="track-skeleton"><span style="width:2rem"></span><span style="flex:1"></span></div></div>';
-  fetch(`/api/releases/${encodeURIComponent(releaseMbid)}/tracks`)
-    .then(r => r.json())
+  api(`/api/releases/${encodeURIComponent(releaseMbid)}/tracks`)
     .then(data => {
       const tracks = data.tracks;
       tracklistCache[releaseMbid] = tracks;
       renderTracklist(section, tracks);
     })
     .catch(() => {
-      section.innerHTML = `<p class="tracklist-error">Failed to load tracks. <button class="link-btn" onclick="delete tracklistCache['${releaseMbid}'];toggleTracklist(this.closest('.release-item').querySelector('.release-card'));toggleTracklist(this.closest('.release-item').querySelector('.release-card'))">Retry</button></p>`;
+      section.innerHTML = `<p class="tracklist-error">Failed to load tracks. <button class="link-btn"${dataAttrs({ action: "retry-tracklist" })}>Retry</button></p>`;
     });
 }
 
@@ -612,24 +967,27 @@ function renderTracklist(container, tracks) {
 
   const item = container.closest(".release-item");
   const mbid = item ? item.dataset.mbid : "";
-  container.innerHTML = `
+  container.innerHTML = html`
     <div class="tracklist-header">
       <span class="tracklist-title">Tracklist</span>
-      <span><span class="tracklist-count">${tracks.length} tracks</span> <button class="copy-tracklist-btn" onclick="copyTracklist('${mbid}', this)" title="Copy track titles">Copy</button></span>
+      <span><span class="tracklist-count">${tracks.length} tracks</span> <button class="copy-tracklist-btn"${raw(dataAttrs({ action: "copy-tracklist", mbid: mbid }))} title="Copy track titles">Copy</button></span>
     </div>
     <div class="tracklist-list">
       ${tracks.map(t => {
-        const feat = (t.credits && t.credits.length)
-          ? `<span class="track-feat">feat. ${t.credits.map(c => esc(c.name)).join(", ")}</span>`
+        const creditNames = (t.credits && t.credits.length)
+          ? t.credits.map(c => c.name).join(", ")
           : "";
-        const fullTitle = t.title + ((t.credits && t.credits.length) ? ` (feat. ${t.credits.map(c => c.name).join(", ")})` : "");
-        return `
-        <div class="track-item" title="${esc(fullTitle)}">
-          <span class="track-number">${esc(t.number)}</span>
-          <span class="track-title-text">${esc(t.title)}${t.has_single ? ' <span class="single-badge" title="Also released as a single">SINGLE</span>' : ''}${feat}</span>
+        const feat = creditNames
+          ? html`<span class="track-feat">feat. ${creditNames}</span>`
+          : "";
+        const fullTitle = t.title + (creditNames ? ` (feat. ${creditNames})` : "");
+        return html`
+        <div class="track-item" title="${fullTitle}">
+          <span class="track-number">${t.number}</span>
+          <span class="track-title-text">${t.title}${t.has_single ? raw(' <span class="single-badge" title="Also released as a single">SINGLE</span>') : ''}${feat}</span>
           <span class="track-length">${formatLength(t.length)}</span>
         </div>
-      `; }).join("")}
+      `; })}
     </div>
   `;
 }
@@ -679,8 +1037,7 @@ function toggleStreaming(cardEl) {
   setCardExpanded(item, "stream", true);
   section.innerHTML = '<p class="tracklist-loading">Loading streaming links...</p>';
 
-  fetch(`/api/releases/${encodeURIComponent(releaseMbid)}/streaming`)
-    .then(r => r.json())
+  api(`/api/releases/${encodeURIComponent(releaseMbid)}/streaming`)
     .then(data => {
       const streaming = data.streaming || [];
       streamingCache[releaseMbid] = streaming;
@@ -708,12 +1065,12 @@ const STREAMING_ICONS = {
 // section + tracked-artist MB links panel). Same look as the search-result
 // source badges: brand icon in original colors + label + ↗.
 function streamingPillsHTML(streaming) {
-  return (streaming || []).map(s => {
+  return html`${(streaming || []).map(s => {
     const icon = (typeof STREAMING_ICONS !== 'undefined' && STREAMING_ICONS[s.key])
-      ? `<img src="/static/assets/${STREAMING_ICONS[s.key]}" alt="" class="source-icon-inline" style="width:14px;height:14px;margin-left:0;">`
+      ? html`<img src="/static/assets/${STREAMING_ICONS[s.key]}" alt="" class="source-icon-inline" style="width:14px;height:14px;margin-left:0;">`
       : '';
-    return `<a class="result-pill" href="${esc(s.url)}" target="_blank" rel="noopener" title="${esc(s.service)}">${icon}${esc(s.service)} ↗</a>`;
-  }).join("");
+    return html`<a class="result-pill" href="${s.url}" target="_blank" rel="noopener" title="${s.service}">${icon}${s.service} ↗</a>`;
+  })}`;
 }
 
 function renderStreaming(container, streaming) {
@@ -722,7 +1079,7 @@ function renderStreaming(container, streaming) {
     return;
   }
 
-  container.innerHTML = `
+  container.innerHTML = html`
     <div class="streaming-header">
       <span class="tracklist-title">Stream on</span>
       <span class="tracklist-count">${streaming.length} link${streaming.length > 1 ? "s" : ""}</span>
@@ -735,7 +1092,7 @@ function renderStreaming(container, streaming) {
 
 // --- Mark Seen ---
 async function markSeen(id, el) {
-  await fetch(`/api/releases/${id}/seen`, { method: "POST" });
+  await apiRaw(`/api/releases/${id}/seen`, { method: "POST", allowError: true });
   const item = el.closest(".release-item");
   if (item) item.classList.remove("unseen");
   el.remove();
@@ -745,12 +1102,12 @@ async function markSeen(id, el) {
 async function hideRelease(id, el) {
   const item = el.closest(".release-item");
   const title = item ? (item.querySelector(".release-title") || {}).textContent || "Release" : "Release";
-  await fetch(`/api/releases/${id}/hide`, { method: "POST" });
+  await apiRaw(`/api/releases/${id}/hide`, { method: "POST", allowError: true });
   if (item) {
     const placeholder = document.createComment(`hidden-release-${id}`);
     item.replaceWith(placeholder);
     showToast(`Hidden “${title.trim().slice(0, 60)}”`, "Undo", async () => {
-      await fetch(`/api/releases/${id}/unhide`, { method: "POST" });
+      await apiRaw(`/api/releases/${id}/unhide`, { method: "POST", allowError: true });
       placeholder.replaceWith(item);
       item.style.opacity = "0";
       requestAnimationFrame(() => { item.style.transition = "opacity 0.3s"; item.style.opacity = "1"; });
@@ -762,7 +1119,7 @@ async function hideRelease(id, el) {
 }
 
 async function unhideRelease(id, el) {
-  await fetch(`/api/releases/${id}/unhide`, { method: "POST" });
+  await apiRaw(`/api/releases/${id}/unhide`, { method: "POST", allowError: true });
   const item = el.closest(".release-item");
   if (item) {
     item.style.transition = "opacity 0.3s";
@@ -776,14 +1133,13 @@ async function unhideRelease(id, el) {
 }
 
 async function markAllReleasesSeen() {
-  await fetch("/api/releases/all_seen", { method: "POST" });
+  await apiRaw("/api/releases/all_seen", { method: "POST", allowError: true });
   updateUnseenBadge();
   loadReleases();
 }
 
 function updateUnseenBadge() {
-  fetch("/api/unseen_count")
-    .then(r => r.json())
+  api("/api/unseen_count")
     .then(data => {
       const badge = document.getElementById("unseen-badge");
       if (badge) {
@@ -822,8 +1178,7 @@ let _enabledSources = { musicbrainz: true, itunes: true, soundcloud: true };
 
 async function refreshEnabledSources() {
   try {
-    const resp = await fetch("/api/settings");
-    const s = await resp.json();
+    const s = await api("/api/settings");
     _enabledSources = {
       musicbrainz: s.source_musicbrainz !== "0",
       itunes: s.source_itunes !== "0",
@@ -857,8 +1212,8 @@ function searchResultPills(a) {
     if (a.soundcloud_permalink && _srcEnabled('soundcloud')) pills.push(`<a class="result-pill" href="https://soundcloud.com/${esc(a.soundcloud_permalink)}" target="_blank" rel="noopener"${scTitle}>${sourceIcon('soundcloud', 14)} SoundCloud ↗</a>`);
   }
   pills.push(mbConfirmedTag(a));
-  const html = pills.join("");
-  return html ? `<div class="result-sources">${html}</div>` : "";
+  const inner = pills.join("");
+  return inner ? `<div class="result-sources">${inner}</div>` : "";
 }
 
 // Visible marker placed to the right of the source badges when MB URL
@@ -868,7 +1223,7 @@ function mbConfirmedTag(a) {
   if (a._confirmed_apple) bits.push("Apple Music");
   if (a._confirmed_sc) bits.push("SoundCloud");
   if (!bits.length) return "";
-  return `<span class="mb-confirmed-tag" title="${esc(bits.join(" + "))} link${bits.length > 1 ? "s" : ""} confirmed via this artist's MusicBrainz page">✓ MB</span>`;
+  return html`<span class="mb-confirmed-tag" title="${bits.join(" + ")} link${bits.length > 1 ? "s" : ""} confirmed via this artist's MusicBrainz page">✓ MB</span>`;
 }
 
 function formatFollowers(n) {
@@ -913,8 +1268,7 @@ function enhanceItunesCounts(list, containerEl) {
       if (_albumCountCache[key]) { a._albums = _albumCountCache[key]; apply(); }
     } else if (!_albumCountPending.has(key)) {
       _albumCountPending.add(key);
-      fetch(`/api/itunes/album-count?artist_id=${id}&country=${encodeURIComponent(a.country || 'us')}`)
-        .then(r => r.json())
+      api(`/api/itunes/album-count?artist_id=${id}&country=${encodeURIComponent(a.country || 'us')}`)
         .then(d => {
           const label = (d.albums == null) ? null
             : d.albums === 1 ? "1 album"
@@ -969,12 +1323,9 @@ function _patchSearchRowPills(containerEl, index, a) {
     if (oldSources && freshSources) oldSources.replaceWith(freshSources);
     else if (freshSources) srcWrap.appendChild(freshSources);
   }
-  // The Add button embeds a JSON snapshot at render time — refresh it so Add
-  // carries the confirmed IDs even though the row isn't fully re-rendered.
-  // NB: setAttribute values are NOT HTML-parsed, so unlike the onclick='...'
-  // markup above this must be raw JSON (no &quot; escaping).
-  const btn = row.querySelector('.add-btn');
-  if (btn) btn.setAttribute('onclick', `addArtist(${JSON.stringify(a)}, this)`);
+  // The Add button references the live row object via _rowData (see the
+  // delegated handler), so a re-patch is no longer needed to keep it current:
+  // _applyMbLinksToEntry mutates the very object the button points at.
 }
 
 function enrichSearchRowsWithMbLinks(list, containerEl) {
@@ -991,8 +1342,7 @@ function enrichSearchRowsWithMbLinks(list, containerEl) {
     }
     if (_mbLinksPending.has(mbid)) return;
     _mbLinksPending.add(mbid);
-    fetch(`/api/mb-artists/${encodeURIComponent(mbid)}/links`)
-      .then(r => r.json())
+    api(`/api/mb-artists/${encodeURIComponent(mbid)}/links`)
       .then(d => {
         _mbLinksCache[mbid] = d;
         // Upgrade every entry sharing this MBID (visible now or via paging),
@@ -1017,7 +1367,7 @@ function renderSearchPage() {
     let artistImage = a.artistImageUrl || '';
     if (!artistImage && a.itunes_artist_id) artistImage = '/static/assets/apple-music.svg';
     const imageHtml = artistImage
-      ? `<img class="result-image ${a.itunes_artist_id && !a.artistImageUrl ? 'result-image-icon' : ''}" src="${esc(artistImage)}" alt="" onerror="this.style.display='none'">`
+      ? `<img class="result-image ${a.itunes_artist_id && !a.artistImageUrl ? 'result-image-icon' : ''}" src="${esc(artistImage)}" alt="" data-hide-on-error">`
       : '';
     return `
       <div class="search-result-item">
@@ -1029,7 +1379,7 @@ function renderSearchPage() {
             ${searchResultPills(a)}
           </div>
         </div>
-        <button class="add-btn" onclick='addArtist(${JSON.stringify(a).replace(/'/g, "&#39;")}, this)'>${a.already_tracked ? 'Link' : 'Add'}</button>
+        <button class="add-btn"${dataAttrs({ action: "add-artist", key: registerRow(a) })}>${a.already_tracked ? 'Link' : 'Add'}</button>
       </div>
     `;
   }).join("");
@@ -1118,12 +1468,11 @@ async function searchArtists() {
   searchResults.innerHTML = '<p class="status-msg">Searching…</p>';
 
   try {
-    const resp = await fetch("/api/artists/search", {
+    const results = await api("/api/artists/search", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, sources: _searchSources })
+      json: { query, sources: _searchSources },
+      allowError: true,
     });
-    const results = await resp.json();
     if (!Array.isArray(results)) {
       searchResults.innerHTML = `<p class="status-msg error">Search failed: ${esc(typeof results === 'string' ? results : JSON.stringify(results))}</p>`;
       return;
@@ -1176,17 +1525,15 @@ async function addArtist(artist, btn) {
 
   for (const s of sourcesToAdd) {
     try {
-      const resp = await fetch("/api/artists", {
+      const result = await api("/api/artists", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        json: {
           source: s.source,
           id: s.id,
           name: artist.name,
           disambiguation: artist.disambiguation
-        })
+        }
       });
-      const result = await resp.json();
       if (result.status === "conflict") {
         // That platform ID is already tracked under a different artist —
         // same "already taken" outcome as the link-source modal. Skip only
@@ -1242,8 +1589,7 @@ async function addArtist(artist, btn) {
 }
 
 async function loadArtists() {
-  const resp = await fetch("/api/artists");
-  const artists = await resp.json();
+  const artists = await api("/api/artists");
   await refreshEnabledSources();
   _trackedArtists = artists;
   if (activeTrackedFilterId && !_trackedArtists.some(a => String(a.id) === String(activeTrackedFilterId))) {
@@ -1269,7 +1615,7 @@ function renderTrackedArtistItem(a) {
       if (hasMb) {
         sourceIcons += `<a class="source-icon-btn linked" href="https://musicbrainz.org/artist/${esc(a.mbid)}" target="_blank" rel="noopener" title="MusicBrainz — linked, click to open" aria-label="Open ${esc(a.name)} on MusicBrainz"><img src="/static/assets/musicbrainz.svg" alt=""></a>`;
       } else {
-        sourceIcons += `<button class="source-icon-btn unlinked" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'musicbrainz')" title="Link MusicBrainz for ${esc(a.name)}" aria-label="Link MusicBrainz for ${esc(a.name)}"><img src="/static/assets/musicbrainz.svg" alt=""></button>`;
+        sourceIcons += `<button class="source-icon-btn unlinked"${dataAttrs({ action: "open-link-source", id: a.id, source: "musicbrainz", name: a.name })} title="Link MusicBrainz for ${esc(a.name)}" aria-label="Link MusicBrainz for ${esc(a.name)}"><img src="/static/assets/musicbrainz.svg" alt=""></button>`;
       }
       }
       // iTunes
@@ -1277,7 +1623,7 @@ function renderTrackedArtistItem(a) {
       if (hasItunes) {
         sourceIcons += `<a class="source-icon-btn linked" href="https://music.apple.com/artist/${esc(a.name.toLowerCase().replace(/[^a-z0-9]/g, ''))}/${esc(a.itunes_artist_id)}" target="_blank" rel="noopener" title="Apple Music — linked, click to open" aria-label="Open ${esc(a.name)} on Apple Music"><img src="/static/assets/apple-music.svg" alt=""></a>`;
       } else {
-        sourceIcons += `<button class="source-icon-btn unlinked" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'itunes')" title="Link Apple Music for ${esc(a.name)}" aria-label="Link Apple Music for ${esc(a.name)}"><img src="/static/assets/apple-music.svg" alt=""></button>`;
+        sourceIcons += `<button class="source-icon-btn unlinked"${dataAttrs({ action: "open-link-source", id: a.id, source: "itunes", name: a.name })} title="Link Apple Music for ${esc(a.name)}" aria-label="Link Apple Music for ${esc(a.name)}"><img src="/static/assets/apple-music.svg" alt=""></button>`;
       }
       }
       // SoundCloud
@@ -1285,12 +1631,12 @@ function renderTrackedArtistItem(a) {
       if (hasSc) {
         sourceIcons += `<a class="source-icon-btn linked" href="https://soundcloud.com/${esc(a.soundcloud_permalink)}" target="_blank" rel="noopener" title="SoundCloud — linked, click to open" aria-label="Open ${esc(a.name)} on SoundCloud"><img src="/static/assets/soundcloud.svg" alt=""></a>`;
       } else {
-        sourceIcons += `<button class="source-icon-btn unlinked" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'soundcloud')" title="Link SoundCloud for ${esc(a.name)}" aria-label="Link SoundCloud for ${esc(a.name)}"><img src="/static/assets/soundcloud.svg" alt=""></button>`;
+        sourceIcons += `<button class="source-icon-btn unlinked"${dataAttrs({ action: "open-link-source", id: a.id, source: "soundcloud", name: a.name })} title="Link SoundCloud for ${esc(a.name)}" aria-label="Link SoundCloud for ${esc(a.name)}"><img src="/static/assets/soundcloud.svg" alt=""></button>`;
       }
       }
       // MB external links (on-demand viewer for the artist's url-rels)
       if (hasMb) {
-        sourceIcons += `<button class="source-icon-btn mb-links-btn" onclick="toggleMbArtistLinks('${esc(a.mbid)}', this)" title="View external links from this artist's MusicBrainz page" aria-label="View external links for ${esc(a.name)}"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#aaa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>`;
+        sourceIcons += `<button class="source-icon-btn mb-links-btn"${dataAttrs({ action: "toggle-mb-links", mbid: a.mbid })} title="View external links from this artist's MusicBrainz page" aria-label="View external links for ${esc(a.name)}"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#aaa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>`;
       }
 
       // Build dropdown menu items (link/unlink hidden for disabled sources)
@@ -1298,31 +1644,31 @@ function renderTrackedArtistItem(a) {
       // MusicBrainz
       if (mbOn) {
       if (hasMb) {
-        dropdownItems += `<button class="dropdown-item" onclick="event.stopPropagation();confirmUnlinkArtist(${a.id}, 'musicbrainz', this)"><img src="/static/assets/musicbrainz.svg" alt="" class="dropdown-icon"> Unlink MusicBrainz</button>`;
+        dropdownItems += `<button class="dropdown-item"${dataAttrs({ action: "confirm-unlink", id: a.id, source: "musicbrainz" })}><img src="/static/assets/musicbrainz.svg" alt="" class="dropdown-icon"> Unlink MusicBrainz</button>`;
       } else {
-        dropdownItems += `<button class="dropdown-item" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'musicbrainz')"><img src="/static/assets/musicbrainz.svg" alt="" class="dropdown-icon"> Link MusicBrainz</button>`;
+        dropdownItems += `<button class="dropdown-item"${dataAttrs({ action: "open-link-source", id: a.id, source: "musicbrainz", name: a.name })}><img src="/static/assets/musicbrainz.svg" alt="" class="dropdown-icon"> Link MusicBrainz</button>`;
       }
       }
       // iTunes
       if (itOn) {
       if (hasItunes) {
-        dropdownItems += `<button class="dropdown-item" onclick="event.stopPropagation();confirmUnlinkArtist(${a.id}, 'itunes', this)"><img src="/static/assets/apple-music.svg" alt="" class="dropdown-icon"> Unlink iTunes</button>`;
+        dropdownItems += `<button class="dropdown-item"${dataAttrs({ action: "confirm-unlink", id: a.id, source: "itunes" })}><img src="/static/assets/apple-music.svg" alt="" class="dropdown-icon"> Unlink iTunes</button>`;
       } else {
-        dropdownItems += `<button class="dropdown-item" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'itunes')"><img src="/static/assets/apple-music.svg" alt="" class="dropdown-icon"> Link iTunes</button>`;
+        dropdownItems += `<button class="dropdown-item"${dataAttrs({ action: "open-link-source", id: a.id, source: "itunes", name: a.name })}><img src="/static/assets/apple-music.svg" alt="" class="dropdown-icon"> Link iTunes</button>`;
       }
       }
       // SoundCloud
       if (scOn) {
       if (hasSc) {
-        dropdownItems += `<button class="dropdown-item" onclick="event.stopPropagation();confirmUnlinkArtist(${a.id}, 'soundcloud', this)"><img src="/static/assets/soundcloud.svg" alt="" class="dropdown-icon"> Unlink SoundCloud</button>`;
+        dropdownItems += `<button class="dropdown-item"${dataAttrs({ action: "confirm-unlink", id: a.id, source: "soundcloud" })}><img src="/static/assets/soundcloud.svg" alt="" class="dropdown-icon"> Unlink SoundCloud</button>`;
       } else {
-        dropdownItems += `<button class="dropdown-item" onclick="openLinkSourceModal(${a.id}, '${esc(a.name)}', 'soundcloud')"><img src="/static/assets/soundcloud.svg" alt="" class="dropdown-icon"> Link SoundCloud</button>`;
+        dropdownItems += `<button class="dropdown-item"${dataAttrs({ action: "open-link-source", id: a.id, source: "soundcloud", name: a.name })}><img src="/static/assets/soundcloud.svg" alt="" class="dropdown-icon"> Link SoundCloud</button>`;
       }
       }
       // Untrack (red, with confirmation)
-      dropdownItems = `<button class="dropdown-item" onclick="checkSingleArtist(${a.id})">↻ Check this artist</button>` + dropdownItems;
-      dropdownItems += `<button class="dropdown-item" onclick="event.stopPropagation();editDisambiguation(${a.id}, this)"><img src="/static/assets/edit.svg" alt="" class="dropdown-icon dropdown-icon-mono"> Edit note…</button>`;
-      dropdownItems += `<button class="dropdown-item danger" onclick="event.stopPropagation();confirmRemoveArtist(${a.id}, this)">Untrack</button>`;
+      dropdownItems = `<button class="dropdown-item"${dataAttrs({ action: "check-artist", id: a.id })}>↻ Check this artist</button>` + dropdownItems;
+      dropdownItems += `<button class="dropdown-item"${dataAttrs({ action: "edit-disambiguation", id: a.id })}><img src="/static/assets/edit.svg" alt="" class="dropdown-icon dropdown-icon-mono"> Edit note…</button>`;
+      dropdownItems += `<button class="dropdown-item danger"${dataAttrs({ action: "confirm-remove", id: a.id })}>Untrack</button>`;
       
       return `
         <div class="artist-item">
@@ -1333,7 +1679,7 @@ function renderTrackedArtistItem(a) {
           <div class="artist-actions">
             <div class="artist-source-icons">${sourceIcons}</div>
             <div class="artist-manage-wrapper">
-              <button class="manage-btn" onclick="toggleArtistMenu(this)" title="Manage artist">
+              <button class="manage-btn"${dataAttrs({ action: "toggle-artist-menu" })} title="Manage artist">
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
               </button>
               <div class="artist-dropdown hidden">${dropdownItems}</div>
@@ -1381,12 +1727,12 @@ function confirmRemoveArtist(id, btn) {
   const name = _artistName(id);
   _artistMenuOf(btn).forEach(d => {
     d.classList.remove('hidden');
-    d.innerHTML = `<div class="inline-confirm">Untrack “${esc(name)}”? <button class="confirm-yes" onclick="doRemoveArtist(${id})">Confirm</button> <button class="confirm-no" onclick="loadArtists()">Keep</button></div>`;
+    d.innerHTML = `<div class="inline-confirm">Untrack “${esc(name)}”? <button class="confirm-yes"${dataAttrs({ action: "do-remove-artist", id: id })}>Confirm</button> <button class="confirm-no"${dataAttrs({ action: "load-artists" })}>Keep</button></div>`;
   });
 }
 
 function doRemoveArtist(id) {
-  fetch(`/api/artists/${id}`, { method: "DELETE" }).then(() => {
+  apiRaw(`/api/artists/${id}`, { method: "DELETE", allowError: true }).then(() => {
     showToast("Artist untracked");
     loadArtists();
     _refreshArtistsCache();
@@ -1398,12 +1744,12 @@ function confirmUnlinkArtist(id, source, btn) {
   const sourceLabel = source === 'musicbrainz' ? 'MusicBrainz' : source === 'itunes' ? 'Apple Music' : 'SoundCloud';
   _artistMenuOf(btn).forEach(d => {
     d.classList.remove('hidden');
-    d.innerHTML = `<div class="inline-confirm">Unlink ${sourceLabel}? <button class="confirm-yes" onclick="doUnlinkArtist(${id}, '${source}')">Confirm</button> <button class="confirm-no" onclick="loadArtists()">Keep</button></div>`;
+    d.innerHTML = `<div class="inline-confirm">Unlink ${sourceLabel}? <button class="confirm-yes"${dataAttrs({ action: "do-unlink-artist", id: id, source: source })}>Confirm</button> <button class="confirm-no"${dataAttrs({ action: "load-artists" })}>Keep</button></div>`;
   });
 }
 
 function doUnlinkArtist(id, source) {
-  fetch(`/api/artists/${id}/unlink-${source}`, { method: "POST" }).then(() => {
+  apiRaw(`/api/artists/${id}/unlink-${source}`, { method: "POST", allowError: true }).then(() => {
     showToast("Source unlinked");
     loadArtists();
     _refreshArtistsCache();
@@ -1430,8 +1776,8 @@ function editDisambiguation(id, btn) {
     d.innerHTML = `<div class="inline-edit">
       <input type="text" id="disambig-edit-input" value="${safe}" placeholder="Add a note..." maxlength="200" aria-label="Artist note">
       <div class="edit-btn-row">
-        <button class="confirm-yes" onclick="saveDisambiguation(${id})">Save</button>
-        <button class="confirm-no" onclick="loadArtists()">Cancel</button>
+        <button class="confirm-yes"${dataAttrs({ action: "save-disambiguation", id: id })}>Save</button>
+        <button class="confirm-no"${dataAttrs({ action: "load-artists" })}>Cancel</button>
       </div>
     </div>`;
     const input = d.querySelector('#disambig-edit-input');
@@ -1448,12 +1794,10 @@ async function saveDisambiguation(id) {
   const input = document.getElementById('disambig-edit-input');
   const value = input ? input.value : "";
   try {
-    const resp = await fetch(`/api/artists/${id}/disambiguation`, {
+    const data = await api(`/api/artists/${id}/disambiguation`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ disambiguation: value }),
+      json: { disambiguation: value },
     });
-    const data = await resp.json();
     if (data.status !== "ok") throw new Error(data.message || "save failed");
     showToast(value.trim() ? "Note saved" : "Note cleared");
   } catch {
@@ -1750,14 +2094,14 @@ function playChime() {
 }
 
 function renderSummary(summary) {
-  return `
+  return html`
     <h3>New Releases Found</h3>
-    ${summary.map(s => `
+    ${summary.map(s => html`
       <div class="summary-artist">
-        <button class="summary-artist-name" onclick="jumpToArtistFromSummary('${esc(s.artist)}')">${esc(s.artist)}</button>
-        <ul>${s.new_releases.map(r => `<li>${esc(r)}</li>`).join("")}</ul>
+        <button class="summary-artist-name"${raw(dataAttrs({ action: "jump-to-artist", artist: s.artist }))}>${s.artist}</button>
+        <ul>${s.new_releases.map(r => html`<li>${r}</li>`)}</ul>
       </div>
-    `).join("")}
+    `)}
   `;
 }
 
@@ -1780,16 +2124,11 @@ function viewNewResults() {
 }
 
 // --- Utilities ---
-function esc(str) {
-  if (!str) return "";
-  const div = document.createElement("div");
-  div.textContent = str;
-  return div.innerHTML;
-}
+// (esc / raw / html are defined near the top of the file with the helpers.)
 
 // --- Export / Import Artists ---
 async function exportArtists() {
-  const resp = await fetch("/api/artists/export");
+  const resp = await apiRaw("/api/artists/export");
   const blob = await resp.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -1815,9 +2154,7 @@ document.getElementById("import-file-input").addEventListener("change", async (e
   form.append("file", file);
 
   try {
-    const resp = await fetch("/api/artists/import", { method: "POST", body: form });
-    if (!resp.ok) throw new Error(`Server returned ${resp.status}`);
-    const result = await resp.json();
+    const result = await api("/api/artists/import", { method: "POST", body: form });
 
     if (result.status === "error") {
       statusEl.className = "import-status error";
@@ -1914,8 +2251,7 @@ function stopLogsRefresh() {
 
 async function loadLogs() {
   try {
-    const resp = await fetch("/api/logs?limit=200");
-    const logs = await resp.json();
+    const logs = await api("/api/logs?limit=200");
     const q = (document.getElementById("logs-search").value || "").toLowerCase();
     const filtered = logs.filter(l =>
       (activeLogLevel === "ALL" || l.level === activeLogLevel || (activeLogLevel === "WARN" && l.level === "WARNING")) &&
@@ -1938,21 +2274,21 @@ async function loadLogs() {
 function renderLogEntry(log) {
   const parts = log.timestamp.split("T");
   const time = parts[1] ? parts[1].slice(0, 8) : "";
-  const artistPart = log.artist ? `<span class="log-artist">[${esc(log.artist)}]</span>` : "";
-  return `
+  const artistPart = log.artist ? html`<span class="log-artist">[${log.artist}]</span>` : "";
+  return html`
     <div class="log-entry">
-      <span class="log-timestamp">${esc(time)}</span>
-      <span class="log-level ${esc(log.level)}">${esc(log.level)}</span>
+      <span class="log-timestamp">${time}</span>
+      <span class="log-level ${log.level}">${log.level}</span>
       ${artistPart}
-      <span class="log-message">${esc(log.message)}</span>
-      ${log.detail ? `<span class="log-message"> — ${esc(log.detail)}</span>` : ""}
+      <span class="log-message">${log.message}</span>
+      ${log.detail ? html`<span class="log-message"> — ${log.detail}</span>` : ""}
     </div>
   `;
 }
 
 async function clearLogs() {
   try {
-    await fetch("/api/logs/clear", { method: "POST" });
+    await apiRaw("/api/logs/clear", { method: "POST", allowError: true });
     logsContainer.innerHTML = "";
   } catch {
     // silent fail
@@ -2000,8 +2336,7 @@ document.addEventListener("click", e => {
 
 async function loadSettings() {
   try {
-    const resp = await fetch("/api/settings");
-    const settings = await resp.json();
+    const settings = await api("/api/settings");
     // Default: all sources enabled, dedup off (first run has no settings)
     document.getElementById("source-musicbrainz").checked = settings.source_musicbrainz !== "0";
     document.getElementById("source-itunes").checked = settings.source_itunes !== "0";
@@ -2026,8 +2361,7 @@ let _dedupRules = [];
 async function loadDedupRules() {
   const listEl = document.getElementById("dedup-list");
   try {
-    const resp = await fetch("/api/settings/dedup-ignores");
-    const data = await resp.json();
+    const data = await api("/api/settings/dedup-ignores");
     _dedupRules = Array.isArray(data.ignores) ? data.ignores : [];
   } catch {
     _dedupRules = [];
@@ -2042,23 +2376,21 @@ function renderDedupList() {
     listEl.innerHTML = '<p class="dedup-empty">No rules — every title difference counts as a different release.</p>';
     return;
   }
-  listEl.innerHTML = _dedupRules.map((rule, i) => `
+  listEl.innerHTML = html`${_dedupRules.map((rule, i) => html`
     <div class="dedup-card">
-      <span class="dedup-text" title="${esc(rule)}"><span class="dedup-quote">“</span>${esc(rule)}<span class="dedup-quote">”</span></span>
-      <button class="dedup-remove" onclick="removeDedupRule(${i})" aria-label="Remove ignore rule ${esc(rule)}" title="Remove">✕</button>
+      <span class="dedup-text" title="${rule}"><span class="dedup-quote">“</span>${rule}<span class="dedup-quote">”</span></span>
+      <button class="dedup-remove"${raw(dataAttrs({ action: "remove-dedup-rule", index: i }))} aria-label="Remove ignore rule ${rule}" title="Remove">✕</button>
     </div>
-  `).join("");
+  `)}`;
 }
 
 async function persistDedupRules(statusMsg) {
   const statusEl = document.getElementById("dedup-rules-status");
   try {
-    const resp = await fetch("/api/settings/dedup-ignores", {
+    const data = await api("/api/settings/dedup-ignores", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ignores: _dedupRules }),
+      json: { ignores: _dedupRules },
     });
-    const data = await resp.json();
     if (data.status !== "ok") throw new Error(data.message || "save failed");
     _dedupRules = data.ignores;
     renderDedupList();
@@ -2106,8 +2438,7 @@ let _explicitMap = [];
 
 async function loadExplicitMap() {
   try {
-    const resp = await fetch("/api/settings/explicit-map");
-    const data = await resp.json();
+    const data = await api("/api/settings/explicit-map");
     _explicitMap = Array.isArray(data.mappings) ? data.mappings : [];
   } catch {
     _explicitMap = [];
@@ -2122,23 +2453,21 @@ function renderExplicitMap() {
     listEl.innerHTML = '<p class="dedup-empty">No mappings — censored and explicit titles compare as different releases.</p>';
     return;
   }
-  listEl.innerHTML = _explicitMap.map((pair, i) => `
+  listEl.innerHTML = html`${_explicitMap.map((pair, i) => html`
     <div class="dedup-card">
-      <span class="dedup-text" title="${esc(pair[0])} → ${esc(pair[1])}"><span class="dedup-quote">“</span>${esc(pair[0])}<span class="dedup-quote">”</span> <span class="dedup-map-arrow">→</span> <span class="dedup-quote">“</span>${esc(pair[1])}<span class="dedup-quote">”</span></span>
-      <button class="dedup-remove" onclick="removeExplicitMapRule(${i})" aria-label="Remove mapping ${esc(pair[0])}" title="Remove">✕</button>
+      <span class="dedup-text" title="${pair[0]} → ${pair[1]}"><span class="dedup-quote">“</span>${pair[0]}<span class="dedup-quote">”</span> <span class="dedup-map-arrow">→</span> <span class="dedup-quote">“</span>${pair[1]}<span class="dedup-quote">”</span></span>
+      <button class="dedup-remove"${raw(dataAttrs({ action: "remove-explicit-map", index: i }))} aria-label="Remove mapping ${pair[0]}" title="Remove">✕</button>
     </div>
-  `).join("");
+  `)}`;
 }
 
 async function persistExplicitMap(statusMsg) {
   const statusEl = document.getElementById("explicit-status");
   try {
-    const resp = await fetch("/api/settings/explicit-map", {
+    const data = await api("/api/settings/explicit-map", {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mappings: _explicitMap }),
+      json: { mappings: _explicitMap },
     });
-    const data = await resp.json();
     if (data.status !== "ok") throw new Error(data.message || "save failed");
     _explicitMap = data.mappings;
     renderExplicitMap();
@@ -2212,11 +2541,7 @@ async function saveSettings(auto = false) {
   };
 
   try {
-    await fetch("/api/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(settings),
-    });
+    await apiRaw("/api/settings", { method: "POST", json: settings });
     settingsStatus.textContent = auto ? "Saved ✓" : "Saved";
     settingsStatus.className = "settings-status success";
     clearTimeout(saveSettings._t);
@@ -2236,8 +2561,7 @@ async function runDedup() {
   status.textContent = "Running...";
   status.className = "settings-status";
   try {
-    const resp = await fetch("/api/dedup", { method: "POST" });
-    const data = await resp.json();
+    const data = await api("/api/dedup", { method: "POST" });
     status.textContent = `Hidden ${data.hidden} duplicate(s)`;
     status.className = "settings-status success";
     showToast(`Dedup hid ${data.hidden} duplicate(s)`, data.hidden ? "View feed" : null, data.hidden ? () => { location.hash = "#/feed"; loadReleases(); } : null);
@@ -2307,19 +2631,18 @@ async function searchLinkSource(query) {
   linkSourceResults.innerHTML = '<p class="status-msg">Searching...</p>';
 
   try {
-    const resp = await fetch("/api/artists/search", {
+    const results = await api("/api/artists/search", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+      json: {
         query,
         source: currentLinkSource === "musicbrainz" ? "musicbrainz" :
                 currentLinkSource === "itunes" ? "itunes" :
                 currentLinkSource === "soundcloud" ? "soundcloud" : ""
-      })
+      },
+      allowError: true,
     });
-    const results = await resp.json();
     if (!Array.isArray(results)) {
-      linkSourceResults.innerHTML = `<p class="status-msg error">Search failed. <button class="link-btn" onclick="searchLinkSource()">Retry</button></p>`;
+      linkSourceResults.innerHTML = `<p class="status-msg error">Search failed. <button class="link-btn"${dataAttrs({ action: "search-link-source" })}>Retry</button></p>`;
       return;
     }
 
@@ -2329,7 +2652,7 @@ async function searchLinkSource(query) {
       linkSourceResults.innerHTML = `<p class="status-msg">Found ${results.length} — showing ${Math.min(results.length, 10)}</p>` + results.slice(0, 10).map(a => {
         let artistImage = a.artistImageUrl || '';
         if (!artistImage && a.itunes_artist_id) artistImage = '/static/assets/apple-music.svg';
-        const imageHtml = artistImage ? `<img class="result-image ${a.itunes_artist_id && !a.artistImageUrl ? 'result-image-icon' : ''}" src="${esc(artistImage)}" alt="" onerror="this.style.display='none'">` : '';
+        const imageHtml = artistImage ? `<img class="result-image ${a.itunes_artist_id && !a.artistImageUrl ? 'result-image-icon' : ''}" src="${esc(artistImage)}" alt="" data-hide-on-error">` : '';
         return `
           <div class="search-result-item">
             <div class="result-info">
@@ -2340,14 +2663,14 @@ async function searchLinkSource(query) {
                 ${searchResultPills(a)}
               </div>
             </div>
-            <button class="add-btn" onclick='linkSource(${JSON.stringify(a).replace(/'/g, "&#39;")}, this)'>Link</button>
+            <button class="add-btn"${dataAttrs({ action: "link-source", key: registerRow(a) })}>Link</button>
           </div>
         `;
       }).join("");
       enhanceItunesCounts(results.slice(0, 10), linkSourceResults);
     }
   } catch (err) {
-    linkSourceResults.innerHTML = `<p class="status-msg error">Search failed: ${esc(err.message)} <button class="link-btn" onclick="searchLinkSource()">Retry</button></p>`;
+    linkSourceResults.innerHTML = `<p class="status-msg error">Search failed: ${esc(err.message)} <button class="link-btn"${dataAttrs({ action: "search-link-source" })}>Retry</button></p>`;
   }
 }
 
@@ -2404,12 +2727,10 @@ async function linkSource(artist, btn, force = false) {
       if (force) payload.force = true;
     }
 
-    const resp = await fetch("/api/artists", {
+    const result = await api("/api/artists", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      json: payload
     });
-    const result = await resp.json();
 
     if (result.status === "conflict") {
       const owner = (result.conflicting_artist && result.conflicting_artist.name)
@@ -2473,7 +2794,7 @@ function showLinkConflict(btn, artist, message) {
 }
 
 // --- Init ---
-loadReleases();
+navigateTo(getRoute());   // sets the initial tab and loads its data
 updateUnseenBadge();
 loadSettings();
 refreshEnabledSources();

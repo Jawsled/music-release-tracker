@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Music Release Tracker</title>
     <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
-    <link rel="stylesheet" href="/static/style.css?v=12">
+    <link rel="stylesheet" href="/static/style.css?v=13">
 </head>
 <body>
     <header class="app-header">
@@ -18,26 +18,26 @@
             <button class="nav-btn nav-btn-quiet" id="settings-btn">Settings</button>
         </nav>
     </header>
-    <div id="panel-scrim" class="panel-scrim hidden" onclick="closeSidePanels()"></div>
+    <div id="panel-scrim" class="panel-scrim hidden" data-action="close-side-panels"></div>
 
     <!-- Logs Panel -->
     <div id="logs-panel" class="logs-panel hidden" role="dialog" aria-label="Scan logs">
         <div class="logs-header">
             <h2>Scan Logs</h2>
             <div class="logs-actions">
-                <button id="clear-logs-btn" class="check-btn" onclick="clearLogs()">Clear</button>
-                <button class="popup-close-btn" onclick="toggleLogsPanel()" aria-label="Close logs">✕</button>
+                <button id="clear-logs-btn" class="check-btn" data-action="clear-logs">Clear</button>
+                <button class="popup-close-btn" data-action="toggle-logs-panel" aria-label="Close logs">✕</button>
             </div>
         </div>
         <div class="logs-toolbar">
             <div class="log-filters" role="group" aria-label="Filter logs by level">
-                <button type="button" class="chip active" data-log-level="ALL" onclick="setLogLevel(this)">All</button>
-                <button type="button" class="chip" data-log-level="INFO" onclick="setLogLevel(this)">Info</button>
-                <button type="button" class="chip" data-log-level="WARN" onclick="setLogLevel(this)">Warn</button>
-                <button type="button" class="chip" data-log-level="ERROR" onclick="setLogLevel(this)">Errors</button>
+                <button type="button" class="chip active" data-log-level="ALL" data-action="set-log-level">All</button>
+                <button type="button" class="chip" data-log-level="INFO" data-action="set-log-level">Info</button>
+                <button type="button" class="chip" data-log-level="WARN" data-action="set-log-level">Warn</button>
+                <button type="button" class="chip" data-log-level="ERROR" data-action="set-log-level">Errors</button>
             </div>
             <div class="logs-toolbar-row">
-                <input type="text" id="logs-search" class="dropdown-search" placeholder="Filter text..." oninput="loadLogs()" aria-label="Filter logs by text">
+                <input type="text" id="logs-search" class="dropdown-search" placeholder="Filter text..." data-input-action="load-logs" aria-label="Filter logs by text">
                 <label class="checkbox-label" title="Pause live refresh"><input type="checkbox" id="logs-pause"> Pause</label>
             </div>
         </div>
@@ -48,7 +48,7 @@
     <div id="settings-panel" class="settings-panel hidden" role="dialog" aria-label="Settings">
         <div class="settings-header">
             <h2>Settings</h2>
-            <button class="popup-close-btn" onclick="toggleSettingsPanel()" aria-label="Close settings">✕</button>
+            <button class="popup-close-btn" data-action="toggle-settings-panel" aria-label="Close settings">✕</button>
         </div>
         <div class="settings-container">
             <div class="settings-section">
@@ -56,17 +56,17 @@
                 <p class="settings-hint">Enable or disable data sources for search and release checking. Changes save automatically.</p>
                 <div class="settings-toggles">
                     <label class="settings-toggle">
-                        <input type="checkbox" id="source-musicbrainz" onchange="saveSettings(true)">
+                        <input type="checkbox" id="source-musicbrainz" data-change-action="save-settings">
                         <span class="settings-toggle-label">MusicBrainz</span>
                         <span class="settings-toggle-desc">Album, EP, Single metadata</span>
                     </label>
                     <label class="settings-toggle">
-                        <input type="checkbox" id="source-itunes" onchange="saveSettings(true)">
+                        <input type="checkbox" id="source-itunes" data-change-action="save-settings">
                         <span class="settings-toggle-label">iTunes / Apple Music</span>
                         <span class="settings-toggle-desc">Album, EP, Single metadata</span>
                     </label>
                     <label class="settings-toggle">
-                        <input type="checkbox" id="source-soundcloud" onchange="saveSettings(true)">
+                        <input type="checkbox" id="source-soundcloud" data-change-action="save-settings">
                         <span class="settings-toggle-label">SoundCloud</span>
                         <span class="settings-toggle-desc">Individual track releases</span>
                     </label>
@@ -76,11 +76,11 @@
                 <h3>Startup</h3>
                 <div class="settings-toggles">
                     <label class="settings-toggle">
-                        <input type="checkbox" id="setting-startup-refresh" onchange="saveSettings(true)">
+                        <input type="checkbox" id="setting-startup-refresh" data-change-action="save-settings">
                         <span class="settings-toggle-label">Check for new releases on startup</span>
                     </label>
                     <label class="settings-toggle">
-                        <input type="checkbox" id="setting-startup-dedup" onchange="saveSettings(true)">
+                        <input type="checkbox" id="setting-startup-dedup" data-change-action="save-settings">
                         <span class="settings-toggle-label">Check for duplicates on startup</span>
                     </label>
                 </div>
@@ -89,7 +89,7 @@
                 <h3>Maintenance</h3>
                 <p class="settings-hint">Hide releases that duplicate another release or an album track.</p>
                 <div class="settings-maintenance">
-                    <button class="check-btn" onclick="runDedup()">Run Dedup Now</button>
+                    <button class="check-btn" data-action="run-dedup">Run Dedup Now</button>
                     <span id="dedup-status" class="settings-status"></span>
                 </div>
             </div>
@@ -99,7 +99,7 @@
                 <div id="dedup-list" class="dedup-list" aria-live="polite"></div>
                 <div class="dedup-add-row">
                     <input type="text" id="dedup-input" class="dropdown-search" placeholder='e.g. "(feat.*)"' maxlength="60" aria-label="New ignore rule">
-                    <button class="check-btn" id="dedup-add-btn" onclick="addDedupRule()">Add</button>
+                    <button class="check-btn" id="dedup-add-btn" data-action="add-dedup-rule">Add</button>
                 </div>
                 <span id="dedup-rules-status" class="settings-status" aria-live="polite"></span>
             </div>
@@ -110,7 +110,7 @@
                 <div class="dedup-add-row explicit-add-row">
                     <input type="text" id="explicit-censored-input" class="dropdown-search" placeholder='Censored' maxlength="60" aria-label="Censored form">
                     <input type="text" id="explicit-clean-input" class="dropdown-search" placeholder='Uncensored' maxlength="60" aria-label="Clean word">
-                    <button class="check-btn" id="explicit-add-btn" onclick="addExplicitMapRule()">Add</button>
+                    <button class="check-btn" id="explicit-add-btn" data-action="add-explicit-map-rule">Add</button>
                 </div>
                 <span id="explicit-status" class="settings-status" aria-live="polite"></span>
             </div>
@@ -127,34 +127,34 @@
                 <div class="filters-row filters-row-scope">
                     <!-- Artist filter: searchable dropdown -->
                     <div class="filter-dropdown" id="artist-filter-wrapper">
-                        <button type="button" class="filter-btn" onclick="toggleArtistDropdown()" id="filter-artist-btn" aria-haspopup="listbox" aria-expanded="false">All Artists</button>
+                        <button type="button" class="filter-btn" data-action="toggle-artist-dropdown" id="filter-artist-btn" aria-haspopup="listbox" aria-expanded="false">All Artists</button>
                         <div class="dropdown-menu hidden" id="artist-dropdown-menu" role="listbox">
-                            <input type="text" class="dropdown-search" placeholder="Search artists..." id="artist-filter-search" oninput="filterArtistList()" aria-label="Search artists">
+                            <input type="text" class="dropdown-search" placeholder="Search artists..." id="artist-filter-search" data-input-action="filter-artist-list" aria-label="Search artists">
                             <div class="dropdown-count" id="artist-dropdown-count"></div>
                             <div class="dropdown-list" id="artist-dropdown-list"></div>
                         </div>
                     </div>
 
                     <label class="checkbox-label"><input type="checkbox" id="filter-unseen"> New only</label>
-                    <label class="checkbox-label" title="Show only hidden releases"><input type="checkbox" id="filter-hidden" onchange="loadReleases()"> Hidden only</label>
+                    <label class="checkbox-label" title="Show only hidden releases"><input type="checkbox" id="filter-hidden" data-change-action="load-releases"> Hidden only</label>
                     <button id="check-btn" class="check-btn check-now-btn">Check All Artists</button>
                 </div>
                 <div class="filters-row filters-row-refine">
                     <!-- Release type: toggle chips (multi-select; none selected = all) -->
                     <div class="type-chips" role="group" aria-label="Filter by release type">
-                        <button type="button" class="chip active" data-type="Album" onclick="toggleType(this)" aria-pressed="true">Albums</button>
-                        <button type="button" class="chip active" data-type="EP" onclick="toggleType(this)" aria-pressed="true">EPs</button>
-                        <button type="button" class="chip active" data-type="Single" onclick="toggleType(this)" aria-pressed="true">Singles</button>
-                        <button type="button" class="chip active" data-type="Other" onclick="toggleType(this)" aria-pressed="true">Others</button>
+                        <button type="button" class="chip active" data-type="Album" data-action="toggle-type" aria-pressed="true">Albums</button>
+                        <button type="button" class="chip active" data-type="EP" data-action="toggle-type" aria-pressed="true">EPs</button>
+                        <button type="button" class="chip active" data-type="Single" data-action="toggle-type" aria-pressed="true">Singles</button>
+                        <button type="button" class="chip active" data-type="Other" data-action="toggle-type" aria-pressed="true">Others</button>
                     </div>
-                    <button type="button" id="reset-filters-btn" class="link-btn hidden" onclick="resetFilters()">Reset filters</button>
+                    <button type="button" id="reset-filters-btn" class="link-btn hidden" data-action="reset-filters">Reset filters</button>
                     <button id="markallasseen" class="link-btn mark-seen-link">Mark All as Seen</button>
 
                     <!-- Popup panel (appears when clicking Check Now) -->
                     <div id="check-popup" class="check-popup hidden" role="dialog" aria-label="Check progress">
                         <div class="popup-header">
                             <span id="popup-title">Checking for new releases...</span>
-                            <button class="popup-close-btn" onclick="closeCheckPopup()" aria-label="Minimize check progress">✕</button>
+                            <button class="popup-close-btn" data-action="close-check-popup" aria-label="Minimize check progress">✕</button>
                         </div>
 
                         <!-- Progress bar -->
@@ -166,7 +166,7 @@
 
                         <!-- Footer: pause/resume + sound toggle -->
                         <div class="popup-footer">
-                            <button id="pause-btn" class="pause-btn hidden" onclick="togglePauseCheck()">⏸ Pause</button>
+                            <button id="pause-btn" class="pause-btn hidden" data-action="toggle-pause-check">⏸ Pause</button>
                             <label class="checkbox-label" title="Play a chime when a check finishes"><input type="checkbox" id="sound-enabled" checked> chime on completion</label>
                         </div>
 
@@ -176,8 +176,8 @@
                         </div>
                         <div id="failed-body" class="popup-failed hidden"></div>
                         <div class="popup-results-actions hidden" id="summary-actions">
-                            <button class="link-btn" id="retry-failed-btn" onclick="retryFailed()">Retry failed</button>
-                            <button class="check-btn" onclick="viewNewResults()">View new in feed</button>
+                            <button class="link-btn" id="retry-failed-btn" data-action="retry-failed">Retry failed</button>
+                            <button class="check-btn" data-action="view-new-results">View new in feed</button>
                         </div>
                     </div>
                 </div>
@@ -195,11 +195,11 @@
                     <input type="text" id="artist-search-input" placeholder="Search Musicbrainz, iTunes and Soundcloud, or paste URL" aria-label="Search artists">
                     <div class="search-divider" aria-hidden="true"></div>
                     <div class="filter-dropdown" id="search-source-wrapper">
-                        <button type="button" class="search-source-btn" id="search-source-btn" onclick="toggleSearchSourceMenu()" aria-haspopup="true" aria-expanded="false" title="Choose which platforms to search">All ▾</button>
+                        <button type="button" class="search-source-btn" id="search-source-btn" data-action="toggle-search-source-menu" aria-haspopup="true" aria-expanded="false" title="Choose which platforms to search">All ▾</button>
                         <div class="dropdown-menu hidden" id="search-source-menu">
-                            <label class="dropdown-check"><input type="checkbox" data-source="musicbrainz" onchange="updateSearchSources()"> MusicBrainz</label>
-                            <label class="dropdown-check"><input type="checkbox" data-source="itunes" onchange="updateSearchSources()"> Apple Music</label>
-                            <label class="dropdown-check"><input type="checkbox" data-source="soundcloud" onchange="updateSearchSources()"> SoundCloud</label>
+                            <label class="dropdown-check"><input type="checkbox" data-source="musicbrainz" data-change-action="update-search-sources"> MusicBrainz</label>
+                            <label class="dropdown-check"><input type="checkbox" data-source="itunes" data-change-action="update-search-sources"> Apple Music</label>
+                            <label class="dropdown-check"><input type="checkbox" data-source="soundcloud" data-change-action="update-search-sources"> SoundCloud</label>
                         </div>
                     </div>
                 </div>
@@ -210,15 +210,15 @@
             <div id="search-more-wrap" class="search-more-wrap hidden"><button class="check-btn" id="search-more-btn">Show more</button></div>
             <div class="artists-header-row">
                 <div class="filter-dropdown" id="tracked-filter-wrapper">
-                    <button type="button" class="filter-btn" onclick="toggleTrackedDropdown()" id="filter-tracked-btn" aria-haspopup="listbox" aria-expanded="false">All tracked artists</button>
+                    <button type="button" class="filter-btn" data-action="toggle-tracked-dropdown" id="filter-tracked-btn" aria-haspopup="listbox" aria-expanded="false">All tracked artists</button>
                     <div class="dropdown-menu hidden" id="tracked-dropdown-menu" role="listbox">
-                        <input type="text" class="dropdown-search" placeholder="Search artists..." id="tracked-filter-search" oninput="filterTrackedList()" aria-label="Search tracked artists">
+                        <input type="text" class="dropdown-search" placeholder="Search artists..." id="tracked-filter-search" data-input-action="filter-tracked-list" aria-label="Search tracked artists">
                         <div class="dropdown-count" id="tracked-dropdown-count"></div>
                         <div class="dropdown-list" id="tracked-dropdown-list"></div>
                     </div>
                 </div>
                 <div class="import-export-bar">
-                    <button id="export-artists-btn" class="link-btn" onclick="exportArtists()" title="Download tracked artists as JSON">Export</button>
+                    <button id="export-artists-btn" class="link-btn" data-action="export-artists" title="Download tracked artists as JSON">Export</button>
                     <button id="import-btn" class="link-btn" title="Import artists from a JSON file">Import</button>
                     <input type="file" id="import-file-input" accept=".json" style="display:none">
                 </div>
@@ -235,7 +235,7 @@
         <div class="modal-content">
             <div class="modal-header">
                 <h3 id="link-source-title">Link Missing Source</h3>
-                <button class="popup-close-btn" onclick="closeLinkSourceModal()" aria-label="Close link dialog">✕</button>
+                <button class="popup-close-btn" data-action="close-link-source-modal" aria-label="Close link dialog">✕</button>
             </div>
             <div class="modal-body">
                 <p class="search-hint" id="link-source-hint">Search by name, or paste a direct link.</p>
@@ -248,7 +248,7 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=19"></script>
+    <script src="/static/app.js?v=23"></script>
     <div id="toast-container" class="toast-container" aria-live="polite"></div>
 </body>
 </html>

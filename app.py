@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -19,6 +19,8 @@ import musicbrainz
 import itunes
 import soundcloud
 import logstore
+import covers
+import cache
 
 HOST = "127.0.0.1"
 PORT = 7070
@@ -330,7 +332,11 @@ async def search_artists(body: ArtistSearchRequest):
                 top = mb_results[0]
                 if top.get("mbid") and _normalize_name(top.get("name", "")) == _normalize_name(query):
                     try:
-                        links = await musicbrainz.get_artist_links(top["mbid"])
+                        links = await cache.cached(
+                            f"mb_links:{top['mbid']}",
+                            cache.TTL_MB_LINKS,
+                            lambda: musicbrainz.get_artist_links(top["mbid"]),
+                        )
                     except Exception:
                         links = None
                     if links and (links.get("itunes_artist_id") or links.get("soundcloud_permalink")):
@@ -938,23 +944,86 @@ async def import_artists(request: Request):
 
 
 # --- Release endpoints ---
+
+# Feed paging. The client asks for one page at a time and follows the opaque
+# X-Next-Cursor header, so the feed never ships the whole library at once.
+FEED_PAGE_SIZE = 60
+FEED_PAGE_MAX = 200
+
+# Cursor layout: "release_date|first_seen_at|id". Neither date string can
+# contain the separator, so a plain split is safe.
+_CURSOR_SEP = "|"
+
+
+def _decode_cursor(raw: str) -> tuple[str, str, int] | None:
+    """Parse an X-Next-Cursor value, or None when absent/malformed."""
+    if not raw:
+        return None
+    parts = raw.split(_CURSOR_SEP)
+    if len(parts) != 3:
+        return None
+    date, time, raw_id = parts
+    try:
+        return date, time, int(raw_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _encode_cursor(row: dict) -> str:
+    return f"{row['release_date']}{_CURSOR_SEP}{row['first_seen_at']}{_CURSOR_SEP}{row['id']}"
+
+
 @app.get("/api/releases")
 async def list_releases(
+    response: Response,
     artist_id: Optional[int] = Query(None),
     type: Optional[str] = Query(None),
     unseen_only: bool = Query(False),
     include_hidden: bool = Query(False),
     hidden_only: bool = Query(False),
+    limit: int = Query(FEED_PAGE_SIZE, ge=1, le=FEED_PAGE_MAX),
+    cursor: str = Query(""),
 ):
     # Parse comma-separated type filter; empty means "all"
     type_list = [t.strip() for t in type.split(",")] if type else None
-    return db.get_releases(
+    filters = dict(
         artist_id=artist_id,
         release_type=type_list,
         unseen_only=unseen_only,
         include_hidden=include_hidden or hidden_only,
         hidden_only=hidden_only,
     )
+    releases = db.get_releases(**filters, limit=limit, cursor=_decode_cursor(cursor))
+    # X-Total-Count lets the UI show "N of M"; X-Next-Cursor (empty on the
+    # last page) tells it whether to keep paging.
+    response.headers["X-Total-Count"] = str(db.count_releases(**filters))
+    if len(releases) == limit:
+        response.headers["X-Next-Cursor"] = _encode_cursor(releases[-1])
+    else:
+        response.headers["X-Next-Cursor"] = ""
+    return releases
+
+@app.get("/api/covers/{mbid}")
+async def get_release_cover(mbid: str):
+    """Serve a Cover Art Archive image, cached on disk.
+
+    Returns 404 when the release group has no cover (also cached, so the
+    browser's onerror fallback doesn't trigger a fresh upstream request on
+    every feed load).
+    """
+    result = await covers.get_cover(mbid)
+    if result is None:
+        return Response(
+            status_code=404,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    data, content_type = result
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=604800"},
+    )
+
 
 @app.post("/api/releases/{release_id}/seen")
 async def mark_seen(release_id: int):
@@ -1016,22 +1085,29 @@ async def get_release_tracks(release_id: str):
     source = release.get("source", "musicbrainz")
     artist_id = release["artist_id"]
 
-    # Fetch tracks from the appropriate API
-    try:
+    # Fetch tracks from the appropriate API. Cached per release row so repeat
+    # expands (this session or after a restart) are a local read; the failure
+    # handling below still sees the original upstream exception.
+    async def _fetch_tracks() -> list[dict]:
         if source == "itunes":
             collection_id = release.get("itunes_collection_id") or release_id
-            tracks = await itunes.get_release_tracks(int(collection_id))
-        elif source == "soundcloud":
+            return await itunes.get_release_tracks(int(collection_id))
+        if source == "soundcloud":
             playlist_id = release.get("soundcloud_playlist_id")
             if playlist_id:
-                tracks = await soundcloud.get_playlist_tracks(playlist_id)
-            else:
-                track_id = release.get("soundcloud_track_id") or release_id
-                tracks = await soundcloud.get_release_tracks(track_id)
-        else:
-            # Pass the tracked artist's MBID so their own credit is filtered out
-            # of per-track "feat." listings
-            tracks = await musicbrainz.get_release_tracks(release_id, main_mbid=release.get("artist_mbid") or "")
+                return await soundcloud.get_playlist_tracks(playlist_id)
+            track_id = release.get("soundcloud_track_id") or release_id
+            return await soundcloud.get_release_tracks(track_id)
+        # Pass the tracked artist's MBID so their own credit is filtered out
+        # of per-track "feat." listings
+        return await musicbrainz.get_release_tracks(
+            release_id, main_mbid=release.get("artist_mbid") or ""
+        )
+
+    try:
+        tracks = await cache.cached(
+            f"tracks:{release['id']}", cache.TTL_TRACKS, _fetch_tracks
+        )
     except Exception as e:
         msg = _error_message(e)
         logger.warning(f"Tracklist fetch failed for {release_id}: {msg}")
@@ -1083,7 +1159,11 @@ async def get_release_streaming(release_id: str):
         return {"mbid": release_id, "streaming": []}
 
     try:
-        streaming = await musicbrainz.get_release_streaming_urls(release_id)
+        streaming = await cache.cached(
+            f"streaming:{release_id}",
+            cache.TTL_STREAMING,
+            lambda: musicbrainz.get_release_streaming_urls(release_id),
+        )
     except Exception as e:
         msg = _error_message(e)
         logger.warning(f"Streaming fetch failed for {release_id}: {msg}")
@@ -1119,7 +1199,11 @@ async def get_mb_artist_links(mbid: str):
         return {"mbid": mbid, "streaming": [],
                 "itunes_artist_id": None, "soundcloud_permalink": None}
     try:
-        links = await musicbrainz.get_artist_links(mbid)
+        links = await cache.cached(
+            f"mb_links:{mbid}",
+            cache.TTL_MB_LINKS,
+            lambda: musicbrainz.get_artist_links(mbid),
+        )
     except Exception as e:
         msg = _error_message(e)
         logger.warning(f"Artist links fetch failed for {mbid}: {msg}")
@@ -1590,7 +1674,11 @@ async def _backfill_tracklists():
     async def _fill_one(row) -> bool:
         async with sem:
             try:
-                tracks = await musicbrainz.get_release_tracks(row["mbid"], row["artist_mbid"] or "")
+                tracks = await cache.cached(
+                    f"tracks:{row['id']}",
+                    cache.TTL_TRACKS,
+                    lambda: musicbrainz.get_release_tracks(row["mbid"], row["artist_mbid"] or ""),
+                )
             except Exception:
                 return False
             if tracks:
@@ -1675,7 +1763,11 @@ async def _fetch_tracklists_parallel(pending: list[tuple[int, str]], artist_mbid
     async def _fill(release_id: int, release_mbid: str):
         async with sem:
             try:
-                tracks = await musicbrainz.get_release_tracks(release_mbid, artist_mbid or "")
+                tracks = await cache.cached(
+                    f"tracks:{release_id}",
+                    cache.TTL_TRACKS,
+                    lambda: musicbrainz.get_release_tracks(release_mbid, artist_mbid or ""),
+                )
             except Exception:
                 return
             if tracks:
