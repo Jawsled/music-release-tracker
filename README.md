@@ -20,7 +20,7 @@ A local-first desktop app that tracks new album and EP releases from artists you
 - **Artist notes:** The 3-dot menu on each tracked artist lets you edit a free-text note, check a single artist, link or unlink sources, and untrack.
 - **Logs:** The Scan Logs panel streams scan activity with level filters, text search and pause.
 - **Startup options:** Optionally scan for new releases and/or run dedup automatically when the app starts.
-- **Easy backup:** Import/export your artists as a `.json` file, or stop the app and copy `music-release-tracker.db` from the app folder. That single file is self-contained (it holds artists, releases and settings), so no sidecar files need to come along. Drop it next to a fresh install before starting the app to restore everything. The app also saves its own timestamped backup into `BACKUP/` on every startup and keeps the latest five. Never copy or replace the database file while the app is running.
+- **Easy backup:** Import/export your artists as a `.json` file, or stop the app and copy `music-release-tracker.db` from the app folder. That single file is self-contained (it holds artists, releases and settings), so no sidecar files need to come along — but the database runs in WAL mode, so let the app shut down cleanly first; after a force-kill, recent writes can still be sitting in `music-release-tracker.db-wal`. Drop it next to a fresh install before starting the app to restore everything. The app also saves its own timestamped backup into `BACKUP/` on every startup and keeps the latest five. Never copy or replace the database file while the app is running.
 
 ## Quick Start
 
@@ -75,12 +75,13 @@ A `Music-Release-Tracker (conda).bat` launcher is included if you prefer running
 
 ## Database
 
-SQLite database (`music-release-tracker.db`) with four tables:
+SQLite database (`music-release-tracker.db`) with five tables:
 
 | Table | Columns |
 | --- | --- |
 | `artists` | internal ID, `mbid`, `name`, `disambiguation`, `itunes_artist_id`, `soundcloud_permalink`, `added_at` |
 | `releases` | internal ID, `mbid` (iTunes/SoundCloud IDs also live here), artist ID, `source` (`musicbrainz`/`itunes`/`soundcloud`), `title`, `release_type`, `release_date`, `first_seen_at`, `notified`, `release_day_notified` *(unused)*, `mb_url`, `itunes_collection_id`, `soundcloud_track_id`, `soundcloud_playlist_id`, `artwork_url`, `credits`, `track_titles`, `is_visible` |
+| `release_artists` | legacy join table (`release_id`, `artist_mbid`, `artist_name`); unused — always empty |
 | `meta` | key/value store for settings (keys prefixed with `setting_`) and internal state |
 | `api_cache` | upstream response cache: `key` (`<kind>:<id>`), `value` (JSON), `fetched_at` |
 
