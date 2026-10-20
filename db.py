@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sqlite3
 from contextlib import asynccontextmanager
@@ -9,6 +10,11 @@ from functools import lru_cache
 from pathlib import Path
 
 DB_PATH = str(Path(__file__).resolve().parent / "music-release-tracker.db")
+
+# Bump when the artist export gains a field so importers can adapt.
+ARTISTS_EXPORT_VERSION = 3
+# Number of automatic artist JSON snapshots kept in BACKUP/.
+ARTIST_BACKUP_KEEP = 30
 
 _conn: sqlite3.Connection | None = None
 
@@ -151,6 +157,9 @@ def init_db():
         "ALTER TABLE releases ADD COLUMN soundcloud_playlist_id TEXT",
         "ALTER TABLE releases ADD COLUMN track_titles TEXT DEFAULT ''",
         "ALTER TABLE releases ADD COLUMN is_visible INTEGER DEFAULT 1",
+        "ALTER TABLE releases ADD COLUMN hidden_reason TEXT DEFAULT ''",
+        "ALTER TABLE releases ADD COLUMN duplicate_of INTEGER",
+        "ALTER TABLE releases ADD COLUMN dedup_ignored INTEGER DEFAULT 0",
     ]
     for sql in migrations:
         try:
@@ -193,6 +202,7 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_releases_artist_sc_playlist ON releases(artist_id, soundcloud_playlist_id)",
         "CREATE INDEX IF NOT EXISTS idx_releases_unseen ON releases(notified, is_visible)",
         "CREATE INDEX IF NOT EXISTS idx_releases_visible_date ON releases(is_visible, release_date, first_seen_at)",
+        "CREATE INDEX IF NOT EXISTS idx_releases_hidden_reason ON releases(is_visible, hidden_reason)",
         "CREATE INDEX IF NOT EXISTS idx_artists_mbid ON artists(mbid)",
         "CREATE INDEX IF NOT EXISTS idx_artists_itunes ON artists(itunes_artist_id)",
         "CREATE INDEX IF NOT EXISTS idx_artists_sc ON artists(soundcloud_permalink)",
@@ -229,25 +239,136 @@ def get_counts() -> dict[str, int]:
 
 
 def backup_database(keep: int = 5) -> str | None:
-    """Save a timestamped copy of the database into BACKUP/, pruning old ones.
+    """Save a timestamped, consistent snapshot of the database into BACKUP/.
+
+    Uses SQLite's online backup API instead of copying the file. In WAL mode a
+    plain copy can catch a half-checkpointed main file, or miss the -wal
+    sidecar entirely, producing a corrupt or empty backup. The copy is written
+    to a temporary file, integrity-checked, then renamed into place so a failed
+    backup never leaves a broken .db behind.
 
     Never raises: returns the backup path, or None when anything goes wrong.
-    Callers must ensure no scan is mid-write; at startup (right after
-    init_db) the connection is idle, which is the safe moment.
     """
-    import shutil
     from datetime import datetime
     try:
         backup_dir = Path(DB_PATH).parent / "BACKUP"
         backup_dir.mkdir(exist_ok=True)
-        try:
-            get_db().execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            pass
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         dest = backup_dir / f"music-release-tracker-{stamp}.db"
-        shutil.copy(DB_PATH, dest)
+        tmp = backup_dir / f"{dest.name}.tmp"
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+        try:
+            dest_conn = sqlite3.connect(tmp)
+            try:
+                get_db().backup(dest_conn)
+                status = dest_conn.execute("PRAGMA integrity_check").fetchone()[0]
+                if status != "ok":
+                    raise sqlite3.DatabaseError(f"backup integrity check failed: {status}")
+            finally:
+                dest_conn.close()
+            tmp.replace(dest)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+
         existing = sorted(backup_dir.glob("music-release-tracker-*.db"))
+        for old in existing[:-keep] if len(existing) > keep else []:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return str(dest)
+    except Exception:
+        return None
+
+
+def _artists_export_payload(artists: list[dict]) -> dict:
+    """Build the importable artist export payload."""
+    return {
+        "version": ARTISTS_EXPORT_VERSION,
+        "artists": [
+            {
+                "mbid": a.get("mbid", "") or "",
+                "name": a.get("name", ""),
+                "disambiguation": a.get("disambiguation", "") or "",
+                "itunes_artist_id": a.get("itunes_artist_id"),
+                "soundcloud_permalink": a.get("soundcloud_permalink"),
+            }
+            for a in artists
+        ],
+    }
+
+
+def artists_export_payload() -> dict:
+    """Artist export payload, shared by the API endpoint and backups."""
+    return _artists_export_payload(get_all_artists())
+
+
+def _backup_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def backup_artists_json(keep: int = ARTIST_BACKUP_KEEP) -> str | None:
+    """Save a timestamped JSON snapshot of tracked artists into BACKUP/.
+
+    Called before init_db() runs migrations at startup, so a future schema
+    change can never strand the artist list, and refreshed once a day while
+    the app stays open. The payload matches /api/artists/export, so a
+    snapshot can be re-imported from the Artists page.
+
+    Never raises: returns the path, or None when there is nothing to save or
+    anything goes wrong.
+    """
+    from datetime import datetime
+    db_file = Path(DB_PATH)
+    try:
+        # A fresh install has no database yet: don't create one just to find
+        # an empty artist list.
+        if not db_file.exists() or db_file.stat().st_size == 0:
+            return None
+        artists = get_all_artists()
+        if not artists:
+            return None
+        payload = _artists_export_payload(artists)
+
+        backup_dir = db_file.parent / "BACKUP"
+        backup_dir.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = backup_dir / f"music-release-tracker-artists-{stamp}.json"
+        if dest.exists():
+            # Two snapshots in the same second (startup + immediate refresh).
+            dest = backup_dir / (
+                f"music-release-tracker-artists-{stamp}-"
+                f"{datetime.now().strftime('%f')}.json"
+            )
+        tmp = backup_dir / f"{dest.name}.tmp"
+        try:
+            tmp.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(dest)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+
+        existing = sorted(
+            backup_dir.glob("music-release-tracker-artists-*.json"),
+            key=_backup_mtime,
+        )
         for old in existing[:-keep] if len(existing) > keep else []:
             try:
                 old.unlink()
@@ -466,10 +587,13 @@ def add_release(
     credits: str = "",
     soundcloud_track_id: str | None = None,
     soundcloud_playlist_id: str | None = None,
-) -> bool:
+    return_id: bool = False,
+) -> bool | int:
     """Insert a release, or update release_date if it already exists.
     
-    Returns True if inserted or updated, False if unchanged.
+    Returns True if inserted or updated, False if unchanged. With
+    ``return_id=True``, returns the row id for inserts/updates instead, so the
+    caller can check whether dedup left that exact row visible.
     Updates ensure bootleg/unofficial dates get replaced with official dates
     on the next sync.
 
@@ -534,16 +658,18 @@ def add_release(
                 (mb_url, existing["id"]),
             )
         _maybe_commit()
+        if return_id and changed:
+            return existing["id"]
         return changed  # True only for inserts / date updates
 
-    conn.execute(
+    cursor = conn.execute(
         """INSERT INTO releases
            (mbid, artist_id, source, title, release_type, release_date, first_seen_at, notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (unique_key, artist_id, source, title, release_type, release_date, _now_iso(), notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id),
     )
     _maybe_commit()
-    return True
+    return cursor.lastrowid if return_id else True
 
 
 def _release_filters(
@@ -663,11 +789,127 @@ def mark_release_seen(release_id: int):
     _maybe_commit()
 
 
+# Why a release is hidden. '' on legacy hidden rows (before provenance existed)
+# and on visible rows; treated as "unknown" so dedup never touches it.
+HIDE_REASON_MANUAL = "manual"
+HIDE_REASON_DEDUP_TITLE = "dedup_title"
+HIDE_REASON_DEDUP_TRACK = "dedup_track"
+
+
 def set_release_visible(release_id: int, visible: bool):
-    """Show or hide a release in the feed."""
+    """Show or hide a release in the feed.
+
+    Showing marks the row as user-preferred (`dedup_ignored`) and clears any
+    dedup provenance, so a later dedup pass keeps it visible and removes other
+    copies instead. Hiding here is always a manual hide, never a dedup one.
+    """
     conn = get_db()
-    conn.execute("UPDATE releases SET is_visible = ? WHERE id = ?", (1 if visible else 0, release_id))
+    if visible:
+        conn.execute(
+            "UPDATE releases SET is_visible = 1, hidden_reason = '', "
+            "duplicate_of = NULL, dedup_ignored = 1 WHERE id = ?",
+            (release_id,),
+        )
+    else:
+        conn.execute(
+            "UPDATE releases SET is_visible = 0, hidden_reason = ?, "
+            "duplicate_of = NULL, dedup_ignored = 0 WHERE id = ?",
+            (HIDE_REASON_MANUAL, release_id),
+        )
     _maybe_commit()
+
+
+def hide_release_as_duplicate(release_id: int, reason: str, duplicate_of: int | None):
+    """Hide a release because dedup matched it to ``duplicate_of``."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE releases SET is_visible = 0, hidden_reason = ?, "
+        "duplicate_of = ?, dedup_ignored = 0 WHERE id = ?",
+        (reason, duplicate_of, release_id),
+    )
+    _maybe_commit()
+
+
+def restore_dedup_release(release_id: int):
+    """Unhide a release that was hidden by dedup (not by the user)."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE releases SET is_visible = 1, hidden_reason = '', "
+        "duplicate_of = NULL WHERE id = ?",
+        (release_id,),
+    )
+    _maybe_commit()
+
+
+# Source preference when choosing which copy of a duplicate survives.
+# MusicBrainz is authoritative; iTunes and SoundCloud are complementary and
+# only fill in releases MB has no entry for (yet).
+SOURCE_PRIORITY = {"musicbrainz": 0, "itunes": 1, "soundcloud": 2}
+
+
+def source_priority(source: str) -> int:
+    """Rank a release source; lower wins, unknown sources rank last."""
+    return SOURCE_PRIORITY.get((source or "").lower(), len(SOURCE_PRIORITY))
+
+
+def normalize_release_type(release_type: str) -> str:
+    """Normalize a release type for duplicate matching.
+
+    Sources already store canonical types (Album/EP/Single/Other), so this
+    only guards against case/whitespace drift. Releases of different types are
+    never treated as duplicates of each other.
+    """
+    return (release_type or "").strip().casefold()
+
+
+def hide_lower_priority_title_duplicates(artist_id: int, source: str) -> int:
+    """Hide visible lower-priority rows matching a ``source`` release.
+
+    A match requires both the same normalized title *and* the same release
+    type: an MB album and an iTunes single that happen to share a title are
+    different releases and must both stay visible. Used right after importing
+    a source so a newly-arrived higher-priority entry takes over immediately
+    instead of waiting for the next dedup run (e.g. MB appearing for a release
+    iTunes previously covered). Rows the user manually restored
+    (`dedup_ignored`) are never hidden here.
+
+    Returns the number of rows hidden.
+    """
+    rank = source_priority(source)
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, title, release_type, source, dedup_ignored FROM releases "
+        "WHERE artist_id = ? AND is_visible = 1 "
+        "ORDER BY first_seen_at, id",
+        (artist_id,),
+    ).fetchall()
+
+    keepers: dict[tuple[str, str], int] = {}
+    for row in rows:
+        if (row["source"] or "").lower() != source.lower():
+            continue
+        norm = normalize_release_title(row["title"])
+        if norm:
+            key = (norm, normalize_release_type(row["release_type"]))
+            keepers.setdefault(key, row["id"])
+    if not keepers:
+        return 0
+
+    hidden = 0
+    for row in rows:
+        if row["dedup_ignored"]:
+            continue  # user chose to keep this copy visible
+        if source_priority(row["source"]) <= rank:
+            continue
+        norm = normalize_release_title(row["title"])
+        if not norm:
+            continue
+        key = (norm, normalize_release_type(row["release_type"]))
+        keeper = keepers.get(key)
+        if keeper is not None:
+            hide_release_as_duplicate(row["id"], HIDE_REASON_DEDUP_TITLE, keeper)
+            hidden += 1
+    return hidden
 
 
 def mark_all_releases_seen():
@@ -685,7 +927,8 @@ def get_releases_due_today() -> list[dict]:
         """SELECT r.*, a.name as artist_name
            FROM releases r
            JOIN artists a ON r.artist_id = a.id
-           WHERE r.release_date = ? AND r.release_day_notified = 0""",
+           WHERE r.release_date = ? AND r.release_day_notified = 0
+             AND r.is_visible = 1""",
         (today,),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -812,27 +1055,6 @@ def update_release_mb_url(release_id: int, mb_url: str):
         (mb_url, release_id),
     )
     _maybe_commit()
-
-
-def get_artist_all_track_titles(artist_id: int) -> set[str]:
-    """Get all normalized track titles from album/EP tracklists for an artist."""
-    import json
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT track_titles FROM releases WHERE artist_id = ? AND track_titles != ''",
-        (artist_id,),
-    ).fetchall()
-    titles = set()
-    for row in rows:
-        try:
-            tracks = json.loads(row["track_titles"])
-            for t in tracks:
-                norm = normalize_release_title(t)
-                if norm:
-                    titles.add(norm)
-        except (json.JSONDecodeError, TypeError):
-            continue
-    return titles
 
 
 # --- Dedup title ignore rules ---

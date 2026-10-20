@@ -2562,9 +2562,14 @@ async function runDedup() {
   status.className = "settings-status";
   try {
     const data = await api("/api/dedup", { method: "POST" });
-    status.textContent = `Hidden ${data.hidden} duplicate(s)`;
+    const hidden = data.hidden || 0;
+    const restored = data.restored || 0;
+    const totalHidden = data.total_hidden || 0;
+    let detail = `Hidden ${hidden} duplicate(s) this run · ${totalHidden} total hidden`;
+    if (restored) detail += ` · restored ${restored}`;
+    status.textContent = detail;
     status.className = "settings-status success";
-    showToast(`Dedup hid ${data.hidden} duplicate(s)`, data.hidden ? "View feed" : null, data.hidden ? () => { location.hash = "#/feed"; loadReleases(); } : null);
+    showToast(`Dedup: ${detail}`, hidden ? "View feed" : null, hidden ? () => { location.hash = "#/feed"; loadReleases(); } : null);
     loadReleases();
     setTimeout(() => { status.textContent = ""; status.className = "settings-status"; }, 3000);
   } catch (err) {
