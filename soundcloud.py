@@ -646,8 +646,16 @@ def _playlist_release_date(pl: dict) -> str:
     return _iso_date(pl.get("created_at"))
 
 
-def _playlist_to_release(pl: dict) -> dict | None:
-    """Convert an album/EP playlist to a release dict (None when not one)."""
+def _playlist_to_release(
+    pl: dict, track_titles_by_id: dict[str, str] | None = None
+) -> dict | None:
+    """Convert an album/EP playlist to a release dict (None when not one).
+
+    The playlist's tracks are carried along as ``track_titles`` so dedup can
+    recognize tracks that were also imported as Singles. Playlist entries are
+    sometimes returned as ID-only stubs; ``track_titles_by_id`` (the artist's
+    full track list from the same scan) fills those titles back in.
+    """
     release_type = _playlist_type(pl)
     playlist_id = pl.get("id")
     if not release_type or playlist_id is None:
@@ -655,6 +663,14 @@ def _playlist_to_release(pl: dict) -> dict | None:
     track_count = _int_or_none(pl.get("track_count")) or len(pl.get("tracks") or [])
     if not track_count:
         return None
+
+    track_titles: list[str] = []
+    for track in pl.get("tracks") or []:
+        title = (track.get("title") or "").strip()
+        if not title and track_titles_by_id:
+            title = (track_titles_by_id.get(str(track.get("id"))) or "").strip()
+        if title:
+            track_titles.append(title)
 
     title = (pl.get("title") or "").strip() or "Untitled"
     artwork = _upgrade_artwork(pl.get("artwork_url"))
@@ -669,6 +685,7 @@ def _playlist_to_release(pl: dict) -> dict | None:
         "soundcloud_playlist_id": str(playlist_id),
         "soundcloud_track_id": "",
         "credits": [],
+        "track_titles": track_titles,
     }
 
 
@@ -741,10 +758,11 @@ def _playlist_track_entry(track: dict, number: int) -> dict:
 async def get_artist_releases(permalink: str) -> list[dict]:
     """Fetch a user's album/EP playlists and their tracks.
 
-    Album/EP playlists become Album/EP releases with a tracklist; every
-    track is still returned as a Single, so tracks that also live on an
-    album get the SINGLE badge in that album's tracklist (same as the
-    other providers).
+    Album/EP playlists become Album/EP releases with their tracklist stored
+    for duplicate detection; every track is still returned as a Single, but
+    dedup hides the copies that are really album tracks. The artist's full
+    track list also fills in playlist entries that come back as ID-only
+    stubs.
     """
     user = await _fetch_user(permalink)
     if not user or not user.get("id"):
@@ -762,9 +780,17 @@ async def get_artist_releases(permalink: str) -> list[dict]:
         logger.warning(f"SoundCloud track fetch failed: {tracks}")
         tracks = []
 
+    # Playlist entries are sometimes ID-only stubs; the user's full track
+    # list has the missing titles, so use it to complete the tracklists.
+    track_titles_by_id = {
+        str(t.get("id")): (t.get("title") or "").strip()
+        for t in tracks
+        if t.get("id")
+    }
+
     releases = []
     for pl in playlists:
-        release = _playlist_to_release(pl)
+        release = _playlist_to_release(pl, track_titles_by_id)
         if release:
             releases.append(release)
     releases.extend(_track_to_release(t) for t in tracks)

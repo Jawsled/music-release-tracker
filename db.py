@@ -573,6 +573,12 @@ def update_artist_disambiguation(artist_id: int, disambiguation: str) -> dict | 
 
 # --- Releases ---
 
+def _track_titles_json(track_titles: list[str] | None) -> str:
+    """JSON-encode a tracklist, dropping blanks; "" when there is none."""
+    titles = [str(t).strip() for t in (track_titles or []) if str(t).strip()]
+    return json.dumps(titles) if titles else ""
+
+
 def add_release(
     mbid: str,
     artist_id: int,
@@ -588,6 +594,7 @@ def add_release(
     soundcloud_track_id: str | None = None,
     soundcloud_playlist_id: str | None = None,
     return_id: bool = False,
+    track_titles: list[str] | None = None,
 ) -> bool | int:
     """Insert a release, or update release_date if it already exists.
     
@@ -602,6 +609,9 @@ def add_release(
     this does NOT count as a new release. Missing/changed mb_url is backfilled
     the same way, so rows imported before a source stored URLs still get a
     working link on the next sync.
+
+    track_titles: album/EP tracklist used by duplicate detection. Backfilled
+    silently when supplied; an empty fetch never clears an existing list.
     """
     conn = get_db()
     # For non-MB releases, use their own ID as uniqueness key
@@ -615,22 +625,22 @@ def add_release(
     # Build the uniqueness query based on available identifiers
     if soundcloud_playlist_id:
         existing = conn.execute(
-            "SELECT id, release_date, credits, mb_url FROM releases WHERE artist_id = ? AND soundcloud_playlist_id = ?",
+            "SELECT id, release_date, credits, mb_url, track_titles FROM releases WHERE artist_id = ? AND soundcloud_playlist_id = ?",
             (artist_id, soundcloud_playlist_id),
         ).fetchone()
     elif soundcloud_track_id:
         existing = conn.execute(
-            "SELECT id, release_date, credits, mb_url FROM releases WHERE artist_id = ? AND soundcloud_track_id = ?",
+            "SELECT id, release_date, credits, mb_url, track_titles FROM releases WHERE artist_id = ? AND soundcloud_track_id = ?",
             (artist_id, soundcloud_track_id),
         ).fetchone()
     elif itunes_collection_id:
         existing = conn.execute(
-            "SELECT id, release_date, credits, mb_url FROM releases WHERE artist_id = ? AND (mbid = ? OR itunes_collection_id = ?)",
+            "SELECT id, release_date, credits, mb_url, track_titles FROM releases WHERE artist_id = ? AND (mbid = ? OR itunes_collection_id = ?)",
             (artist_id, unique_key, unique_key),
         ).fetchone()
     else:
         existing = conn.execute(
-            "SELECT id, release_date, credits, mb_url FROM releases WHERE artist_id = ? AND mbid = ?",
+            "SELECT id, release_date, credits, mb_url, track_titles FROM releases WHERE artist_id = ? AND mbid = ?",
             (artist_id, unique_key),
         ).fetchone()
 
@@ -657,6 +667,14 @@ def add_release(
                 "UPDATE releases SET mb_url = ? WHERE id = ?",
                 (mb_url, existing["id"]),
             )
+        # Store/refresh the tracklist when the source supplied one. This is
+        # a silent backfill like credits, not a new-release change.
+        track_titles_json = _track_titles_json(track_titles)
+        if track_titles_json and existing["track_titles"] != track_titles_json:
+            conn.execute(
+                "UPDATE releases SET track_titles = ? WHERE id = ?",
+                (track_titles_json, existing["id"]),
+            )
         _maybe_commit()
         if return_id and changed:
             return existing["id"]
@@ -664,9 +682,9 @@ def add_release(
 
     cursor = conn.execute(
         """INSERT INTO releases
-           (mbid, artist_id, source, title, release_type, release_date, first_seen_at, notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (unique_key, artist_id, source, title, release_type, release_date, _now_iso(), notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id),
+           (mbid, artist_id, source, title, release_type, release_date, first_seen_at, notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id, track_titles)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (unique_key, artist_id, source, title, release_type, release_date, _now_iso(), notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id, _track_titles_json(track_titles)),
     )
     _maybe_commit()
     return cursor.lastrowid if return_id else True
@@ -853,25 +871,60 @@ def source_priority(source: str) -> int:
 
 
 def normalize_release_type(release_type: str) -> str:
-    """Normalize a release type for duplicate matching.
+    """Normalize a release type's case/whitespace for comparison.
 
-    Sources already store canonical types (Album/EP/Single/Other), so this
-    only guards against case/whitespace drift. Releases of different types are
-    never treated as duplicates of each other.
+    Sources already store canonical types (Album/EP/Single/Other). Exact-type
+    checks use this; duplicate matching goes through ``release_type_family``
+    because iTunes and SoundCloud routinely classify EPs as albums.
     """
     return (release_type or "").strip().casefold()
+
+
+def release_type_family(release_type: str) -> str:
+    """Return the type family used to find duplicate releases.
+
+    Album and EP share one family: iTunes and SoundCloud often have no EP
+    classification and report EPs as albums, so an MB EP must be able to
+    match their copy. Singles and Other stay separate, so a single and an
+    album that share a title remain different releases.
+    """
+    norm = normalize_release_type(release_type)
+    return "album" if norm == "ep" else norm
+
+
+def are_duplicate_types(
+    type_a: str, source_a: str, type_b: str, source_b: str
+) -> bool:
+    """Whether two release types can describe the same duplicate copy.
+
+    An exact type match is always a duplicate. Album vs EP only counts across
+    different sources: MusicBrainz can legitimately have both an album and an
+    EP with the same title, and those must stay distinct.
+    """
+    norm_a = normalize_release_type(type_a)
+    norm_b = normalize_release_type(type_b)
+    if norm_a == norm_b:
+        return True
+    if norm_a in ("album", "ep") and norm_b in ("album", "ep"):
+        return (source_a or "").strip().casefold() != (
+            source_b or ""
+        ).strip().casefold()
+    return False
 
 
 def hide_lower_priority_title_duplicates(artist_id: int, source: str) -> int:
     """Hide visible lower-priority rows matching a ``source`` release.
 
-    A match requires both the same normalized title *and* the same release
-    type: an MB album and an iTunes single that happen to share a title are
-    different releases and must both stay visible. Used right after importing
-    a source so a newly-arrived higher-priority entry takes over immediately
-    instead of waiting for the next dedup run (e.g. MB appearing for a release
-    iTunes previously covered). Rows the user manually restored
-    (`dedup_ignored`) are never hidden here.
+    A match requires both the same normalized title *and* the same
+    release-type family: Album and EP compare together because iTunes and
+    SoundCloud often report EPs as albums, so an MB EP can take over their
+    copy. Singles and Other stay distinct: an MB album and an iTunes single
+    that happen to share a title are different releases and must both stay
+    visible. Used right after importing a source so a newly-arrived
+    higher-priority entry takes over immediately instead of waiting for the
+    next dedup run (e.g. MB appearing for a release iTunes previously
+    covered). Rows the user manually restored (`dedup_ignored`) are never
+    hidden here.
 
     Returns the number of rows hidden.
     """
@@ -890,7 +943,7 @@ def hide_lower_priority_title_duplicates(artist_id: int, source: str) -> int:
             continue
         norm = normalize_release_title(row["title"])
         if norm:
-            key = (norm, normalize_release_type(row["release_type"]))
+            key = (norm, release_type_family(row["release_type"]))
             keepers.setdefault(key, row["id"])
     if not keepers:
         return 0
@@ -904,7 +957,7 @@ def hide_lower_priority_title_duplicates(artist_id: int, source: str) -> int:
         norm = normalize_release_title(row["title"])
         if not norm:
             continue
-        key = (norm, normalize_release_type(row["release_type"]))
+        key = (norm, release_type_family(row["release_type"]))
         keeper = keepers.get(key)
         if keeper is not None:
             hide_release_as_duplicate(row["id"], HIDE_REASON_DEDUP_TITLE, keeper)
@@ -947,10 +1000,16 @@ def get_unseen_count() -> int:
 
 
 def get_artist_single_titles(artist_id: int) -> list[str]:
-    """Return lowercase titles of all Single releases for a given artist."""
+    """Return lowercase titles of all visible Single releases for an artist.
+
+    Hidden copies must not feed the tracklist ``SINGLE`` badge: dedup hides
+    SoundCloud album tracks as duplicate Singles, and those hidden rows would
+    otherwise badge every album track.
+    """
     conn = get_db()
     rows = conn.execute(
-        "SELECT title FROM releases WHERE artist_id = ? AND release_type = 'Single'",
+        "SELECT title FROM releases "
+        "WHERE artist_id = ? AND release_type = 'Single' AND is_visible = 1",
         (artist_id,),
     ).fetchall()
     return [row["title"].strip().lower() for row in rows if row["title"]]

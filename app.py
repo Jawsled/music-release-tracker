@@ -5,6 +5,7 @@ import json
 import logging
 import webbrowser
 from contextlib import asynccontextmanager
+from datetime import date
 from typing import Optional
 
 import httpx
@@ -81,6 +82,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_startup_refresh())
     # Retroactively fetch tracklists for MB albums/EPs missing track_titles
     asyncio.create_task(_backfill_tracklists())
+    # Retroactively fetch tracklists for SoundCloud albums/EPs too
+    asyncio.create_task(_backfill_sc_tracklists())
     # Retroactively fetch canonical URLs for SoundCloud releases missing one
     asyncio.create_task(_backfill_sc_urls())
     # Refresh the artist JSON snapshot while the app stays open.
@@ -645,6 +648,7 @@ async def add_artist(body: ArtistAddRequest):
                     soundcloud_playlist_id=rel.get("soundcloud_playlist_id") or None,
                     artwork_url=rel.get("artwork_url", ""),
                     mb_url=rel.get("url", ""),
+                    track_titles=rel.get("track_titles") or [],
                 )
                 if inserted:
                     count += 1
@@ -760,6 +764,7 @@ async def add_artist(body: ArtistAddRequest):
                         soundcloud_playlist_id=rel.get("soundcloud_playlist_id") or None,
                         artwork_url=rel.get("artwork_url", ""),
                         mb_url=rel.get("url", ""),
+                        track_titles=rel.get("track_titles") or [],
                     )
                     if inserted:
                         count += 1
@@ -839,6 +844,7 @@ async def add_artist(body: ArtistAddRequest):
                     soundcloud_playlist_id=rel.get("soundcloud_playlist_id") or None,
                     artwork_url=rel.get("artwork_url", ""),
                     mb_url=rel.get("url", ""),
+                    track_titles=rel.get("track_titles") or [],
                 )
                 if inserted:
                     count += 1
@@ -1392,6 +1398,7 @@ async def _fetch_artist_new_titles(artist: dict) -> list[str]:
                         soundcloud_playlist_id=rel.get("soundcloud_playlist_id") or None,
                         artwork_url=rel.get("artwork_url", ""),
                         mb_url=rel.get("url", ""),
+                        track_titles=rel.get("track_titles") or [],
                         return_id=True,
                     )
                     if inserted:
@@ -1633,20 +1640,29 @@ async def run_dedup():
 # Bump when grouping/visibility rules change. The lifespan compares this to a
 # meta row and runs one dedup pass on startup so existing libraries are
 # repaired even when the user has not enabled startup_dedup.
-DEDUP_POLICY_VERSION = 3
+DEDUP_POLICY_VERSION = 5
 
 
 async def _dedupe_releases() -> dict:
     """Hide duplicate releases and restore ones that no longer are.
 
-    Releases are grouped by (artist_id, normalized title, normalized release
-    type): a single and an album that share a title are different releases and
-    never match. Within a group the highest-priority copy survives —
-    MusicBrainz, then iTunes, then SoundCloud — and the rest are hidden. Hidden
-    rows carry ``hidden_reason`` so a later pass can tell dedup hides apart
-    from manual ones, and rows this pass hid earlier but that no longer
-    duplicate anything are restored. Titles that normalize to an empty string
-    are ignored — they carry no information and must never be grouped.
+    Releases are grouped by (artist_id, normalized title, release-type
+    family): Album and EP share a family because iTunes and SoundCloud often
+    report EPs as albums, so an MB EP can replace their copy. Singles and
+    Other stay distinct, so a single and an album that share a title never
+    match. Same-source album/EP rows remain distinct; only a cross-source
+    album-vs-EP pair counts as a duplicate. Within a group the
+    highest-priority copy survives — MusicBrainz, then iTunes, then
+    SoundCloud — and the rest are hidden. Hidden rows carry ``hidden_reason``
+    so a later pass can tell dedup hides apart from manual ones, and rows
+    this pass hid earlier but that no longer duplicate anything are restored.
+    Titles that normalize to an empty string are ignored — they carry no
+    information and must never be grouped.
+
+    A second pass hides SoundCloud Singles that are really album/EP tracks.
+    MusicBrainz tracklists are authoritative; other tracklists only match
+    when the single landed with the album (within one day), so a genuine
+    single released earlier stays visible.
 
     The whole pass runs in one ``db.batch()`` transaction: it cannot commit a
     scan's open batch and a failure leaves no partial dedup state.
@@ -1657,96 +1673,103 @@ async def _dedupe_releases() -> dict:
     def _norm(title: str) -> str:
         return db.normalize_release_title(title)
 
+    def _parse_full_date(value: str) -> date | None:
+        """Parse a complete YYYY-MM-DD date; partial/unknown dates are None."""
+        text = (value or "").strip()
+        if len(text) != 10:
+            return None
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            return None
+
     hidden = 0
     restored = 0
 
     def _apply_title_groups(release_rows) -> None:
-        """One title+type duplicate pass over a snapshot of release rows."""
+        """One title+type-family duplicate pass over a snapshot of rows."""
         nonlocal hidden, restored
         groups: dict[tuple[int, str, str], list[dict]] = {}
         for row in release_rows:
             norm = _norm(row["title"])
             if not norm:
                 continue
-            key = (row["artist_id"], norm, db.normalize_release_type(row["release_type"]))
+            family = db.release_type_family(row["release_type"])
+            key = (row["artist_id"], norm, family)
             groups.setdefault(key, []).append(dict(row))
 
         for group in groups.values():
-            if len(group) < 2:
-                row = group[0]
-                # This pass hid it, but nothing duplicates it any more (rule
-                # removed, other copy deleted). Bring it back.
-                if row["hidden_reason"] == db.HIDE_REASON_DEDUP_TITLE:
-                    db.restore_dedup_release(row["id"])
-                    restored += 1
-                continue
-
-            visible = [r for r in group if r["is_visible"]]
-            dedup_hidden = [
+            # Manual/legacy hides are user or unknown decisions, and tracklist
+            # duplicates belong to the SoundCloud pass below.
+            candidates = [
                 r for r in group
-                if not r["is_visible"]
-                and r["hidden_reason"] == db.HIDE_REASON_DEDUP_TITLE
+                if r["is_visible"]
+                or r["hidden_reason"] == db.HIDE_REASON_DEDUP_TITLE
             ]
-
-            if visible:
-                best_rank = min(db.source_priority(r["source"]) for r in visible)
-                # A hidden copy from a *strictly higher-priority* source is
-                # forced back (e.g. a hidden MB row under a visible iTunes
-                # one). Same-source duplicates stay hidden — dedup still
-                # collapses two MB entries that share a title and type.
-                for row in dedup_hidden:
-                    if db.source_priority(row["source"]) >= best_rank:
-                        continue
-                    db.restore_dedup_release(row["id"])
-                    row["is_visible"] = 1
-                    row["hidden_reason"] = ""
-                    restored += 1
-                visible = [r for r in group if r["is_visible"]]
-            elif dedup_hidden:
-                # Nothing visible: keep exactly one duplicate, the best one.
-                keeper_row = min(
-                    dedup_hidden,
-                    key=lambda r: (db.source_priority(r["source"]), r["id"]),
-                )
-                db.restore_dedup_release(keeper_row["id"])
-                keeper_row["is_visible"] = 1
-                keeper_row["hidden_reason"] = ""
-                restored += 1
-                visible = [r for r in group if r["is_visible"]]
-            else:
-                # Every copy is manually hidden — respect that.
+            if not candidates:
                 continue
 
-            if not visible:
-                continue
-
-            # Prefer MusicBrainz, then iTunes, then SoundCloud; within a
-            # source tier prefer the copy the user explicitly restored.
-            keeper = min(
-                visible,
+            # Highest-priority source first. Within a tier prefer an
+            # already-visible copy (so a same-source hidden duplicate is not
+            # resurrected over the current winner), then the copy the user
+            # explicitly restored, then insertion order.
+            ordered = sorted(
+                candidates,
                 key=lambda r: (
                     db.source_priority(r["source"]),
+                    0 if r["is_visible"] else 1,
                     0 if r["dedup_ignored"] else 1,
                     r["id"],
                 ),
             )
 
-            for row in group:
-                if row["id"] == keeper["id"]:
+            keepers_by_type: dict[str, dict] = {}
+            keepers_by_family: dict[str, dict] = {}
+            for row in ordered:
+                rtype = db.normalize_release_type(row["release_type"])
+                family = db.release_type_family(row["release_type"])
+
+                # Exact-type copies always compete. Album vs EP only competes
+                # across sources: iTunes/SoundCloud often report EPs as
+                # albums, while MB can genuinely have both with one title.
+                keeper = keepers_by_type.get(rtype)
+                if keeper is None:
+                    family_keeper = keepers_by_family.get(family)
+                    if family_keeper is not None and db.are_duplicate_types(
+                        row["release_type"], row["source"],
+                        family_keeper["release_type"], family_keeper["source"],
+                    ):
+                        keeper = family_keeper
+
+                # A copy the user explicitly restored stays visible even when
+                # it duplicates a higher-priority copy.
+                keep = keeper is None or (
+                    row["is_visible"] and row["dedup_ignored"]
+                )
+
+                if not keep:
+                    if row["is_visible"]:
+                        db.hide_release_as_duplicate(
+                            row["id"], db.HIDE_REASON_DEDUP_TITLE, keeper["id"]
+                        )
+                        row["is_visible"] = 0
+                        hidden += 1
+                    else:
+                        # Already hidden as a duplicate; refresh the keeper.
+                        db.hide_release_as_duplicate(
+                            row["id"], db.HIDE_REASON_DEDUP_TITLE, keeper["id"]
+                        )
                     continue
-                if row["is_visible"]:
-                    if row["dedup_ignored"]:
-                        continue  # user chose to keep this copy visible
-                    db.hide_release_as_duplicate(
-                        row["id"], db.HIDE_REASON_DEDUP_TITLE, keeper["id"]
-                    )
-                    hidden += 1
-                elif row["hidden_reason"] == db.HIDE_REASON_DEDUP_TITLE:
-                    # Already hidden as a duplicate of this keeper; refresh
-                    # the reference.
-                    db.hide_release_as_duplicate(
-                        row["id"], db.HIDE_REASON_DEDUP_TITLE, keeper["id"]
-                    )
+
+                if not row["is_visible"]:
+                    # This pass hid it, but nothing duplicates it any more
+                    # (rule removed, other copy deleted). Bring it back.
+                    db.restore_dedup_release(row["id"])
+                    row["is_visible"] = 1
+                    row["hidden_reason"] = ""
+                    restored += 1
+                keepers_by_type.setdefault(rtype, row)
+                keepers_by_family.setdefault(family, row)
 
     async with db.batch():
         conn = db.get_db()
@@ -1760,21 +1783,66 @@ async def _dedupe_releases() -> dict:
 
         _apply_title_groups(_release_rows())
 
-        # Hide SoundCloud tracks whose title already appears on an album/EP
-        # tracklist. Empty norms are skipped for the same reason as above.
+        # Hide SoundCloud tracks that are really album/EP tracks. MusicBrainz
+        # tracklists are authoritative and always win. Other sources only
+        # count when the single landed with the album (within a day):
+        # SoundCloud imports every upload as a Single, so a track uploaded on
+        # release day must not look like a standalone single, while a single
+        # released earlier stays visible.
         track_rows = conn.execute(
-            "SELECT id, artist_id, track_titles FROM releases WHERE track_titles != ''"
+            "SELECT id, artist_id, source, release_date, track_titles "
+            "FROM releases WHERE track_titles != '' "
+            "AND lower(release_type) IN ('album', 'ep')"
         ).fetchall()
-        album_tracks: dict[tuple[int, str], int] = {}
+        album_tracks: dict[tuple[int, str], list[dict]] = {}
         for tr in track_rows:
             try:
                 tracks = json.loads(tr["track_titles"])
             except (json.JSONDecodeError, TypeError):
                 continue
+            if not isinstance(tracks, list):
+                continue
+            candidate = {
+                "id": tr["id"],
+                "source": (tr["source"] or "").strip().casefold(),
+                "date": _parse_full_date(tr["release_date"]),
+            }
             for t in tracks:
-                norm = _norm(t)
+                norm = _norm(t) if isinstance(t, str) else ""
                 if norm:
-                    album_tracks.setdefault((tr["artist_id"], norm), tr["id"])
+                    album_tracks.setdefault(
+                        (tr["artist_id"], norm), []
+                    ).append(candidate)
+
+        def _track_duplicate(row) -> dict | None:
+            """Pick the album/EP row that makes this Single an album track."""
+            candidates = album_tracks.get(
+                (row["artist_id"], _norm(row["title"]))
+            )
+            if not candidates:
+                return None
+            # MB models genuine singles separately, so an MB album tracklist
+            # is authoritative regardless of upload dates.
+            for candidate in candidates:
+                if candidate["source"] == "musicbrainz":
+                    return candidate
+            # Other sources have no separate single model. Only treat a track
+            # as an album track when it landed with the album; earlier
+            # uploads are standalone singles.
+            single_date = _parse_full_date(row["release_date"])
+            if single_date is None:
+                return None
+            best = None
+            best_delta = None
+            for candidate in candidates:
+                album_date = candidate["date"]
+                if album_date is None:
+                    continue
+                delta = abs((single_date - album_date).days)
+                if delta <= 1 and (best_delta is None or delta < best_delta):
+                    best = candidate
+                    best_delta = delta
+            return best
 
         # Re-evaluate rows this pass hid, so a tracklist that disappeared can
         # bring them back instead of leaving them hidden forever. Only
@@ -1782,37 +1850,34 @@ async def _dedupe_releases() -> dict:
         # that happens to share a title with a track is a different release.
         restored_before_track = restored
         for row in conn.execute(
-            "SELECT id, artist_id, title, release_type FROM releases WHERE hidden_reason = ?",
+            "SELECT id, artist_id, title, release_type, release_date "
+            "FROM releases WHERE hidden_reason = ?",
             (db.HIDE_REASON_DEDUP_TRACK,),
         ).fetchall():
             if db.normalize_release_type(row["release_type"]) != "single":
                 db.restore_dedup_release(row["id"])
                 restored += 1
                 continue
-            norm = _norm(row["title"])
-            source_id = album_tracks.get((row["artist_id"], norm)) if norm else None
-            if source_id is None:
+            source = _track_duplicate(row)
+            if source is None:
                 db.restore_dedup_release(row["id"])
                 restored += 1
             else:
                 db.hide_release_as_duplicate(
-                    row["id"], db.HIDE_REASON_DEDUP_TRACK, source_id
+                    row["id"], db.HIDE_REASON_DEDUP_TRACK, source["id"]
                 )
 
         if album_tracks:
             sc_rows = conn.execute(
-                "SELECT id, artist_id, title FROM releases "
+                "SELECT id, artist_id, title, release_date FROM releases "
                 "WHERE source = 'soundcloud' AND lower(release_type) = 'single' "
                 "AND is_visible = 1 AND dedup_ignored = 0"
             ).fetchall()
             for sr in sc_rows:
-                norm = _norm(sr["title"])
-                if not norm:
-                    continue
-                source_id = album_tracks.get((sr["artist_id"], norm))
-                if source_id is not None:
+                source = _track_duplicate(sr)
+                if source is not None:
                     db.hide_release_as_duplicate(
-                        sr["id"], db.HIDE_REASON_DEDUP_TRACK, source_id
+                        sr["id"], db.HIDE_REASON_DEDUP_TRACK, source["id"]
                     )
                     hidden += 1
 
@@ -1830,7 +1895,11 @@ async def _dedupe_releases() -> dict:
 
 
 async def _backfill_tracklists():
-    """Fetch and store tracklists for MB album/EP releases that are missing them."""
+    """Fetch and store tracklists for MB album/EP releases that are missing them.
+
+    Tracklists feed duplicate detection, so re-run dedup after filling rather
+    than waiting for the next scan or startup pass.
+    """
     import asyncio
     conn = db.get_db()
     rows = conn.execute(
@@ -1874,6 +1943,78 @@ async def _backfill_tracklists():
             continue
     if filled:
         _add_log("INFO", f"Backfilled tracklists for {filled} release(s)")
+        await _dedupe_releases()
+
+
+async def _backfill_sc_tracklists():
+    """Fetch and store tracklists for SoundCloud album/EP rows missing them.
+
+    The playlist list response already carries tracks, so one fetch per
+    artist covers all of that artist's albums. ID-only stubs are filled from
+    the same response's full track list. Re-runs dedup afterwards because
+    these tracklists are dedup input.
+    """
+    conn = db.get_db()
+    rows = conn.execute(
+        """SELECT r.id, r.soundcloud_playlist_id,
+                  a.soundcloud_permalink
+             FROM releases r
+             JOIN artists a ON r.artist_id = a.id
+            WHERE r.source = 'soundcloud'
+              AND r.release_type IN ('Album', 'EP')
+              AND (r.track_titles = '' OR r.track_titles IS NULL)
+              AND r.soundcloud_playlist_id != ''
+              AND a.soundcloud_permalink != ''"""
+    ).fetchall()
+
+    if not rows:
+        return
+
+    _add_log(
+        "INFO",
+        f"Backfilling tracklists for {len(rows)} SoundCloud release(s)...",
+    )
+    by_artist: dict[str, list] = {}
+    for row in rows:
+        by_artist.setdefault(row["soundcloud_permalink"], []).append(row)
+
+    sem = asyncio.Semaphore(3)
+    filled = 0
+
+    async def _fill_artist(permalink: str, artist_rows) -> None:
+        nonlocal filled
+        async with sem:
+            try:
+                releases = await soundcloud.get_artist_releases(permalink)
+            except Exception:
+                return
+            titles_by_playlist = {
+                str(rel.get("soundcloud_playlist_id")): rel.get("track_titles") or []
+                for rel in releases
+                if rel.get("soundcloud_playlist_id")
+            }
+            for row in artist_rows:
+                titles = titles_by_playlist.get(
+                    str(row["soundcloud_playlist_id"])
+                )
+                if titles:
+                    db.update_release_track_titles(row["id"], titles)
+                    filled += 1
+
+    for coro in asyncio.as_completed(
+        [_fill_artist(p, rs) for p, rs in by_artist.items()]
+    ):
+        try:
+            await coro
+        except Exception:
+            continue
+
+    if filled:
+        _add_log(
+            "INFO",
+            f"Backfilled tracklists for {filled} SoundCloud release(s)",
+        )
+        await _dedupe_releases()
 
 
 async def _backfill_sc_urls():
