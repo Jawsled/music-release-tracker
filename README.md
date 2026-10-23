@@ -56,26 +56,27 @@ A `Music-Release-Tracker (conda).bat` launcher is included if you prefer running
 
 - **Search:** Queries the MusicBrainz, iTunes and SoundCloud APIs (whichever platforms are selected and enabled). Names matching across platforms merge into one row so you can link everything at once.
 - **Manual query:** If search comes up empty, paste an MBID, a full MusicBrainz / Apple Music / SoundCloud URL, or a SoundCloud permalink.
-- **Linking:** Already have an artist added via one source? Link the other sources to the same entry. Unlinking asks for confirmation inline, then removes that artist's release from said platform from the DB.
-- **Import / Export:** import/export artist entries (name, MBIDs, iTunes IDs, SoundCloud permalinks) as JSON. The app also writes the same format to `BACKUP/` automatically. If in the future, should DB schema changes occur, the json can be used to re-populate it.
+- **Linking:** Already have an artist added via one source? Link the other sources to the same entry. Unlinking asks for confirmation inline, then removes that source's releases for the artist from the database.
+- **Import / Export:** Import/export artist entries (name, MBIDs, iTunes IDs, SoundCloud permalinks) as JSON. The app also writes the same format to `BACKUP/` automatically. This JSON covers artists only, so it can repopulate the artist list but not releases or settings.
 - **Sorting:** The tracked artists list sorts alphabetically, case-insensitively, with accented characters folded to their base letters.
 
 ### Feed
 
 - **Artist dropdown:** Choose whose releases to view (searchable, keyboard navigable).
+- **Timeline:** The feed is date-ordered, so upcoming releases sit above today's. A `Today` divider marks that boundary, each card carries a short relative hint (`in 7 days`, `today`, `3 days ago`), and a floating pill jumps back to the marker whenever it is off-screen. Partial dates (`2026-11`, `2027`) are grouped on the side of the boundary they belong to.
 - **Check for new releases:** Checks the artist(s) currently selected in the dropdown (all artists by default). Progress, per-artist failures with retry, and a new-release summary appear in the popup.
 - **Type filters:** Release-type chips show/hide releases per type and combine with the other filters.
   - *MusicBrainz types:* Everything classified as a release is fetched (albums, EPs, singles, and various mixes/compilations). Anything that isn't an album, EP, or single falls under **Other** when filtering. The exact type still appears on each release card.
-  - *iTunes types:* Since iTunes labels everything `collectionType=Album`, classification uses title suffixes like `- Single` / `- EP`; anything else counts as an album. (refer to known limitations section.)
-- **Duplicate handling:** Scans store every release each enabled source returns, then run dedup afterwards; duplicates are registered and hidden instead of being skipped at fetch time to reduce the load. Album and track titles are then normalized and compared to detect duplicates to the best of its abilitity. (Track title, album including EP title, release day etc.) for details, refer to dedup / hidden releases section.
+  - *iTunes types:* Since iTunes labels everything `collectionType=Album`, classification uses title suffixes like `- Single` / `- EP`; anything else counts as an album. (See Known Issues.)
+- **Duplicate handling:** Scans store every release each enabled source returns, then run dedup afterwards; duplicates are registered and hidden instead of being skipped at fetch time. Album and track titles are then normalized and compared to detect duplicates as accurately as possible using release titles, album/EP titles, tracklists and (for SoundCloud) release dates. For details, see [Hidden releases](#hidden-releases).
 - **New-only checkbox:** Shows only entries marked `NEW`. "New" here means *newly added to the database*. This has nothing to do with release dates. Dismiss badges individually with a click or via `Mark All as Seen` button at the top.
-- **Hidden only checkbox:** Shows everything that are hidden. manual hides plus copies dedup set aside — each with an Unhide action. Unhiding a dedup copy also marks it as user-preferred so a later dedup pass leaves it visible.
+- **Hidden only checkbox:** Shows every hidden release — manual hides plus copies dedup set aside — with the reason and, for dedup hides, the surviving copy or owning album. Each row has an Unhide action. Unhiding a dedup copy also marks it as user-preferred so a later dedup pass leaves it visible.
 - **Tracklist:** Fetched from MusicBrainz/iTunes/SoundCloud for anything other than singles, with a copy button to quickly copy the entire list.
 - **`SINGLE` badge:** Purely local: matches track titles against the artist's visible single releases, so hidden duplicate copies never add a badge.
 
 ### Hidden releases
 
-Hidden rows are never deleted. The Hidden only filter lists all of them and offers Unhide. Each row records a `hidden_reason`, so the app can tell its own dedup decisions apart from yours:
+Hidden rows are never deleted. The Hidden only filter lists all of them, shows the reason on each card, and offers Unhide. Each row records a `hidden_reason`, so the app can tell its own dedup decisions apart from yours:
 
 | `hidden_reason` | Meaning | What happens next |
 | --- | --- | --- |
@@ -107,7 +108,7 @@ Cover art for MusicBrainz releases is proxied through `/api/covers/{mbid}` and c
 
 - **iTunes quirks:** iTunes provides no release type (everything is `collectionType=Album`), so suffix-based classification is used. Fixing this properly would require the modern Apple Music API key. Also the iTunes catalog is less frequently maintained. Some releases only surface via UPC lookup. iTunes also exposes no follower counts, so search rows show album counts instead to help tell same-name artists apart.
 - **Near-duplicate titles:** Deduplication can still miss releases whose titles differ in ways no rule covers. Fully censored words (`****`) cannot be mapped to anything, by design.
-- **MusicBrainz credits:** The scan works at the *release group* level (individual releases are only fetched on demand for tracklists/streaming links), so credited artists don't appear during a release-group scan, necessitating secondary level scan for those.
+- **MusicBrainz credits:** The scan works at the *release group* level (individual releases are only fetched on demand for tracklists/streaming links), so credited artists don't appear during a release-group scan; those credits require a secondary, release-level scan.
 
 ### Telegram (removed)
 

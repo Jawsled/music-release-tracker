@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Music Release Tracker</title>
     <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
-    <link rel="stylesheet" href="/static/style.css?v=13">
+    <link rel="stylesheet" href="/static/style.css?v=16">
 </head>
 <body>
     <header class="app-header">
@@ -186,6 +186,9 @@
             <div id="release-list" class="release-list">
                 <p class="empty-state">No releases yet. Add some artists to get started.</p>
             </div>
+
+            <!-- Floating shortcut back to the Today divider (feed.js keeps it in sync) -->
+            <button id="today-pill" type="button" class="today-pill hidden" data-action="jump-to-today" aria-label="Jump to the Today marker in the feed">↓ Jump to today</button>
         </section>
 
         <!-- Artists Tab -->
@@ -248,7 +251,14 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=23"></script>
+    <script src="/static/js/core.js?v=24"></script>
+    <script src="/static/js/feed.js?v=26"></script>
+    <script src="/static/js/artists.js?v=24"></script>
+    <script src="/static/js/check.js?v=24"></script>
+    <script src="/static/js/misc.js?v=24"></script>
+    <script src="/static/js/panels.js?v=24"></script>
+    <script src="/static/js/modal.js?v=24"></script>
+    <script src="/static/js/init.js?v=24"></script>
     <div id="toast-container" class="toast-container" aria-live="polite"></div>
 </body>
 </html>

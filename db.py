@@ -757,8 +757,14 @@ def get_releases(
 
     query = (
         "SELECT r.*, a.name as artist_name, a.mbid as artist_mbid, "
-        "a.soundcloud_permalink as artist_soundcloud_permalink "
-        "FROM releases r JOIN artists a ON r.artist_id = a.id" + clause
+        "a.soundcloud_permalink as artist_soundcloud_permalink, "
+        "d.title as duplicate_title, "
+        "d.release_type as duplicate_release_type, "
+        "d.release_date as duplicate_release_date, "
+        "d.source as duplicate_source, "
+        "d.is_visible as duplicate_is_visible "
+        "FROM releases r JOIN artists a ON r.artist_id = a.id "
+        "LEFT JOIN releases d ON d.id = r.duplicate_of" + clause
     )
 
     if cursor is not None:
