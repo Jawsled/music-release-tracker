@@ -8,9 +8,9 @@ A local-first desktop app that tracks new releases with webUI. Powered by [Music
 
 ## Features
 
-- **Artist search:** Search MusicBrainz, iTunes and SoundCloud by name (platform filter included in the search box), or paste an MBID, a MusicBrainz / Apple Music / Bandcamp / SoundCloud URL, or a SoundCloud permalink. Preview buttons and pills let you confirm you're adding the right artist before you commit.
+- **Artist search:** Search MusicBrainz, iTunes, Bandcamp and SoundCloud by name (platform filter included in the search box), or paste an MBID, a MusicBrainz / Apple Music / Bandcamp / SoundCloud URL, or a SoundCloud permalink. Preview buttons and pills let you confirm you're adding the right artist before you commit.
 - **SoundCloud suggestions:** SoundCloud has no text search API, so display names are probed as profile URL variants. Each suggestion shows the live follower count, which is usually the fastest way to tell same-name profiles apart. iTunes rows show album counts for the same reason.
-- **Bandcamp (opt-in):** Bandcamp has no usable name search either, so it works like SoundCloud: paste an `artist.bandcamp.com` URL (or use *Link Bandcamp* on a tracked artist) and the app resolves the band id from the artist page. When an artist's MusicBrainz page lists a Bandcamp URL, search rows show it as an MB-confirmed link. Bandcamp is off by default because it targets exclusive / non-streaming releases rather than duplicating streaming catalogs; enable it under Settings → Sources.
+- **Bandcamp (opt-in):** Search Bandcamp by name via the autocomplete endpoint behind its site search, or paste an `artist.bandcamp.com` URL (or use *Link Bandcamp* on a tracked artist) to resolve that exact profile. When an artist's MusicBrainz page lists a Bandcamp URL, search rows show it as an MB-confirmed link. Bandcamp is off by default because it targets exclusive / non-streaming releases rather than duplicating streaming catalogs; enable it under Settings → Sources.
 - **iTunes completeness:** The iTunes Lookup API is capped at 200 collections and ignores `offset`. When a lookup comes back full, the app runs one Search API query for that artist (ranked by relevance) and merges the results by `collectionId`, so releases beyond the cap and releases filed under a duplicate Apple artist entry still appear. Requests are paced at ~20/min to stay inside Apple's documented limit. Collaborations are matched on `artist_name` too, so a co-primary credit is kept even when Apple assigns the collection to another artist's ID; featured-only appearances stay out.
 - **Release feed:** Browse albums, EPs, singles and other releases sorted by date; filter by artist, release type, new-only, or hidden-only.
 - **Tracklists:** Fetch tracklists for album and EP releases, including track numbers, durations and featured-artist credits. Tracks also released as visible singles get a `SINGLE` badge.
@@ -56,7 +56,7 @@ A `Music-Release-Tracker (conda).bat` launcher is included if you prefer running
 
 ### Artists
 
-- **Search:** Queries the MusicBrainz, iTunes and SoundCloud APIs (whichever platforms are selected and enabled). Names matching across platforms merge into one row so you can link everything at once. Bandcamp is not part of name search (its site search is bot-challenged); paste a Bandcamp URL instead.
+- **Search:** Queries the MusicBrainz, iTunes, Bandcamp and SoundCloud APIs (whichever platforms are selected and enabled). Names matching across platforms merge into one row so you can link everything at once. Bandcamp's search comes from the same autocomplete endpoint its site uses, so results are best-effort and capped at roughly 50 bands.
 - **Manual query:** If search comes up empty, paste an MBID, a full MusicBrainz / Apple Music / Bandcamp / SoundCloud URL, or a SoundCloud permalink.
 - **Linking:** Already have an artist added via one source? Link the other sources to the same entry. Unlinking asks for confirmation inline, then removes that source's releases for the artist from the database.
 - **Import / Export:** Import/export artist entries (name, MBIDs, iTunes IDs, SoundCloud permalinks, Bandcamp URLs and band IDs) as JSON. The app also writes the same format to `BACKUP/` automatically. This JSON covers artists only, so it can repopulate the artist list but not releases or settings.
@@ -109,7 +109,7 @@ Cover art for MusicBrainz releases is proxied through `/api/covers/{mbid}` and c
 ## Known Issues
 
 - **iTunes quirks:** iTunes provides no release type (everything is `collectionType=Album`), so suffix-based classification is used. Fixing this properly would require the modern Apple Music API key. The free Search/Lookup API is also capped at 200 collections per lookup and ~20 calls/min; the app detects a full lookup and adds one Search query for that artist, but extremely large catalogs may still be incomplete. Some releases only surface via UPC lookup. iTunes also exposes no follower counts, so search rows show album counts instead to help tell same-name artists apart.
-- **Bandcamp quirks:** Bandcamp has no public search API and its site search is bot-challenged, so artists are linked by pasting an `artist.bandcamp.com` URL (or via a MusicBrainz URL relationship). Custom-domain Bandcamp stores cannot be resolved automatically. Bandcamp has no EP type; album items are classified as albums unless the title marks itself as an EP, and track items are treated as singles.
+- **Bandcamp quirks:** Bandcamp has no official public search API; the app uses the autocomplete endpoint behind its site search, so results are best-effort and capped at roughly 50 bands. Custom-domain Bandcamp stores cannot be resolved automatically; pasting an `artist.bandcamp.com` URL (or using a MusicBrainz URL relationship) is the exact way to link one. Bandcamp has no EP type; album items are classified as albums unless the title marks itself as an EP, and track items are treated as singles.
 - **Near-duplicate titles:** Deduplication can still miss releases whose titles differ in ways no rule covers. Fully censored words (`****`) cannot be mapped to anything, by design.
 - **MusicBrainz credits:** The scan works at the *release group* level (individual releases are only fetched on demand for tracklists/streaming links), so credited artists don't appear during a release-group scan; those credits require a secondary, release-level scan.
 
@@ -123,7 +123,7 @@ Telegram support was dropped during a significant rewrite. Feel free to build yo
 | --- | --- |
 | Backend | Python, FastAPI, SQLite |
 | Frontend | Vanilla HTML/CSS/JS (dark theme) |
-| Data sources | [MusicBrainz API](https://musicbrainz.org/doc/MusicBrainz_API), [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI), [Bandcamp mobile API](https://bandcamp.com), [SoundCloud V2 API](https://soundcloud.com), no API keys required |
+| Data sources | [MusicBrainz API](https://musicbrainz.org/doc/MusicBrainz_API), [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI), [Bandcamp search/mobile API](https://bandcamp.com), [SoundCloud V2 API](https://soundcloud.com), no API keys required |
 
 ## Requirements
 

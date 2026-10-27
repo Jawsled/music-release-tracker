@@ -256,13 +256,19 @@ const _moreBtn = document.getElementById("search-more-btn");
 if (_moreBtn) _moreBtn.addEventListener("click", () => { _searchVisibleCount += SEARCH_PAGE_SIZE; renderSearchPage(); });
 
 // --- Search platform filter (which sources the Artists search queries) ---
-const SEARCH_SOURCES_ALL = ["musicbrainz", "itunes", "soundcloud"];
-const SEARCH_SOURCE_LABELS = { musicbrainz: "MB", itunes: "Apple", soundcloud: "SC" };
+const SEARCH_SOURCES_ALL = ["musicbrainz", "itunes", "bandcamp", "soundcloud"];
+const SEARCH_SOURCE_LABELS = { musicbrainz: "MB", itunes: "Apple", bandcamp: "BC", soundcloud: "SC" };
 let _searchSources = [...SEARCH_SOURCES_ALL];
 try {
   const saved = JSON.parse(localStorage.getItem("mrt_search_sources") || "null");
   if (Array.isArray(saved)) {
     const valid = saved.filter(s => SEARCH_SOURCES_ALL.includes(s));
+    // Selections saved before Bandcamp existed that included every old
+    // platform were effectively "All"; include Bandcamp for those users.
+    const oldAll = ["musicbrainz", "itunes", "soundcloud"];
+    if (valid.length && !valid.includes("bandcamp") && oldAll.every(s => valid.includes(s))) {
+      valid.push("bandcamp");
+    }
     if (valid.length) _searchSources = valid;
   }
 } catch { /* keep defaults */ }
@@ -300,8 +306,9 @@ function updateSearchSourceBtn() {
   if (!btn) return;
   const active = _searchSources.filter(s => _srcEnabled(s));
   const show = active.length ? active : _searchSources;
-  const full = show.map(s => ({ musicbrainz: "MusicBrainz", itunes: "Apple Music", soundcloud: "SoundCloud" }[s])).join(", ");
-  btn.textContent = (show.length === SEARCH_SOURCES_ALL.length ? "All" : show.map(s => SEARCH_SOURCE_LABELS[s]).join("+")) + " ▾";
+  const enabledAll = SEARCH_SOURCES_ALL.filter(s => _srcEnabled(s));
+  const full = show.map(s => ({ musicbrainz: "MusicBrainz", itunes: "Apple Music", bandcamp: "Bandcamp", soundcloud: "SoundCloud" }[s])).join(", ");
+  btn.textContent = (enabledAll.length && show.length === enabledAll.length ? "All" : show.map(s => SEARCH_SOURCE_LABELS[s]).join("+")) + " ▾";
   btn.title = `Search: ${full}. Click to choose platforms.`;
 }
 

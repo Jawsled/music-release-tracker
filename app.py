@@ -214,13 +214,12 @@ async def list_artists():
 
 @app.post("/api/artists/search")
 async def search_artists(body: ArtistSearchRequest):
-    """Search both MusicBrainz and iTunes in parallel, merge by name.
-    
-    Also supports pasting MBIDs, MusicBrainz URLs, or iTunes/Apple Music URLs
-    directly into the search bar.
-    
-    Returns combined results where matching names are merged into single entries
-    with both mbid and itunes_artist_id populated.
+    """Search the selected platforms and merge matching names into one row.
+
+    Supports pasting MBIDs, MusicBrainz URLs, Apple Music URLs, SoundCloud
+    permalinks and Bandcamp artist URLs directly into the search bar. Bandcamp
+    names use the autocomplete endpoint behind its site search; a pasted
+    Bandcamp URL resolves that exact profile.
     """
     import re as _re
 
@@ -307,8 +306,9 @@ async def search_artists(body: ArtistSearchRequest):
             except Exception:
                 pass
 
-    # Bandcamp has no usable name search (its site search is behind a bot
-    # challenge), so only URL/host pastes and the explicit link flow resolve.
+    # Bandcamp URL pastes resolve to the exact profile. The explicit link
+    # modal also passes source="bandcamp", which allows a name/handle search
+    # through the same endpoint the site's search box uses.
     bc_url_match = _re.match(
         r'^(?:https?://)?[A-Za-z0-9-]+\.bandcamp\.com(?:[/?#]|$)', query, _re.I
     )
@@ -368,10 +368,10 @@ async def search_artists(body: ArtistSearchRequest):
         # intersected with globally enabled sources. A bare permalink-like
         # word or spaced name also probes SoundCloud here instead of
         # short-circuiting it, so MB/iTunes results are never shadowed.
-        wanted = {s.lower() for s in (body.sources or ["musicbrainz", "itunes", "soundcloud"])}
-        wanted &= {"musicbrainz", "itunes", "soundcloud"}
+        wanted = {s.lower() for s in (body.sources or ["musicbrainz", "itunes", "bandcamp", "soundcloud"])}
+        wanted &= {"musicbrainz", "itunes", "bandcamp", "soundcloud"}
         if not wanted:
-            wanted = {"musicbrainz", "itunes", "soundcloud"}
+            wanted = {"musicbrainz", "itunes", "bandcamp", "soundcloud"}
         use = {s for s in wanted if s in enabled}
         if not use:
             return []
@@ -379,6 +379,12 @@ async def search_artists(body: ArtistSearchRequest):
         async def _search_sc():
             try:
                 return await soundcloud.search_artist(query)
+            except Exception:
+                return []
+
+        async def _search_bc():
+            try:
+                return await bandcamp.search_artist(query)
             except Exception:
                 return []
 
@@ -391,6 +397,7 @@ async def search_artists(body: ArtistSearchRequest):
         mb_results: list = []
         it_results: list = []
         sc_results: list = []
+        bc_results: list = []
         mb_confirmed: dict | None = None
         if "musicbrainz" in use:
             mb_results = await _search_mb()
@@ -423,12 +430,15 @@ async def search_artists(body: ArtistSearchRequest):
         # Skip a platform search when MB already confirmed that platform's link
         if "itunes" in use and not (mb_confirmed and mb_confirmed.get("itunes_artist_id")):
             coros["itunes"] = _search_itunes()
+        if "bandcamp" in use and not (mb_confirmed and mb_confirmed.get("bandcamp_url")):
+            coros["bandcamp"] = _search_bc()
         if "soundcloud" in use and not (mb_confirmed and mb_confirmed.get("soundcloud_permalink")):
             coros["soundcloud"] = _search_sc()
         if coros:
             gathered = await asyncio.gather(*coros.values())
             by_source = dict(zip(coros.keys(), gathered))
             it_results = by_source.get("itunes", [])
+            bc_results = by_source.get("bandcamp", [])
             sc_results = by_source.get("soundcloud", [])
 
         # Build lookup maps by normalized name
@@ -447,6 +457,17 @@ async def search_artists(body: ArtistSearchRequest):
             key = _normalize_name(r["name"])
             # First hit wins; exact slug matches come first from the prober
             sc_by_name.setdefault(key, r)
+
+        bc_by_name: dict[str, dict] = {}
+        for r in bc_results:
+            key = _normalize_name(r["name"])
+            # First hit wins; the search endpoint ranks exact matches first
+            bc_by_name.setdefault(key, r)
+
+        def _add_source_tag(entry: dict, tag: str) -> None:
+            parts = (entry.get("source") or "").split("+")
+            if tag not in parts:
+                entry["source"] = "+".join(parts + [tag])
 
         # Merge: combine matching names, keep all unique names
         merged: dict[str, dict] = {}
@@ -523,6 +544,32 @@ async def search_artists(body: ArtistSearchRequest):
                     "followers_count": r.get("followers_count"),
                 }
 
+        for key, r in bc_by_name.items():
+            if key in merged:
+                # Name match: link the Bandcamp profile into the entry
+                merged[key]["bandcamp_url"] = r.get("bandcamp_url")
+                merged[key]["bandcamp_band_id"] = r.get("bandcamp_band_id")
+                _add_source_tag(merged[key], "bc")
+                if r.get("artistImageUrl") and not merged[key].get("artistImageUrl"):
+                    merged[key]["artistImageUrl"] = r["artistImageUrl"]
+                # Prefer the higher score for ranking
+                merged[key]["score"] = max(merged[key].get("score", 0), r.get("score", 0))
+            else:
+                merged[key] = {
+                    "name": r["name"],
+                    "mbid": "",
+                    "itunes_artist_id": None,
+                    "soundcloud_permalink": None,
+                    "bandcamp_url": r.get("bandcamp_url"),
+                    "bandcamp_band_id": r.get("bandcamp_band_id"),
+                    "disambiguation": r.get("disambiguation", ""),
+                    "type": r.get("type", ""),
+                    "country": r.get("country", ""),
+                    "score": r.get("score", 0),
+                    "source": "bandcamp",
+                    "artistImageUrl": r.get("artistImageUrl", ""),
+                }
+
         # MB-confirmed IDs (from the skipped platform searches above) take
         # precedence over anything name-merged and are flagged so the UI can
         # show them as verified without refetching.
@@ -537,13 +584,11 @@ async def search_artists(body: ArtistSearchRequest):
                 if mb_confirmed.get("soundcloud_permalink"):
                     entry["soundcloud_permalink"] = mb_confirmed["soundcloud_permalink"]
                     entry["_confirmed_sc"] = True
-                    if entry.get("source") in ("musicbrainz", "itunes", "both"):
-                        entry["source"] += "+sc"
+                    _add_source_tag(entry, "sc")
                 if mb_confirmed.get("bandcamp_url"):
                     entry["bandcamp_url"] = mb_confirmed["bandcamp_url"]
                     entry["_confirmed_bc"] = True
-                    if entry.get("source") in ("musicbrainz", "itunes", "both"):
-                        entry["source"] += "+bc"
+                    _add_source_tag(entry, "bc")
                 entry["_mb_streaming"] = mb_confirmed.get("streaming") or []
                 entry["_mb_enriched"] = True
 

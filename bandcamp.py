@@ -8,6 +8,11 @@ import time
 import httpx
 
 MOBILE_API = "https://bandcamp.com/api/mobile/24"
+# Bandcamp's site search UI calls this internal autocomplete endpoint. It is
+# not officially documented, but it returns band profiles (id, host, name,
+# location, genre) as JSON and accepts a plain application User-Agent, unlike
+# the bot-challenged HTML search page.
+SEARCH_API = "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic"
 # Bandcamp's bot challenge flags browser-like User-Agents coming from
 # non-browser TLS fingerprints (Python/OpenSSL), returning a tiny JS challenge
 # page instead of the artist page. A plain application UA is served the real
@@ -89,15 +94,20 @@ async def _pace_request() -> None:
         await asyncio.sleep(delay)
 
 
-async def _request(url: str, params: dict | None = None) -> httpx.Response:
-    """GET with pacing and retries for throttling/network errors."""
+async def _request(
+    url: str,
+    params: dict | None = None,
+    method: str = "GET",
+    json: dict | None = None,
+) -> httpx.Response:
+    """GET/POST with pacing and retries for throttling/network errors."""
     last_err: Exception | None = None
     client = _get_client()
 
     for attempt in range(max(MAX_503_RETRIES, MAX_NET_RETRIES) + 1):
         await _pace_request()
         try:
-            resp = await client.get(url, params=params)
+            resp = await client.request(method, url, params=params, json=json)
             if resp.status_code in (429, 503) and attempt < MAX_503_RETRIES:
                 cooldown = COOLDOWN_503_RETRY if attempt > 0 else COOLDOWN_503
                 retry_after = resp.headers.get("Retry-After")
@@ -139,6 +149,11 @@ async def _get_json(url: str, params: dict | None = None) -> dict:
     return resp.json()
 
 
+async def _post_json(url: str, payload: dict) -> dict:
+    resp = await _request(url, method="POST", json=payload)
+    return resp.json()
+
+
 async def _get_text(url: str) -> str:
     resp = await _request(url)
     return resp.text
@@ -176,6 +191,12 @@ def _host_from_url(url: str) -> str:
     """Extract the host from a canonical Bandcamp URL."""
     match = re.match(r"^https?://([^/]+)", (url or "").strip(), re.I)
     return match.group(1).lower() if match else ""
+
+
+def _normalize_name(name: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace for name matching."""
+    folded = (name or "").casefold()
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", folded)).strip()
 
 
 def normalize_profile_url(value: str) -> str | None:
@@ -418,15 +439,89 @@ async def resolve_profile(value: str, band_id: str | None = None) -> dict | None
     return _store(_profile_cache, host, profile)
 
 
-async def search_artist(query: str) -> list[dict]:
-    """Resolve a pasted Bandcamp URL or handle to a single profile suggestion.
+async def _search_profiles(query: str) -> list[dict]:
+    """Search Bandcamp's autocomplete endpoint for artist profiles.
 
-    Bandcamp's site search sits behind a bot challenge, so there is no
-    name-based search here. Plain handles are probed as ``handle.bandcamp.com``
-    by the explicit link flow.
+    Returns Bandcamp-shaped profile dicts (the same keys as
+    ``resolve_profile``) ranked by the search endpoint. Bandcamp caps the
+    response at ~50 bands, which is plenty for a name lookup.
     """
-    profile = await resolve_profile(query)
-    return [profile] if profile else []
+    data = await _post_json(
+        SEARCH_API,
+        {
+            "search_text": query,
+            "search_filter": "b",  # bands/artists only (not albums or tracks)
+            "full_page": False,
+        },
+    )
+    auto = (data or {}).get("auto") or {}
+    results = auto.get("results") or []
+    wanted = _normalize_name(query)
+
+    profiles: list[dict] = []
+    seen_hosts: set[str] = set()
+    for index, item in enumerate(results):
+        if (item.get("type") or "b") != "b":
+            continue
+        host = _host_from_url(item.get("item_url_root") or "")
+        band_id = item.get("id")
+        if not host or not band_id or host in seen_hosts:
+            continue
+        # Only artist-hosted subdomains are valid profiles.
+        if not host.endswith(".bandcamp.com"):
+            continue
+        sub = host[: -len(".bandcamp.com")]
+        if not sub or sub in _RESERVED_SUBDOMAINS:
+            continue
+        seen_hosts.add(host)
+
+        name = (item.get("name") or "").strip() or host.split(".", 1)[0]
+        # Exact name matches outrank Bandcamp's fuzzy order; everything else
+        # keeps the endpoint's ranking (with a floor so results stay sortable).
+        score = 100 if _normalize_name(name) == wanted else max(50, 90 - index)
+        profiles.append({
+            "bandcamp_url": host,
+            "bandcamp_band_id": str(band_id),
+            "name": name,
+            "disambiguation": item.get("genre_name") or "",
+            "country": item.get("location") or "",
+            "score": score,
+            "source": "bandcamp",
+            "artistImageUrl": item.get("img") or "",
+            "item_urls": {},
+        })
+    return profiles
+
+
+async def search_artist(query: str) -> list[dict]:
+    """Search Bandcamp by name, or resolve a pasted URL/handle.
+
+    Full ``artist.bandcamp.com`` URLs resolve to that exact profile. Names use
+    Bandcamp's autocomplete endpoint. A bare handle is used as a last-resort
+    probe so the explicit link flow can still resolve a profile that the
+    name search does not return.
+    """
+    text = (query or "").strip()
+    if not text:
+        return []
+
+    if _URL_RE.match(text):
+        profile = await resolve_profile(text)
+        return [profile] if profile else []
+
+    try:
+        profiles = await _search_profiles(text)
+    except Exception as e:
+        logger.warning(f"Bandcamp search failed for {text!r}: {e}")
+        profiles = []
+    if profiles:
+        return profiles
+
+    # Last resort: a plain handle ("clppng") can still be probed directly.
+    if _HANDLE_RE.match(text):
+        profile = await resolve_profile(text)
+        return [profile] if profile else []
+    return []
 
 
 # ---------------------------------------------------------------------------

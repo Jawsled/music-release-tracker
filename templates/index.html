@@ -200,13 +200,14 @@
         <section id="tab-artists" class="tab-content">
             <div class="search-bar">
                 <div class="search-box">
-                    <input type="text" id="artist-search-input" placeholder="Search MusicBrainz, iTunes and SoundCloud, or paste URL" aria-label="Search artists">
+                    <input type="text" id="artist-search-input" placeholder="Search MusicBrainz, iTunes, Bandcamp and SoundCloud, or paste URL" aria-label="Search artists">
                     <div class="search-divider" aria-hidden="true"></div>
                     <div class="filter-dropdown" id="search-source-wrapper">
                         <button type="button" class="search-source-btn" id="search-source-btn" data-action="toggle-search-source-menu" aria-haspopup="true" aria-expanded="false" title="Choose which platforms to search">All ▾</button>
                         <div class="dropdown-menu hidden" id="search-source-menu">
                             <label class="dropdown-check"><input type="checkbox" data-source="musicbrainz" data-change-action="update-search-sources"> MusicBrainz</label>
                             <label class="dropdown-check"><input type="checkbox" data-source="itunes" data-change-action="update-search-sources"> Apple Music</label>
+                            <label class="dropdown-check"><input type="checkbox" data-source="bandcamp" data-change-action="update-search-sources"> Bandcamp</label>
                             <label class="dropdown-check"><input type="checkbox" data-source="soundcloud" data-change-action="update-search-sources"> SoundCloud</label>
                         </div>
                     </div>
@@ -258,7 +259,7 @@
 
     <script src="/static/js/core.js?v=25"></script>
     <script src="/static/js/feed.js?v=27"></script>
-    <script src="/static/js/artists.js?v=25"></script>
+    <script src="/static/js/artists.js?v=26"></script>
     <script src="/static/js/check.js?v=24"></script>
     <script src="/static/js/misc.js?v=24"></script>
     <script src="/static/js/panels.js?v=25"></script>
