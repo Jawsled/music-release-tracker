@@ -12,7 +12,7 @@ from pathlib import Path
 DB_PATH = str(Path(__file__).resolve().parent / "music-release-tracker.db")
 
 # Bump when the artist export gains a field so importers can adapt.
-ARTISTS_EXPORT_VERSION = 3
+ARTISTS_EXPORT_VERSION = 4
 # Number of automatic artist JSON snapshots kept in BACKUP/.
 ARTIST_BACKUP_KEEP = 30
 
@@ -160,6 +160,10 @@ def init_db():
         "ALTER TABLE releases ADD COLUMN hidden_reason TEXT DEFAULT ''",
         "ALTER TABLE releases ADD COLUMN duplicate_of INTEGER",
         "ALTER TABLE releases ADD COLUMN dedup_ignored INTEGER DEFAULT 0",
+        "ALTER TABLE artists ADD COLUMN bandcamp_url TEXT",
+        "ALTER TABLE artists ADD COLUMN bandcamp_band_id TEXT",
+        "ALTER TABLE releases ADD COLUMN bandcamp_item_id TEXT",
+        "ALTER TABLE releases ADD COLUMN bandcamp_item_type TEXT",
     ]
     for sql in migrations:
         try:
@@ -200,12 +204,14 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_releases_artist_itunes ON releases(artist_id, itunes_collection_id)",
         "CREATE INDEX IF NOT EXISTS idx_releases_artist_sc_track ON releases(artist_id, soundcloud_track_id)",
         "CREATE INDEX IF NOT EXISTS idx_releases_artist_sc_playlist ON releases(artist_id, soundcloud_playlist_id)",
+        "CREATE INDEX IF NOT EXISTS idx_releases_artist_bc ON releases(artist_id, bandcamp_item_id)",
         "CREATE INDEX IF NOT EXISTS idx_releases_unseen ON releases(notified, is_visible)",
         "CREATE INDEX IF NOT EXISTS idx_releases_visible_date ON releases(is_visible, release_date, first_seen_at)",
         "CREATE INDEX IF NOT EXISTS idx_releases_hidden_reason ON releases(is_visible, hidden_reason)",
         "CREATE INDEX IF NOT EXISTS idx_artists_mbid ON artists(mbid)",
         "CREATE INDEX IF NOT EXISTS idx_artists_itunes ON artists(itunes_artist_id)",
         "CREATE INDEX IF NOT EXISTS idx_artists_sc ON artists(soundcloud_permalink)",
+        "CREATE INDEX IF NOT EXISTS idx_artists_bc ON artists(bandcamp_url)",
     ]
     for sql in indexes:
         try:
@@ -300,6 +306,8 @@ def _artists_export_payload(artists: list[dict]) -> dict:
                 "disambiguation": a.get("disambiguation", "") or "",
                 "itunes_artist_id": a.get("itunes_artist_id"),
                 "soundcloud_permalink": a.get("soundcloud_permalink"),
+                "bandcamp_url": a.get("bandcamp_url"),
+                "bandcamp_band_id": a.get("bandcamp_band_id"),
             }
             for a in artists
         ],
@@ -391,19 +399,26 @@ def add_artist(
     disambiguation: str = "",
     itunes_artist_id: int | None = None,
     soundcloud_permalink: str | None = None,
+    bandcamp_url: str | None = None,
+    bandcamp_band_id: str | None = None,
 ) -> dict:
     conn = get_db()
-    conn.execute(
-        "INSERT INTO artists (mbid, name, disambiguation, itunes_artist_id, soundcloud_permalink, added_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (mbid, name, disambiguation, itunes_artist_id, soundcloud_permalink, _now_iso()),
+    cursor = conn.execute(
+        "INSERT INTO artists (mbid, name, disambiguation, itunes_artist_id, "
+        "soundcloud_permalink, bandcamp_url, bandcamp_band_id, added_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            mbid, name, disambiguation, itunes_artist_id,
+            soundcloud_permalink, bandcamp_url, bandcamp_band_id, _now_iso(),
+        ),
     )
     _maybe_commit()
-    if soundcloud_permalink:
-        row = conn.execute("SELECT * FROM artists WHERE soundcloud_permalink = ?", (soundcloud_permalink,)).fetchone()
-    elif itunes_artist_id:
-        row = conn.execute("SELECT * FROM artists WHERE itunes_artist_id = ?", (itunes_artist_id,)).fetchone()
-    else:
-        row = conn.execute("SELECT * FROM artists WHERE mbid = ?", (mbid,)).fetchone()
+    # Return the row that was just inserted. Looking it up by source ID could
+    # return an older row when two artists share a profile URL (e.g. a
+    # duplicated import), which would mix their releases.
+    row = conn.execute(
+        "SELECT * FROM artists WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
     return dict(row)
 
 
@@ -479,13 +494,24 @@ def get_artist_by_soundcloud_permalink(permalink: str) -> dict | None:
     return dict(row) if row else None
 
 
+def get_artist_by_bandcamp_url(bandcamp_url: str) -> dict | None:
+    """Look up an artist by their Bandcamp host (artist.bandcamp.com)."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM artists WHERE bandcamp_url = ?", (bandcamp_url,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def link_artist(
     artist_id: int,
     mbid: str,
     itunes_artist_id: int | None,
     soundcloud_permalink: str | None = None,
+    bandcamp_url: str | None = None,
+    bandcamp_band_id: str | None = None,
 ) -> dict:
-    """Link a MusicBrainz, iTunes, or SoundCloud ID to an existing artist entry."""
+    """Link a MusicBrainz, iTunes, SoundCloud, or Bandcamp ID to an artist."""
     conn = get_db()
     if mbid:
         conn.execute(
@@ -501,6 +527,34 @@ def link_artist(
         conn.execute(
             "UPDATE artists SET soundcloud_permalink = ? WHERE id = ?",
             (soundcloud_permalink, artist_id),
+        )
+    if bandcamp_url:
+        current = conn.execute(
+            "SELECT bandcamp_url FROM artists WHERE id = ?", (artist_id,)
+        ).fetchone()
+        url_changed = current is None or (current["bandcamp_url"] or "") != bandcamp_url
+        if bandcamp_band_id:
+            conn.execute(
+                "UPDATE artists SET bandcamp_url = ?, bandcamp_band_id = ? WHERE id = ?",
+                (bandcamp_url, str(bandcamp_band_id), artist_id),
+            )
+        elif url_changed:
+            # New profile without a resolved band id: clear the stale id so
+            # tracklist lookups cannot hit the previous band.
+            conn.execute(
+                "UPDATE artists SET bandcamp_url = ?, bandcamp_band_id = NULL "
+                "WHERE id = ?",
+                (bandcamp_url, artist_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE artists SET bandcamp_url = ? WHERE id = ?",
+                (bandcamp_url, artist_id),
+            )
+    elif bandcamp_band_id:
+        conn.execute(
+            "UPDATE artists SET bandcamp_band_id = ? WHERE id = ?",
+            (str(bandcamp_band_id), artist_id),
         )
     _maybe_commit()
     row = conn.execute("SELECT * FROM artists WHERE id = ?", (artist_id,)).fetchone()
@@ -559,6 +613,47 @@ def unlink_artist_soundcloud(artist_id: int) -> dict:
     return dict(row)
 
 
+def unlink_artist_bandcamp(artist_id: int) -> dict:
+    """Remove Bandcamp IDs from an artist entry and delete its BC releases."""
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM releases WHERE artist_id = ? AND source = 'bandcamp'",
+        (artist_id,),
+    )
+    conn.execute(
+        "UPDATE artists SET bandcamp_url = NULL, bandcamp_band_id = NULL "
+        "WHERE id = ?",
+        (artist_id,),
+    )
+    _maybe_commit()
+    row = conn.execute("SELECT * FROM artists WHERE id = ?", (artist_id,)).fetchone()
+    return dict(row)
+
+
+def get_artist_bandcamp_item_ids(artist_id: int) -> set[str]:
+    """Item ids already stored for an artist's Bandcamp source.
+
+    Lets a scan skip per-release detail requests for releases it already has.
+    """
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT bandcamp_item_id FROM releases "
+        "WHERE artist_id = ? AND source = 'bandcamp' AND bandcamp_item_id IS NOT NULL",
+        (artist_id,),
+    ).fetchall()
+    return {str(r["bandcamp_item_id"]) for r in rows if r["bandcamp_item_id"]}
+
+
+def set_artist_bandcamp_band_id(artist_id: int, bandcamp_band_id: str) -> None:
+    """Persist a resolved Bandcamp band id (tracklists need the numeric id)."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE artists SET bandcamp_band_id = ? WHERE id = ?",
+        (str(bandcamp_band_id), artist_id),
+    )
+    _maybe_commit()
+
+
 def update_artist_disambiguation(artist_id: int, disambiguation: str) -> dict | None:
     """Set a tracked artist's disambiguation note (free text, may be empty)."""
     conn = get_db()
@@ -593,6 +688,8 @@ def add_release(
     credits: str = "",
     soundcloud_track_id: str | None = None,
     soundcloud_playlist_id: str | None = None,
+    bandcamp_item_id: str | None = None,
+    bandcamp_item_type: str | None = None,
     return_id: bool = False,
     track_titles: list[str] | None = None,
 ) -> bool | int:
@@ -619,6 +716,8 @@ def add_release(
         unique_key = itunes_collection_id or mbid
     elif source == "soundcloud":
         unique_key = soundcloud_playlist_id or soundcloud_track_id or mbid
+    elif source == "bandcamp":
+        unique_key = bandcamp_item_id or mbid
     else:
         unique_key = mbid
 
@@ -632,6 +731,11 @@ def add_release(
         existing = conn.execute(
             "SELECT id, release_date, credits, mb_url, track_titles FROM releases WHERE artist_id = ? AND soundcloud_track_id = ?",
             (artist_id, soundcloud_track_id),
+        ).fetchone()
+    elif bandcamp_item_id:
+        existing = conn.execute(
+            "SELECT id, release_date, credits, mb_url, track_titles FROM releases WHERE artist_id = ? AND bandcamp_item_id = ?",
+            (artist_id, bandcamp_item_id),
         ).fetchone()
     elif itunes_collection_id:
         existing = conn.execute(
@@ -682,9 +786,9 @@ def add_release(
 
     cursor = conn.execute(
         """INSERT INTO releases
-           (mbid, artist_id, source, title, release_type, release_date, first_seen_at, notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id, track_titles)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (unique_key, artist_id, source, title, release_type, release_date, _now_iso(), notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id, _track_titles_json(track_titles)),
+           (mbid, artist_id, source, title, release_type, release_date, first_seen_at, notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id, bandcamp_item_id, bandcamp_item_type, track_titles)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (unique_key, artist_id, source, title, release_type, release_date, _now_iso(), notified, mb_url, itunes_collection_id, artwork_url, credits, soundcloud_track_id, soundcloud_playlist_id, bandcamp_item_id, bandcamp_item_type, _track_titles_json(track_titles)),
     )
     _maybe_commit()
     return cursor.lastrowid if return_id else True
@@ -758,6 +862,7 @@ def get_releases(
     query = (
         "SELECT r.*, a.name as artist_name, a.mbid as artist_mbid, "
         "a.soundcloud_permalink as artist_soundcloud_permalink, "
+        "a.bandcamp_url as artist_bandcamp_url, "
         "d.title as duplicate_title, "
         "d.release_type as duplicate_release_type, "
         "d.release_date as duplicate_release_date, "
@@ -866,9 +971,15 @@ def restore_dedup_release(release_id: int):
 
 
 # Source preference when choosing which copy of a duplicate survives.
-# MusicBrainz is authoritative; iTunes and SoundCloud are complementary and
-# only fill in releases MB has no entry for (yet).
-SOURCE_PRIORITY = {"musicbrainz": 0, "itunes": 1, "soundcloud": 2}
+# MusicBrainz is authoritative; iTunes and Bandcamp are complementary and
+# only fill in releases MB has no entry for (yet). Bandcamp outranks
+# SoundCloud because its album/EP pages carry richer release metadata.
+SOURCE_PRIORITY = {
+    "musicbrainz": 0,
+    "itunes": 1,
+    "bandcamp": 2,
+    "soundcloud": 3,
+}
 
 
 def source_priority(source: str) -> int:

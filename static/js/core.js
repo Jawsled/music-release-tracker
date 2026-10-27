@@ -99,6 +99,7 @@ function sourceIcon(source, size = 16) {
   const icons = {
     musicbrainz: '/static/assets/musicbrainz.svg',
     itunes: '/static/assets/apple-music.svg',
+    bandcamp: '/static/assets/bandcamp.svg',
     soundcloud: '/static/assets/soundcloud.svg'
   };
   const src = icons[source];

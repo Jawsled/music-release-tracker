@@ -522,7 +522,7 @@ function renderTrackedArtists() {
   if (!visible.length) {
     artistListEl.innerHTML = activeTrackedFilterId
       ? '<div class="empty-wrap"><h3>Artist not found</h3><p>The selected artist is no longer tracked.</p></div>'
-      : '<div class="empty-wrap"><h3>No artists tracked yet</h3><p>Search above or paste a MusicBrainz / Apple Music / SoundCloud link.</p></div>';
+      : '<div class="empty-wrap"><h3>No artists tracked yet</h3><p>Search above or paste a MusicBrainz / Apple Music / Bandcamp / SoundCloud link.</p></div>';
     return;
   }
   artistListEl.innerHTML = visible.map(renderTrackedArtistItem).join("");
@@ -994,6 +994,7 @@ function initialsFor(name) {
 function sourceLabel(source) {
   if (source === "musicbrainz") return "MusicBrainz";
   if (source === "itunes") return "Apple Music";
+  if (source === "bandcamp") return "Bandcamp";
   if (source === "soundcloud") return "SoundCloud";
   return source || "";
 }
@@ -1067,6 +1068,9 @@ function renderReleaseCard(r) {
     viewUrl = `https://music.apple.com/us/album/${esc(r.title.toLowerCase().replace(/[^a-z0-9]/g, ''))}/${r.itunes_collection_id}`;
   } else if (source === "itunes" && r.mb_url) {
     viewUrl = r.mb_url;
+  } else if (source === "bandcamp") {
+    // Bandcamp: stored canonical album/track URL, else the artist profile.
+    viewUrl = r.mb_url || (r.artist_bandcamp_url ? `https://${r.artist_bandcamp_url}` : `https://bandcamp.com/search?q=${encodeURIComponent(`${r.artist_name} ${r.title}`)}`);
   } else {
     // MusicBrainz default
     viewUrl = r.mb_url || `https://musicbrainz.org/release-group/${r.mbid}`;
@@ -1080,6 +1084,8 @@ function renderReleaseCard(r) {
   if (source === 'soundcloud' && r.artwork_url) {
     coverUrl = r.artwork_url;
   } else if (source === 'itunes' && r.artwork_url) {
+    coverUrl = r.artwork_url;
+  } else if (source === 'bandcamp' && r.artwork_url) {
     coverUrl = r.artwork_url;
   } else if (source === 'musicbrainz' && r.mbid) {
     coverUrl = `/api/covers/${encodeURIComponent(r.mbid)}`;
@@ -1134,7 +1140,7 @@ function renderReleaseCard(r) {
           </div>
         </div>
         <div class="release-actions">
-          <a class="release-source-link" href="${esc(viewUrl)}" target="_blank" rel="noopener" title="View on ${source === 'musicbrainz' ? 'MusicBrainz' : source === 'itunes' ? 'Apple Music' : 'SoundCloud'}">
+          <a class="release-source-link" href="${esc(viewUrl)}" target="_blank" rel="noopener" title="View on ${source === 'musicbrainz' ? 'MusicBrainz' : source === 'itunes' ? 'Apple Music' : source === 'bandcamp' ? 'Bandcamp' : 'SoundCloud'}">
             ${sourceBadge}
           </a>
           ${r.notified === 0 ? `<button class="release-badge"${dataAttrs({ action: "mark-seen", id: r.id })} aria-label="Mark ${esc(r.title)} as seen">NEW</button>` : ""}

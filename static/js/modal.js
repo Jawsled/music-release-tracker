@@ -16,17 +16,26 @@ function openLinkSourceModal(artistId, artistName, source) {
   currentLinkArtistId = artistId;
   currentLinkSource = source;
 
-  const label = source === "musicbrainz" ? "MusicBrainz" : source === "itunes" ? "Apple Music" : source === "soundcloud" ? "SoundCloud" : "Source";
+  const label = source === "musicbrainz" ? "MusicBrainz"
+    : source === "itunes" ? "Apple Music"
+    : source === "bandcamp" ? "Bandcamp"
+    : source === "soundcloud" ? "SoundCloud"
+    : "Source";
   linkSourceTitle.textContent = `Link ${label} for ${artistName}`;
   document.getElementById("link-source-hint").textContent =
     source === "soundcloud"
       ? "Paste a SoundCloud URL or permalink, then Search."
-      : `Showing matches for “${artistName}” — refine or paste a link, then Search.`;
+      : source === "bandcamp"
+        ? "Paste a Bandcamp artist URL (artist.bandcamp.com), then Search. Bandcamp has no name search."
+        : `Showing matches for “${artistName}” — refine or paste a link, then Search.`;
 
-  // Always visible input, pre-filled with artist name (or guessed SC URL)
+  // Always visible input, pre-filled with artist name (or guessed profile URL)
   if (source === "soundcloud") {
     const slug = artistName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     linkSourceInput.value = `https://soundcloud.com/${slug}`;
+  } else if (source === "bandcamp") {
+    const slug = artistName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    linkSourceInput.value = `https://${slug}.bandcamp.com`;
   } else {
     linkSourceInput.value = artistName;
   }
@@ -65,6 +74,7 @@ async function searchLinkSource(query) {
         query,
         source: currentLinkSource === "musicbrainz" ? "musicbrainz" :
                 currentLinkSource === "itunes" ? "itunes" :
+                currentLinkSource === "bandcamp" ? "bandcamp" :
                 currentLinkSource === "soundcloud" ? "soundcloud" : ""
       },
       allowError: true,
@@ -119,6 +129,9 @@ async function linkSource(artist, btn, force = false) {
     } else if (currentLinkSource === "itunes" && artist.itunes_artist_id) {
       sourceToLink = "itunes";
       idToLink = String(artist.itunes_artist_id);
+    } else if (currentLinkSource === "bandcamp" && artist.bandcamp_url) {
+      sourceToLink = "bandcamp";
+      idToLink = artist.bandcamp_url;
     } else if (currentLinkSource === "soundcloud" && artist.soundcloud_permalink) {
       sourceToLink = "soundcloud";
       idToLink = artist.soundcloud_permalink;
@@ -130,6 +143,9 @@ async function linkSource(artist, btn, force = false) {
       } else if (artist.itunes_artist_id) {
         sourceToLink = "itunes";
         idToLink = String(artist.itunes_artist_id);
+      } else if (artist.bandcamp_url) {
+        sourceToLink = "bandcamp";
+        idToLink = artist.bandcamp_url;
       } else if (artist.soundcloud_permalink) {
         sourceToLink = "soundcloud";
         idToLink = artist.soundcloud_permalink;
@@ -154,6 +170,11 @@ async function linkSource(artist, btn, force = false) {
     // next to the tracked name ("Avicii").
     if (sourceToLink === "soundcloud" && currentLinkArtistId != null) {
       payload.artist_id = currentLinkArtistId;
+      if (force) payload.force = true;
+    }
+    if (sourceToLink === "bandcamp" && currentLinkArtistId != null) {
+      payload.artist_id = currentLinkArtistId;
+      if (artist.bandcamp_band_id) payload.bandcamp_band_id = artist.bandcamp_band_id;
       if (force) payload.force = true;
     }
 

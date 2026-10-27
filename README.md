@@ -1,6 +1,6 @@
 # Music Release Tracker
 
-A local-first desktop app that tracks new releases with webUI. Powered by [MusicBrainz](https://musicbrainz.org/), [iTunes](https://music.apple.com) and [SoundCloud](https://soundcloud.com). No account required.
+A local-first desktop app that tracks new releases with webUI. Powered by [MusicBrainz](https://musicbrainz.org/), [iTunes](https://music.apple.com), [Bandcamp](https://bandcamp.com) and [SoundCloud](https://soundcloud.com). No account required.
 
 ![Theme](https://img.shields.io/badge/theme-dark-1a1a2e) ![Python](https://img.shields.io/badge/python-3.8%2B-bb86fc) ![License: MIT](https://img.shields.io/badge/license-MIT-03dac6)
 
@@ -8,14 +8,16 @@ A local-first desktop app that tracks new releases with webUI. Powered by [Music
 
 ## Features
 
-- **Artist search:** Search MusicBrainz, iTunes and SoundCloud by name (platform filter included in the search box), or paste an MBID, a MusicBrainz / Apple Music / SoundCloud URL, or a SoundCloud permalink. Preview buttons and pills let you confirm you're adding the right artist before you commit.
+- **Artist search:** Search MusicBrainz, iTunes and SoundCloud by name (platform filter included in the search box), or paste an MBID, a MusicBrainz / Apple Music / Bandcamp / SoundCloud URL, or a SoundCloud permalink. Preview buttons and pills let you confirm you're adding the right artist before you commit.
 - **SoundCloud suggestions:** SoundCloud has no text search API, so display names are probed as profile URL variants. Each suggestion shows the live follower count, which is usually the fastest way to tell same-name profiles apart. iTunes rows show album counts for the same reason.
+- **Bandcamp (opt-in):** Bandcamp has no usable name search either, so it works like SoundCloud: paste an `artist.bandcamp.com` URL (or use *Link Bandcamp* on a tracked artist) and the app resolves the band id from the artist page. When an artist's MusicBrainz page lists a Bandcamp URL, search rows show it as an MB-confirmed link. Bandcamp is off by default because it targets exclusive / non-streaming releases rather than duplicating streaming catalogs; enable it under Settings → Sources.
+- **iTunes completeness:** The iTunes Lookup API is capped at 200 collections and ignores `offset`. When a lookup comes back full, the app runs one Search API query for that artist (ranked by relevance) and merges the results by `collectionId`, so releases beyond the cap and releases filed under a duplicate Apple artist entry still appear. Requests are paced at ~20/min to stay inside Apple's documented limit. Collaborations are matched on `artist_name` too, so a co-primary credit is kept even when Apple assigns the collection to another artist's ID; featured-only appearances stay out.
 - **Release feed:** Browse albums, EPs, singles and other releases sorted by date; filter by artist, release type, new-only, or hidden-only.
 - **Tracklists:** Fetch tracklists for album and EP releases, including track numbers, durations and featured-artist credits. Tracks also released as visible singles get a `SINGLE` badge.
 - **Streaming links:** Fetch external streaming links listed on the MusicBrainz release page (Spotify, Apple Music, Tidal, and more).
-- **Duplicate handling:** MusicBrainz is the authoritative source: matching iTunes/SoundCloud copies are stored and then hidden by dedup, so those sources only fill in releases MB doesn't cover (yet) and every fetched copy remains recoverable in the Hidden view. Matching compares normalized title **and release type**, with Album and EP treated as one long-form family because iTunes/SoundCloud routinely report EPs as albums — so an MB EP wins over their album copy, while a single with the same name stays visible. MusicBrainz copies of the same type are collapsed to one, and same-source album/EP rows are kept distinct. SoundCloud album/EP tracklists are stored too: a SoundCloud Single that appears on an album/EP tracklist and landed within a day of the album is treated as an album track and hidden, while an earlier upload stays visible as a standalone single. User-defined title ignore rules (triggered by the Dedup task) strip noise like `- Single`, `- EP`, `(DJ Mix)` or `(feat. ...)` suffixes before comparing titles. Explicit-word mappings reconcile censored Apple Music titles. Dedup records why it hid a release (see [Hidden releases](#hidden-releases)), so manual hides/restores are respected and removing a rule restores releases that are no longer duplicates.
+- **Duplicate handling:** MusicBrainz is the authoritative source: matching iTunes/Bandcamp/SoundCloud copies are stored and then hidden by dedup, so those sources only fill in releases MB doesn't cover (yet) and every fetched copy remains recoverable in the Hidden view. Matching compares normalized title **and release type**, with Album and EP treated as one long-form family because iTunes/SoundCloud routinely report EPs as albums — so an MB EP wins over their album copy, while a single with the same name stays visible. MusicBrainz copies of the same type are collapsed to one, and same-source album/EP rows are kept distinct. SoundCloud album/EP tracklists are stored too: a SoundCloud Single that appears on an album/EP tracklist and landed within a day of the album is treated as an album track and hidden, while an earlier upload stays visible as a standalone single. User-defined title ignore rules (triggered by the Dedup task) strip noise like `- Single`, `- EP`, `(DJ Mix)` or `(feat. ...)` suffixes before comparing titles. Explicit-word mappings reconcile censored Apple Music titles. Dedup records why it hid a release (see [Hidden releases](#hidden-releases)), so manual hides/restores are respected and removing a rule restores releases that are no longer duplicates.
 - **New release detection:** "Check All Artists" scans every tracked artist (or just the one selected in the feed filter) and highlights new finds with a `NEW` badge. Scans can be paused/resumed, play a chime on completion, and log everything to the Scan Logs panel.
-- **Sources:** Each data source can be toggled in Settings. Disabled sources are skipped when scanning and hidden across search, artist icons and link options. Existing releases are never touched by toggling.
+- **Sources:** Each data source can be toggled in Settings. Disabled sources are skipped when scanning and hidden across search, artist icons and link options. Bandcamp starts disabled (opt-in); MusicBrainz, iTunes and SoundCloud start enabled. Existing releases are never touched by toggling.
 - **Hide / unhide:** Hide individual releases from the feed (with undo), or review everything hidden via the Hidden only filter.
 - **Artist notes:** The 3-dot menu on each tracked artist lets you edit a free-text note, check a single artist, link or unlink sources, and untrack.
 - **Logs:** The Scan Logs panel streams scan activity with level filters, text search and pause.
@@ -54,10 +56,10 @@ A `Music-Release-Tracker (conda).bat` launcher is included if you prefer running
 
 ### Artists
 
-- **Search:** Queries the MusicBrainz, iTunes and SoundCloud APIs (whichever platforms are selected and enabled). Names matching across platforms merge into one row so you can link everything at once.
-- **Manual query:** If search comes up empty, paste an MBID, a full MusicBrainz / Apple Music / SoundCloud URL, or a SoundCloud permalink.
+- **Search:** Queries the MusicBrainz, iTunes and SoundCloud APIs (whichever platforms are selected and enabled). Names matching across platforms merge into one row so you can link everything at once. Bandcamp is not part of name search (its site search is bot-challenged); paste a Bandcamp URL instead.
+- **Manual query:** If search comes up empty, paste an MBID, a full MusicBrainz / Apple Music / Bandcamp / SoundCloud URL, or a SoundCloud permalink.
 - **Linking:** Already have an artist added via one source? Link the other sources to the same entry. Unlinking asks for confirmation inline, then removes that source's releases for the artist from the database.
-- **Import / Export:** Import/export artist entries (name, MBIDs, iTunes IDs, SoundCloud permalinks) as JSON. The app also writes the same format to `BACKUP/` automatically. This JSON covers artists only, so it can repopulate the artist list but not releases or settings.
+- **Import / Export:** Import/export artist entries (name, MBIDs, iTunes IDs, SoundCloud permalinks, Bandcamp URLs and band IDs) as JSON. The app also writes the same format to `BACKUP/` automatically. This JSON covers artists only, so it can repopulate the artist list but not releases or settings.
 - **Sorting:** The tracked artists list sorts alphabetically, case-insensitively, with accented characters folded to their base letters.
 
 ### Feed
@@ -71,7 +73,7 @@ A `Music-Release-Tracker (conda).bat` launcher is included if you prefer running
 - **Duplicate handling:** Scans store every release each enabled source returns, then run dedup afterwards; duplicates are registered and hidden instead of being skipped at fetch time. Album and track titles are then normalized and compared to detect duplicates as accurately as possible using release titles, album/EP titles, tracklists and (for SoundCloud) release dates. For details, see [Hidden releases](#hidden-releases).
 - **New-only checkbox:** Shows only entries marked `NEW`. "New" here means *newly added to the database*. This has nothing to do with release dates. Dismiss badges individually with a click or via `Mark All as Seen` button at the top.
 - **Hidden only checkbox:** Shows every hidden release — manual hides plus copies dedup set aside — with the reason and, for dedup hides, the surviving copy or owning album. Each row has an Unhide action. Unhiding a dedup copy also marks it as user-preferred so a later dedup pass leaves it visible.
-- **Tracklist:** Fetched from MusicBrainz/iTunes/SoundCloud for anything other than singles, with a copy button to quickly copy the entire list.
+- **Tracklist:** Fetched from MusicBrainz/iTunes/Bandcamp/SoundCloud for anything other than singles, with a copy button to quickly copy the entire list.
 - **`SINGLE` badge:** Purely local: matches track titles against the artist's visible single releases, so hidden duplicate copies never add a badge.
 
 ### Hidden releases
@@ -81,7 +83,7 @@ Hidden rows are never deleted. The Hidden only filter lists all of them, shows t
 | `hidden_reason` | Meaning | What happens next |
 | --- | --- | --- |
 | `manual` | User manually hid it from the feed. | Stays hidden; scans and dedup never change it. If it was the visible winner, dedup can restore the best remaining copy. |
-| `dedup_title` | Another copy of the same normalized title and release-type family survived dedup (MusicBrainz > iTunes > SoundCloud; same-source copies collapse to one). `duplicate_of` points at that surviving copy. | Each dedup pass re-checks it: it is restored if the duplicate disappears, or stays hidden if a higher-priority copy takes over. |
+| `dedup_title` | Another copy of the same normalized title and release-type family survived dedup (MusicBrainz > iTunes > Bandcamp > SoundCloud; same-source copies collapse to one). `duplicate_of` points at that surviving copy. | Each dedup pass re-checks it: it is restored if the duplicate disappears, or stays hidden if a higher-priority copy takes over. |
 | `dedup_track` | The Single's title appears on an album/EP tracklist, so it is an album track rather than a standalone single. `duplicate_of` points at that album/EP row — which may itself be hidden as a duplicate. MusicBrainz tracklists always match; SoundCloud tracklists only match when the Single was uploaded within one day of the album. | Each dedup pass re-checks it: it is restored if the tracklist entry or album disappears or, for SoundCloud tracklists, if the date no longer falls in the window. |
 | `''` (empty) | Hidden by an older version, before reasons were recorded. | Treated as unknown: dedup leaves it alone; Unhide still works. |
 
@@ -93,8 +95,8 @@ SQLite database (`music-release-tracker.db`) with four active tables. Older data
 
 | Table | Columns |
 | --- | --- |
-| `artists` | internal ID, `mbid`, `name`, `disambiguation`, `itunes_artist_id`, `soundcloud_permalink`, `added_at` |
-| `releases` | internal ID, `mbid` (iTunes/SoundCloud IDs also live here), artist ID, `source` (`musicbrainz`/`itunes`/`soundcloud`), `title`, `release_type`, `release_date`, `first_seen_at`, `notified`, `release_day_notified` *(reserved, currently unused)*, `mb_url`, `itunes_collection_id`, `soundcloud_track_id`, `soundcloud_playlist_id`, `artwork_url`, `credits`, `track_titles`, `is_visible`, `hidden_reason`, `duplicate_of`, `dedup_ignored` |
+| `artists` | internal ID, `mbid`, `name`, `disambiguation`, `itunes_artist_id`, `soundcloud_permalink`, `bandcamp_url`, `bandcamp_band_id`, `added_at` |
+| `releases` | internal ID, `mbid` (iTunes/Bandcamp/SoundCloud IDs also live here), artist ID, `source` (`musicbrainz`/`itunes`/`bandcamp`/`soundcloud`), `title`, `release_type`, `release_date`, `first_seen_at`, `notified`, `release_day_notified` *(reserved, currently unused)*, `mb_url`, `itunes_collection_id`, `soundcloud_track_id`, `soundcloud_playlist_id`, `bandcamp_item_id`, `bandcamp_item_type`, `artwork_url`, `credits`, `track_titles`, `is_visible`, `hidden_reason`, `duplicate_of`, `dedup_ignored` |
 | `meta` | key/value store for settings (keys prefixed with `setting_`) and internal state |
 | `api_cache` | upstream response cache: `key` (`<kind>:<id>`), `value` (JSON), `fetched_at` |
 
@@ -106,7 +108,8 @@ Cover art for MusicBrainz releases is proxied through `/api/covers/{mbid}` and c
 
 ## Known Issues
 
-- **iTunes quirks:** iTunes provides no release type (everything is `collectionType=Album`), so suffix-based classification is used. Fixing this properly would require the modern Apple Music API key. Also the iTunes catalog is less frequently maintained. Some releases only surface via UPC lookup. iTunes also exposes no follower counts, so search rows show album counts instead to help tell same-name artists apart.
+- **iTunes quirks:** iTunes provides no release type (everything is `collectionType=Album`), so suffix-based classification is used. Fixing this properly would require the modern Apple Music API key. The free Search/Lookup API is also capped at 200 collections per lookup and ~20 calls/min; the app detects a full lookup and adds one Search query for that artist, but extremely large catalogs may still be incomplete. Some releases only surface via UPC lookup. iTunes also exposes no follower counts, so search rows show album counts instead to help tell same-name artists apart.
+- **Bandcamp quirks:** Bandcamp has no public search API and its site search is bot-challenged, so artists are linked by pasting an `artist.bandcamp.com` URL (or via a MusicBrainz URL relationship). Custom-domain Bandcamp stores cannot be resolved automatically. Bandcamp has no EP type; album items are classified as albums unless the title marks itself as an EP, and track items are treated as singles.
 - **Near-duplicate titles:** Deduplication can still miss releases whose titles differ in ways no rule covers. Fully censored words (`****`) cannot be mapped to anything, by design.
 - **MusicBrainz credits:** The scan works at the *release group* level (individual releases are only fetched on demand for tracklists/streaming links), so credited artists don't appear during a release-group scan; those credits require a secondary, release-level scan.
 
@@ -120,12 +123,12 @@ Telegram support was dropped during a significant rewrite. Feel free to build yo
 | --- | --- |
 | Backend | Python, FastAPI, SQLite |
 | Frontend | Vanilla HTML/CSS/JS (dark theme) |
-| Data sources | [MusicBrainz API](https://musicbrainz.org/doc/MusicBrainz_API), [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI), [SoundCloud V2 API](https://soundcloud.com), no API keys required |
+| Data sources | [MusicBrainz API](https://musicbrainz.org/doc/MusicBrainz_API), [iTunes Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI), [Bandcamp mobile API](https://bandcamp.com), [SoundCloud V2 API](https://soundcloud.com), no API keys required |
 
 ## Requirements
 
 - Python 3.8+
-- Internet connection (for MusicBrainz / iTunes / SoundCloud APIs)
+- Internet connection (for MusicBrainz / iTunes / Bandcamp / SoundCloud APIs)
 
 The original launcher installs dependencies automatically into its dedicated `.venv-run/` environment from [`requirements.txt`](requirements.txt). If you use uv, the project environment is kept separately in `.venv/`:
 

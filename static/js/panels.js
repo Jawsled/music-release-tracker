@@ -152,16 +152,18 @@ document.addEventListener("click", e => {
 async function loadSettings() {
   try {
     const settings = await api("/api/settings");
-    // Default: all sources enabled, dedup off (first run has no settings)
+    // Default: MB/iTunes/SoundCloud enabled, Bandcamp opt-in (off), dedup off
     document.getElementById("source-musicbrainz").checked = settings.source_musicbrainz !== "0";
     document.getElementById("source-itunes").checked = settings.source_itunes !== "0";
+    document.getElementById("source-bandcamp").checked = settings.source_bandcamp === "1";
     document.getElementById("source-soundcloud").checked = settings.source_soundcloud !== "0";
     document.getElementById("setting-startup-refresh").checked = settings.startup_refresh === "1";
     document.getElementById("setting-startup-dedup").checked = settings.startup_dedup === "1";
   } catch {
-    // On error, default to all sources enabled
+    // On error, default to the same initial state as a fresh install
     document.getElementById("source-musicbrainz").checked = true;
     document.getElementById("source-itunes").checked = true;
+    document.getElementById("source-bandcamp").checked = false;
     document.getElementById("source-soundcloud").checked = true;
     document.getElementById("setting-startup-refresh").checked = false;
     document.getElementById("setting-startup-dedup").checked = false;
@@ -350,6 +352,7 @@ async function saveSettings(auto = false) {
   const settings = {
     source_musicbrainz: document.getElementById("source-musicbrainz").checked ? "1" : "0",
     source_itunes: document.getElementById("source-itunes").checked ? "1" : "0",
+    source_bandcamp: document.getElementById("source-bandcamp").checked ? "1" : "0",
     source_soundcloud: document.getElementById("source-soundcloud").checked ? "1" : "0",
     startup_refresh: document.getElementById("setting-startup-refresh").checked ? "1" : "0",
     startup_dedup: document.getElementById("setting-startup-dedup").checked ? "1" : "0",

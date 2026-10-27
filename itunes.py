@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 
 import httpx
@@ -15,6 +16,11 @@ logger = logging.getLogger("music-release-tracker.itunes")
 _last_request_time: float = 0.0
 _lock = asyncio.Lock()
 _client: httpx.AsyncClient | None = None
+
+# Apple documents roughly 20 calls/minute for the free Search API and routes
+# heavier use to the Enterprise Partner Feed. The old 1s pacing (60/min) was
+# over the limit and is the likely source of the 503 cooldowns.
+MIN_REQUEST_INTERVAL = 3.0
 
 COOLDOWN_503 = 5.0       # seconds to wait before first retry on 503
 COOLDOWN_503_RETRY = 10.0  # seconds to wait before second retry on 503
@@ -35,7 +41,7 @@ def _get_client() -> httpx.AsyncClient:
 
 
 async def _pace_request() -> None:
-    """Space request starts >=1s apart.
+    """Space request starts >=3s apart (Apple's documented ~20/min).
 
     Only the timestamp check is serialized; network I/O happens outside the
     lock so concurrent requests overlap in flight instead of queueing behind
@@ -46,15 +52,15 @@ async def _pace_request() -> None:
         async with _lock:
             now = time.monotonic()
             elapsed = now - _last_request_time
-            if elapsed >= 1.0:
+            if elapsed >= MIN_REQUEST_INTERVAL:
                 _last_request_time = now
                 return
-            delay = 1.0 - elapsed
+            delay = MIN_REQUEST_INTERVAL - elapsed
         await asyncio.sleep(delay)
 
 
 async def _rate_limited_get(url: str, params: dict) -> dict:
-    """Make a GET request with rate limiting (starts spaced >=1s apart).
+    """Make a GET request with rate limiting (starts spaced >=3s apart).
 
     Retries automatically on:
       - 503 errors (cooldown waits)
@@ -146,6 +152,149 @@ async def search_artist(query: str, country: str = "us") -> list[dict]:
     return results
 
 
+# Credits before a "feat."/"ft." marker are primary/co-primary artists; what
+# follows is a featured appearance. Apple's artistId only names the primary
+# artist, so co-primary collaborations need a name check against this part.
+_FEAT_SPLIT_RE = re.compile(
+    r"\s*(?:\(|\[)?\s*\b(?:feat\.?|ft\.?|featuring)\b", re.I
+)
+# Split collaboration credits, but only on standalone "x"/"vs." tokens and
+# spaced "/"/"+" separators, so names like "X Ambassadors", "Malcolm X",
+# "HUNTR/X" or "AC/DC" survive intact.
+_CREDIT_SPLIT_RE = re.compile(
+    r"\s*,\s*|\s*&\s*|\s+\+\s+|\s+/\s+|\s+\b(?:and|with|vs\.?)\b\s+|\s+x\s+",
+    re.I,
+)
+_MAX_PRIMARY_CREDITS = 3
+
+
+def _normalize_credit_name(name: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace for credit matching."""
+    folded = (name or "").casefold()
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", folded)).strip()
+
+
+def _is_co_primary_credit(artist_name: str, credit: str) -> bool:
+    """Whether ``artist_name`` is a primary/co-primary credit in ``credit``.
+
+    Apple's ``artistId`` is only the collection's primary artist, so a
+    collaboration credited to someone else ("Matt Sassari, Jack Back &
+    David Guetta") is returned with another artist's ID. Match the tracked
+    name against the credits that appear *before* any "feat." marker, and
+    only the first few of them, so featured-only appearances stay out.
+    """
+    wanted = _normalize_credit_name(artist_name)
+    if not wanted:
+        return False
+    primary = _FEAT_SPLIT_RE.split(credit or "", maxsplit=1)[0]
+    if _normalize_credit_name(primary) == wanted:
+        return True
+    credits = [c for c in _CREDIT_SPLIT_RE.split(primary) if c.strip()]
+    return any(
+        _normalize_credit_name(c) == wanted
+        for c in credits[:_MAX_PRIMARY_CREDITS]
+    )
+
+
+async def _search_fallback(artist_name: str, country: str) -> list[dict]:
+    """One Search API query for an artist whose lookup hit the 200-row cap.
+
+    Apple's Lookup API returns at most 200 collections and ignores ``offset``,
+    so releases beyond that window (and releases filed under a duplicate
+    Apple artist entry) never appear. The Search API ranks by relevance and
+    does include those. This runs only for cap-hit artists, keeping the extra
+    request bounded.
+    """
+    data = await _rate_limited_get(
+        BASE_URL,
+        params={
+            "term": artist_name,
+            "entity": "album",
+            "attribute": "artistTerm",
+            "limit": 200,
+            "country": country,
+        },
+    )
+    return data.get("results", []) or []
+
+
+def _release_from_result(
+    r: dict,
+    artist_id: int,
+    artist_name: str,
+    include_albums: bool,
+    include_eps: bool,
+) -> dict | None:
+    """Convert one iTunes collection result, or None when it should be skipped.
+
+    A collection is kept when the tracked artist is its primary artist *or*
+    a co-primary credit. Featured-only appearances are dropped.
+    """
+    if r.get("artistId") != artist_id and not _is_co_primary_credit(
+        artist_name, r.get("artistName", "")
+    ):
+        return None
+
+    collection_id = r.get("collectionId")
+    if not collection_id:
+        return None
+
+    collection_name = r.get("collectionName", "")
+    collection_type = r.get("collectionType", "")
+    track_count = r.get("trackCount", 0)
+
+    # Determine release type with classification fallback
+    release_type = ""
+    title_suffix = ""
+
+    # Priority 1: Check collectionName for " - Single" or " - EP" suffix
+    # iTunes encodes the actual release type in the name (e.g. "Music - Single")
+    if collection_name.endswith(" - Single"):
+        release_type = "Single"
+    elif collection_name.endswith(" - EP"):
+        release_type = "EP"
+    # Priority 2: Use collectionType from iTunes (often just says "Album")
+    elif collection_type:
+        release_type = collection_type
+    # Priority 3: Infer from track count
+    elif track_count <= 4:
+        release_type = "Single"
+        title_suffix = " - Single"
+    elif track_count <= 12:
+        release_type = "EP"
+        title_suffix = " - EP"
+    else:
+        release_type = "Album"
+
+    # Skip if not wanted type
+    if release_type == "Album" and not include_albums:
+        return None
+    if release_type == "EP" and not include_eps:
+        return None
+    # Always include Singles regardless of flags
+
+    # Get artwork URL (iTunes provides 100x100, upscale to 600x600)
+    artwork_url = ""
+    artwork_100 = r.get("artworkUrl100", "")
+    if artwork_100:
+        artwork_url = artwork_100.replace("100x100bb", "600x600bb").replace("100x100", "600x600")
+
+    # Normalize date to YYYY-MM-DD
+    raw_date = r.get("releaseDate", "")
+    normalized_date = normalize_date_for_sort(raw_date)
+
+    return {
+        "id": collection_id,
+        "title": collection_name + title_suffix,
+        "type": release_type,
+        "date": normalized_date,
+        "artistId": r.get("artistId"),
+        "artistName": r.get("artistName", ""),
+        "url": r.get("collectionViewUrl"),
+        "artwork_url": artwork_url,
+    }
+
+
 async def get_artist_releases(
     artist_id: int,
     country: str = "us",
@@ -157,8 +306,15 @@ async def get_artist_releases(
     """
     Fetch artist releases using the iTunes Lookup API by artist ID.
 
-    Uses the Lookup API (exact match by ID) instead of Search API (text search),
-    which is more reliable and returns all releases without the 200-result limit.
+    Uses the Lookup API (exact match by ID) as the primary source. Apple caps
+    a lookup at 200 collections and ignores ``offset``; when the response is
+    full, one Search API query by artist name fills in releases beyond that
+    window (and releases filed under a duplicate Apple artist entry).
+
+    A collection is kept when the tracked artist is its primary artist or a
+    co-primary credit, so collaborations are no longer dropped just because
+    another artist owns Apple's ``artistId``. Featured-only appearances stay
+    out.
 
     Classification logic:
     - Checks collectionName for " - Single" or " - EP" suffix (iTunes encodes type here)
@@ -168,87 +324,56 @@ async def get_artist_releases(
       - 5-12 tracks: EP (appends " - EP" to title)
       - > 12 tracks: Album
     """
-    # Use Lookup API with artist ID - exact match, no filtering needed
     data = await _rate_limited_get(
         LOOKUP_URL,
         params={
             "id": artist_id,
-                        "entity": "album",
+            "entity": "album",
+            "limit": limit,
             "country": country,
         },
     )
-    results_list = data.get("results", [])
+    results_list = list(data.get("results", []))
+
+    # Cap detection: resultCount includes the artist entry itself, so a full
+    # response carries one more row than the requested collection limit.
+    collection_count = sum(1 for r in results_list if r.get("collectionId"))
+    if artist_name.strip() and collection_count >= limit:
+        try:
+            extra = await _search_fallback(artist_name, country)
+        except Exception as e:
+            logger.warning(f"iTunes search fallback failed for {artist_name!r}: {e}")
+        else:
+            seen_ids = {
+                r.get("collectionId") for r in results_list if r.get("collectionId")
+            }
+            added = 0
+            for r in extra:
+                collection_id = r.get("collectionId")
+                if collection_id and collection_id not in seen_ids:
+                    seen_ids.add(collection_id)
+                    results_list.append(r)
+                    added += 1
+            if added:
+                logger.info(
+                    f"iTunes search fallback added {added} release(s) "
+                    f"for {artist_name!r}"
+                )
 
     seen_collection_ids = set()
     out: list[dict] = []
 
     for r in results_list:
-        # Filter to only releases where this artist is the primary artist
-        # (Lookup API can return albums where artist is a contributor/featured)
-        if r.get("artistId") != artist_id:
-            continue
-        collection_id = r.get("collectionId")
-        if not collection_id or collection_id in seen_collection_ids:
-            continue
-
-        collection_name = r.get("collectionName", "")
-        collection_type = r.get("collectionType", "")
-        track_count = r.get("trackCount", 0)
-
-        # Determine release type with classification fallback
-        release_type = ""
-        title_suffix = ""
-
-        # Priority 1: Check collectionName for " - Single" or " - EP" suffix
-        # iTunes encodes the actual release type in the name (e.g. "Music - Single")
-        if collection_name.endswith(" - Single"):
-            release_type = "Single"
-        elif collection_name.endswith(" - EP"):
-            release_type = "EP"
-        # Priority 2: Use collectionType from iTunes (often just says "Album")
-        elif collection_type:
-            release_type = collection_type
-        # Priority 3: Infer from track count
-        elif track_count <= 4:
-            release_type = "Single"
-            title_suffix = " - Single"
-        elif track_count <= 12:
-            release_type = "EP"
-            title_suffix = " - EP"
-        else:
-            release_type = "Album"
-
-        # Skip if not wanted type
-        if release_type == "Album" and not include_albums:
-            continue
-        if release_type == "EP" and not include_eps:
-            continue
-        # Always include Singles regardless of flags
-
-        seen_collection_ids.add(collection_id)
-
-        # Get artwork URL (iTunes provides 100x100, upscale to 600x600)
-        artwork_url = ""
-        artwork_100 = r.get("artworkUrl100", "")
-        if artwork_100:
-            artwork_url = artwork_100.replace("100x100bb", "600x600bb").replace("100x100", "600x600")
-
-        # Normalize date to YYYY-MM-DD
-        raw_date = r.get("releaseDate", "")
-        normalized_date = normalize_date_for_sort(raw_date)
-
-        out.append(
-            {
-                "id": collection_id,
-                "title": r.get("collectionName", "") + title_suffix,
-                "type": release_type,
-                "date": normalized_date,
-                "artistId": r.get("artistId"),
-                "artistName": r.get("artistName", ""),
-                "url": r.get("collectionViewUrl"),
-                "artwork_url": artwork_url,
-            }
+        release = _release_from_result(
+            r, artist_id, artist_name, include_albums, include_eps
         )
+        if release is None:
+            continue
+        collection_id = release["id"]
+        if collection_id in seen_collection_ids:
+            continue
+        seen_collection_ids.add(collection_id)
+        out.append(release)
 
     return out
 

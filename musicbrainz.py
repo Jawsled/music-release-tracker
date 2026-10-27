@@ -526,6 +526,42 @@ def _extract_soundcloud_permalink(url: str) -> str | None:
     return first.lower()
 
 
+# Bandcamp artist profiles live at <artist>.bandcamp.com. These subdomains
+# belong to Bandcamp itself and are never artist profiles.
+_BC_RESERVED_SUBDOMAINS = {
+    "www", "bandcamp", "daily", "api", "m", "store", "help", "get", "about",
+    "community", "discover", "search", "login", "signup", "artists", "labels",
+    "music", "merch", "fan", "fans", "collection", "wishlist", "settings",
+    "terms", "privacy", "jobs", "press", "developers", "status", "blog",
+    "video", "live", "radio", "shows", "tools", "embed", "embedded",
+}
+
+
+def _extract_bandcamp_url(url: str) -> str | None:
+    """Extract the artist subdomain from a Bandcamp URL.
+
+    Returns the host (``artist.bandcamp.com``) or None. Custom domains are not
+    resolvable without Bandcamp's bot-challenged search, so only the hosted
+    subdomain form is accepted.
+    """
+    if not url or "bandcamp.com" not in url.lower():
+        return None
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:
+        return None
+    if host.startswith("www."):
+        host = host[4:]
+    suffix = ".bandcamp.com"
+    if not host.endswith(suffix):
+        return None
+    sub = host[: -len(suffix)]
+    if not sub or sub in _BC_RESERVED_SUBDOMAINS:
+        return None
+    return host
+
+
 async def get_artist_links(mbid: str) -> dict:
     """Fetch an artist's external links from MusicBrainz in a single call.
 
@@ -533,13 +569,14 @@ async def get_artist_links(mbid: str) -> dict:
     for two purposes:
       1. streaming: full streaming-service link list (same shape as
          get_release_streaming_urls, for on-demand display).
-      2. confirmed IDs: the Apple Music artist ID and SoundCloud permalink
-         from the artist's official URL relationships. These are ground
-         truth for search-result badges and take precedence over fuzzy
-         name-based merging from iTunes text search / SC slug probing.
+      2. confirmed IDs: the Apple Music artist ID, SoundCloud permalink and
+         Bandcamp artist host from the artist's official URL relationships.
+         These are ground truth for search-result badges and take precedence
+         over fuzzy name-based merging from iTunes text search / SC slug
+         probing.
 
     Returns {"streaming": [...], "itunes_artist_id": int|None,
-             "soundcloud_permalink": str|None}.
+             "soundcloud_permalink": str|None, "bandcamp_url": str|None}.
     """
     data = await _rate_limited_get(
         f"{BASE_URL}/artist/{mbid}",
@@ -552,6 +589,7 @@ async def get_artist_links(mbid: str) -> dict:
     streaming: list[dict] = []
     itunes_artist_id: int | None = None
     soundcloud_permalink: str | None = None
+    bandcamp_url: str | None = None
 
     for rel in relations:
         if rel.get("target-type") != "url":
@@ -582,11 +620,16 @@ async def get_artist_links(mbid: str) -> dict:
             parsed_sc = _extract_soundcloud_permalink(value)
             if parsed_sc:
                 soundcloud_permalink = parsed_sc
+        if bandcamp_url is None:
+            parsed_bc = _extract_bandcamp_url(value)
+            if parsed_bc:
+                bandcamp_url = parsed_bc
 
     return {
         "streaming": streaming,
         "itunes_artist_id": itunes_artist_id,
         "soundcloud_permalink": soundcloud_permalink,
+        "bandcamp_url": bandcamp_url,
     }
 
 

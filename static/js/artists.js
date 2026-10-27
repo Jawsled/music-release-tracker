@@ -23,9 +23,9 @@ searchInput.addEventListener("input", () => {
 });
 
 // --- Enabled sources cache (mirrors Settings toggles) ---
-// Default: everything enabled. Refreshed from /api/settings whenever the
-// artists list renders and after settings are saved.
-let _enabledSources = { musicbrainz: true, itunes: true, soundcloud: true };
+// Bandcamp is opt-in (default off); the others default on. Refreshed from
+// /api/settings whenever the artists list renders and after settings save.
+let _enabledSources = { musicbrainz: true, itunes: true, bandcamp: false, soundcloud: true };
 
 async function refreshEnabledSources() {
   try {
@@ -33,10 +33,11 @@ async function refreshEnabledSources() {
     _enabledSources = {
       musicbrainz: s.source_musicbrainz !== "0",
       itunes: s.source_itunes !== "0",
+      bandcamp: s.source_bandcamp === "1",
       soundcloud: s.source_soundcloud !== "0",
     };
   } catch {
-    _enabledSources = { musicbrainz: true, itunes: true, soundcloud: true };
+    _enabledSources = { musicbrainz: true, itunes: true, bandcamp: false, soundcloud: true };
   }
   if (typeof syncSearchSourceMenu === "function") syncSearchSourceMenu();
   return _enabledSources;
@@ -56,11 +57,13 @@ function searchResultPills(a) {
   // rendered once to the right of the badges (see mbConfirmedTag below).
   const appleTitle = a._confirmed_apple ? ' title="Apple Music ID confirmed via MusicBrainz relationships"' : '';
   const scTitle = a._confirmed_sc ? ' title="SoundCloud profile confirmed via MusicBrainz relationships"' : '';
+  const bcTitle = a._confirmed_bc ? ' title="Bandcamp profile confirmed via MusicBrainz relationships"' : '';
   if (a.source === 'soundcloud' && a.soundcloud_permalink) {
     if (_srcEnabled('soundcloud')) pills.push(`<a class="result-pill" href="https://soundcloud.com/${esc(a.soundcloud_permalink)}" target="_blank" rel="noopener"${scTitle}>${sourceIcon('soundcloud', 14)} SoundCloud ↗</a>`);
   } else {
     if (a.mbid && _srcEnabled('musicbrainz')) pills.push(`<a class="result-pill" href="https://musicbrainz.org/artist/${esc(a.mbid)}" target="_blank" rel="noopener">${sourceIcon('musicbrainz', 14)} MusicBrainz ↗</a>`);
     if (a.itunes_artist_id && _srcEnabled('itunes')) pills.push(`<a class="result-pill" href="https://music.apple.com/artist/${esc(String(a.name).toLowerCase().replace(/[^a-z0-9]/g, ''))}/${esc(a.itunes_artist_id)}" target="_blank" rel="noopener"${appleTitle}>${sourceIcon('itunes', 14)} Apple Music ↗</a>`);
+    if (a.bandcamp_url && _srcEnabled('bandcamp')) pills.push(`<a class="result-pill" href="https://${esc(a.bandcamp_url)}" target="_blank" rel="noopener"${bcTitle}>${sourceIcon('bandcamp', 14)} Bandcamp ↗</a>`);
     if (a.soundcloud_permalink && _srcEnabled('soundcloud')) pills.push(`<a class="result-pill" href="https://soundcloud.com/${esc(a.soundcloud_permalink)}" target="_blank" rel="noopener"${scTitle}>${sourceIcon('soundcloud', 14)} SoundCloud ↗</a>`);
   }
   pills.push(mbConfirmedTag(a));
@@ -73,6 +76,7 @@ function searchResultPills(a) {
 function mbConfirmedTag(a) {
   const bits = [];
   if (a._confirmed_apple) bits.push("Apple Music");
+  if (a._confirmed_bc) bits.push("Bandcamp");
   if (a._confirmed_sc) bits.push("SoundCloud");
   if (!bits.length) return "";
   return html`<span class="mb-confirmed-tag" title="${bits.join(" + ")} link${bits.length > 1 ? "s" : ""} confirmed via this artist's MusicBrainz page">✓ MB</span>`;
@@ -157,6 +161,13 @@ function _applyMbLinksToEntry(a, d) {
       changed = true;
     }
     if (!a._confirmed_sc) { a._confirmed_sc = true; changed = true; }
+  }
+  if (d.bandcamp_url) {
+    if ((a.bandcamp_url || "").toLowerCase() !== String(d.bandcamp_url).toLowerCase()) {
+      a.bandcamp_url = d.bandcamp_url;
+      changed = true;
+    }
+    if (!a._confirmed_bc) { a._confirmed_bc = true; changed = true; }
   }
   if (d.streaming && !a._mb_streaming) a._mb_streaming = d.streaming;
   return changed;
@@ -370,6 +381,9 @@ async function addArtist(artist, btn) {
   if (artist.itunes_artist_id) {
     sourcesToAdd.push({ source: "itunes", id: String(artist.itunes_artist_id) });
   }
+  if (artist.bandcamp_url && _srcEnabled("bandcamp")) {
+    sourcesToAdd.push({ source: "bandcamp", id: artist.bandcamp_url, bandcamp_band_id: artist.bandcamp_band_id || null });
+  }
   if (artist.soundcloud_permalink) {
     sourcesToAdd.push({ source: "soundcloud", id: artist.soundcloud_permalink });
   }
@@ -392,7 +406,8 @@ async function addArtist(artist, btn) {
           source: s.source,
           id: s.id,
           name: artist.name,
-          disambiguation: artist.disambiguation
+          disambiguation: artist.disambiguation,
+          bandcamp_band_id: s.bandcamp_band_id || null
         }
       });
       if (result.status === "conflict") {
@@ -463,9 +478,11 @@ async function loadArtists() {
 function renderTrackedArtistItem(a) {
       const hasMb = !!a.mbid;
       const hasItunes = !!a.itunes_artist_id;
+      const hasBc = !!a.bandcamp_url;
       const hasSc = !!a.soundcloud_permalink;
       const mbOn = _srcEnabled('musicbrainz');
       const itOn = _srcEnabled('itunes');
+      const bcOn = _srcEnabled('bandcamp');
       const scOn = _srcEnabled('soundcloud');
 
       // Build compact icon-only source buttons (32px targets, + badge when unlinked).
@@ -485,6 +502,14 @@ function renderTrackedArtistItem(a) {
         sourceIcons += `<a class="source-icon-btn linked" href="https://music.apple.com/artist/${esc(a.name.toLowerCase().replace(/[^a-z0-9]/g, ''))}/${esc(a.itunes_artist_id)}" target="_blank" rel="noopener" title="Apple Music — linked, click to open" aria-label="Open ${esc(a.name)} on Apple Music"><img src="/static/assets/apple-music.svg" alt=""></a>`;
       } else {
         sourceIcons += `<button class="source-icon-btn unlinked"${dataAttrs({ action: "open-link-source", id: a.id, source: "itunes", name: a.name })} title="Link Apple Music for ${esc(a.name)}" aria-label="Link Apple Music for ${esc(a.name)}"><img src="/static/assets/apple-music.svg" alt=""></button>`;
+      }
+      }
+      // Bandcamp
+      if (bcOn) {
+      if (hasBc) {
+        sourceIcons += `<a class="source-icon-btn linked" href="https://${esc(a.bandcamp_url)}" target="_blank" rel="noopener" title="Bandcamp — linked, click to open" aria-label="Open ${esc(a.name)} on Bandcamp"><img src="/static/assets/bandcamp.svg" alt=""></a>`;
+      } else {
+        sourceIcons += `<button class="source-icon-btn unlinked"${dataAttrs({ action: "open-link-source", id: a.id, source: "bandcamp", name: a.name })} title="Link Bandcamp for ${esc(a.name)}" aria-label="Link Bandcamp for ${esc(a.name)}"><img src="/static/assets/bandcamp.svg" alt=""></button>`;
       }
       }
       // SoundCloud
@@ -516,6 +541,14 @@ function renderTrackedArtistItem(a) {
         dropdownItems += `<button class="dropdown-item"${dataAttrs({ action: "confirm-unlink", id: a.id, source: "itunes" })}><img src="/static/assets/apple-music.svg" alt="" class="dropdown-icon"> Unlink iTunes</button>`;
       } else {
         dropdownItems += `<button class="dropdown-item"${dataAttrs({ action: "open-link-source", id: a.id, source: "itunes", name: a.name })}><img src="/static/assets/apple-music.svg" alt="" class="dropdown-icon"> Link iTunes</button>`;
+      }
+      }
+      // Bandcamp
+      if (bcOn) {
+      if (hasBc) {
+        dropdownItems += `<button class="dropdown-item"${dataAttrs({ action: "confirm-unlink", id: a.id, source: "bandcamp" })}><img src="/static/assets/bandcamp.svg" alt="" class="dropdown-icon"> Unlink Bandcamp</button>`;
+      } else {
+        dropdownItems += `<button class="dropdown-item"${dataAttrs({ action: "open-link-source", id: a.id, source: "bandcamp", name: a.name })}><img src="/static/assets/bandcamp.svg" alt="" class="dropdown-icon"> Link Bandcamp</button>`;
       }
       }
       // SoundCloud
@@ -602,7 +635,10 @@ function doRemoveArtist(id) {
 }
 
 function confirmUnlinkArtist(id, source, btn) {
-  const sourceLabel = source === 'musicbrainz' ? 'MusicBrainz' : source === 'itunes' ? 'Apple Music' : 'SoundCloud';
+  const sourceLabel = source === 'musicbrainz' ? 'MusicBrainz'
+    : source === 'itunes' ? 'Apple Music'
+    : source === 'bandcamp' ? 'Bandcamp'
+    : 'SoundCloud';
   _artistMenuOf(btn).forEach(d => {
     d.classList.remove('hidden');
     d.innerHTML = `<div class="inline-confirm">Unlink ${sourceLabel}? <button class="confirm-yes"${dataAttrs({ action: "do-unlink-artist", id: id, source: source })}>Confirm</button> <button class="confirm-no"${dataAttrs({ action: "load-artists" })}>Keep</button></div>`;

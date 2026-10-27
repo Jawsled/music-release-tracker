@@ -19,6 +19,7 @@ import db
 import musicbrainz
 import itunes
 import soundcloud
+import bandcamp
 import logstore
 import covers
 import cache
@@ -181,14 +182,15 @@ templates.env.cache = {}  # Replace broken LRU cache with simple dict
 class ArtistSearchRequest(BaseModel):
     query: str
     source: str = ""  # empty = search both
-    sources: list[str] | None = None  # platform filter; None = all three
+    sources: list[str] | None = None  # platform filter; None = every enabled source
 
 class ArtistAddRequest(BaseModel):
-    source: str  # "musicbrainz", "itunes", or "soundcloud"
-    id: str  # mbid for musicbrainz, artistId for itunes, permalink for soundcloud
+    source: str  # "musicbrainz", "itunes", "soundcloud", or "bandcamp"
+    id: str  # mbid for musicbrainz, artistId for itunes, permalink for soundcloud, host for bandcamp
     name: str
     disambiguation: str = ""
     artist_id: int | None = None  # explicit link target (link-source modal)
+    bandcamp_band_id: str | None = None  # avoids re-resolving the artist page
     force: bool = False  # confirmed "replace + unlink from old owner" retry
 
 class iTunesArtistSearchRequest(BaseModel):
@@ -293,7 +295,7 @@ async def search_artists(body: ArtistSearchRequest):
     # SoundCloud URL pastes resolve to the exact profile (unambiguous link).
     # Plain words / spaced names fall through to the combined search below,
     # which probes all selected platforms in parallel.
-    if body.source not in ("musicbrainz", "itunes"):
+    if body.source not in ("musicbrainz", "itunes", "bandcamp"):
         sc_url_match = _re.search(
             r'(?:www\.|m\.)?soundcloud\.com/([A-Za-z0-9._-]+)', query
         )
@@ -304,6 +306,21 @@ async def search_artists(body: ArtistSearchRequest):
                 return _mark_sc_tracked(await soundcloud.search_artist(query))
             except Exception:
                 pass
+
+    # Bandcamp has no usable name search (its site search is behind a bot
+    # challenge), so only URL/host pastes and the explicit link flow resolve.
+    bc_url_match = _re.match(
+        r'^(?:https?://)?[A-Za-z0-9-]+\.bandcamp\.com(?:[/?#]|$)', query, _re.I
+    )
+    if bc_url_match or body.source == "bandcamp":
+        if "bandcamp" not in _enabled_sources():
+            return []
+        try:
+            return _mark_bc_tracked(await bandcamp.search_artist(query))
+        except Exception as e:
+            import logging
+            logging.warning(f"Bandcamp search failed for '{query}': {e}")
+        return []
 
     # Regular search
     # Load existing artists to check what's already tracked
@@ -388,12 +405,17 @@ async def search_artists(body: ArtistSearchRequest):
                         )
                     except Exception:
                         links = None
-                    if links and (links.get("itunes_artist_id") or links.get("soundcloud_permalink")):
+                    if links and (
+                        links.get("itunes_artist_id")
+                        or links.get("soundcloud_permalink")
+                        or links.get("bandcamp_url")
+                    ):
                         mb_confirmed = {
                             "mbid": top["mbid"],
                             "name": top.get("name", ""),
                             "itunes_artist_id": links.get("itunes_artist_id"),
                             "soundcloud_permalink": links.get("soundcloud_permalink"),
+                            "bandcamp_url": links.get("bandcamp_url"),
                             "streaming": links.get("streaming") or [],
                         }
 
@@ -434,6 +456,8 @@ async def search_artists(body: ArtistSearchRequest):
                 "mbid": r.get("mbid", ""),
                 "itunes_artist_id": None,
                 "soundcloud_permalink": None,
+                "bandcamp_url": None,
+                "bandcamp_band_id": None,
                 "disambiguation": r.get("disambiguation", ""),
                 "type": r.get("type", ""),
                 "country": r.get("country", ""),
@@ -460,6 +484,8 @@ async def search_artists(body: ArtistSearchRequest):
                     "mbid": "",
                     "itunes_artist_id": r.get("itunes_artist_id"),
                     "soundcloud_permalink": None,
+                    "bandcamp_url": None,
+                    "bandcamp_band_id": None,
                     "disambiguation": r.get("disambiguation", ""),
                     "type": "",
                     "country": r.get("country", ""),
@@ -486,6 +512,8 @@ async def search_artists(body: ArtistSearchRequest):
                     "mbid": "",
                     "itunes_artist_id": None,
                     "soundcloud_permalink": r.get("soundcloud_permalink"),
+                    "bandcamp_url": None,
+                    "bandcamp_band_id": None,
                     "disambiguation": r.get("disambiguation", ""),
                     "type": r.get("type", ""),
                     "country": r.get("country", ""),
@@ -511,6 +539,11 @@ async def search_artists(body: ArtistSearchRequest):
                     entry["_confirmed_sc"] = True
                     if entry.get("source") in ("musicbrainz", "itunes", "both"):
                         entry["source"] += "+sc"
+                if mb_confirmed.get("bandcamp_url"):
+                    entry["bandcamp_url"] = mb_confirmed["bandcamp_url"]
+                    entry["_confirmed_bc"] = True
+                    if entry.get("source") in ("musicbrainz", "itunes", "both"):
+                        entry["source"] += "+bc"
                 entry["_mb_streaming"] = mb_confirmed.get("streaming") or []
                 entry["_mb_enriched"] = True
 
@@ -522,6 +555,7 @@ async def search_artists(body: ArtistSearchRequest):
             r["already_tracked"] = existing is not None
             r["existing_mbid"] = existing["mbid"] if existing else None
             r["existing_itunes_id"] = existing.get("itunes_artist_id") if existing else None
+            r["existing_bandcamp_url"] = existing.get("bandcamp_url") if existing else None
             result.append(r)
 
         # Sort by score descending
@@ -550,6 +584,37 @@ def _mark_sc_tracked(results: list[dict]) -> list[dict]:
         else:
             r["already_tracked"] = False
     return results
+
+
+def _mark_bc_tracked(results: list[dict]) -> list[dict]:
+    """Annotate every Bandcamp result with already_tracked info for the UI."""
+    for r in results:
+        existing = db.get_artist_by_bandcamp_url(r.get("bandcamp_url", ""))
+        if existing:
+            r["already_tracked"] = True
+            r["existing_mbid"] = existing.get("mbid", "")
+            r["existing_itunes_id"] = existing.get("itunes_artist_id")
+        else:
+            r["already_tracked"] = False
+    return results
+
+
+async def _resolve_bandcamp_band_id(host: str, band_id: str | None = None) -> str | None:
+    """Return a usable Bandcamp band id for ``host``.
+
+    The mobile API (tracklists, discography) needs the numeric band id, so
+    flows that only have a MusicBrainz-confirmed URL resolve and persist it
+    here instead of leaving the row without an id.
+    """
+    band_id = (band_id or "").strip()
+    if band_id:
+        return band_id
+    try:
+        profile = await bandcamp.resolve_profile(host)
+    except Exception as e:
+        logger.warning(f"Bandcamp profile resolution failed for {host}: {e}")
+        return None
+    return (profile or {}).get("bandcamp_band_id")
 
 
 @app.post("/api/itunes/search")
@@ -584,10 +649,99 @@ async def add_artist(body: ArtistAddRequest):
         name = re.sub(r'\s+', ' ', name)
         return name
 
-    # Explicit link from the link-source modal (currently SoundCloud only):
-    # the user picked which tracked row to link onto, so the SoundCloud
-    # display name ("Avicii Official") must never spawn a new artist entry
-    # when it differs from the tracked name ("Avicii").
+    # Bandcamp IDs are stored as the bare host (artist.bandcamp.com) so
+    # pasted URLs and the search-result host resolve to the same artist.
+    if body.source == "bandcamp" and body.id:
+        body.id = bandcamp.normalize_profile_url(body.id) or body.id.strip().lower()
+
+    # Explicit link from the link-source modal. The user picked which tracked
+    # row to link onto, so a platform display name that differs from the
+    # tracked name must never spawn a new artist entry.
+    if body.source == "bandcamp" and body.artist_id is not None:
+        target = db.get_artist_by_id(body.artist_id)
+        if target is None:
+            return {"status": "error", "message": "Artist not found"}
+        host = (body.id or "").strip().lower()
+        if not host:
+            return {"status": "error", "message": "Missing Bandcamp URL"}
+        band_id = await _resolve_bandcamp_band_id(host, body.bandcamp_band_id)
+
+        owner = db.get_artist_by_bandcamp_url(host)
+        if owner and owner["id"] == target["id"]:
+            # Re-link with a freshly resolved band id (e.g. an imported row or
+            # an MB-confirmed URL that was stored without one).
+            if band_id and str(target.get("bandcamp_band_id") or "") != band_id:
+                target = db.link_artist(
+                    artist_id=target["id"],
+                    mbid=target.get("mbid", ""),
+                    itunes_artist_id=target.get("itunes_artist_id"),
+                    soundcloud_permalink=target.get("soundcloud_permalink"),
+                    bandcamp_url=host,
+                    bandcamp_band_id=band_id,
+                )
+            return {"status": "already_exists", "artist": target}
+        if owner and owner["id"] != target["id"] and not body.force:
+            return {
+                "status": "conflict",
+                "message": f"already linked to {owner.get('name', '')}",
+                "conflicting_artist": {"id": owner["id"], "name": owner.get("name", "")},
+                "artist": target,
+            }
+        if owner and owner["id"] != target["id"] and body.force:
+            # Confirmed replace: unlink from the old owner first.
+            db.unlink_artist_bandcamp(owner["id"])
+            target = db.get_artist_by_id(body.artist_id)
+            if target is None:
+                return {"status": "error", "message": "Artist not found"}
+
+        # Target already points at a different profile: drop its old BC
+        # releases so two profiles' releases don't mix under one row.
+        current = (target.get("bandcamp_url") or "").strip().lower()
+        if current and current != host:
+            conn = db.get_db()
+            conn.execute(
+                "DELETE FROM releases WHERE artist_id = ? AND source = 'bandcamp'",
+                (target["id"],),
+            )
+            conn.commit()
+
+        artist = db.link_artist(
+            artist_id=target["id"],
+            mbid=target.get("mbid", ""),
+            itunes_artist_id=target.get("itunes_artist_id"),
+            soundcloud_permalink=target.get("soundcloud_permalink"),
+            bandcamp_url=host,
+            bandcamp_band_id=band_id,
+        )
+
+        count = 0
+        releases = await bandcamp.get_artist_releases(
+            host,
+            known_item_ids=db.get_artist_bandcamp_item_ids(artist["id"]),
+            band_id=band_id,
+        )
+        async with db.batch():
+            for rel in releases:
+                inserted = db.add_release(
+                    mbid=rel["mbid"],
+                    artist_id=artist["id"],
+                    title=rel["title"],
+                    release_type=rel["type"],
+                    release_date=rel.get("date", ""),
+                    notified=1,
+                    source="bandcamp",
+                    bandcamp_item_id=rel.get("bandcamp_item_id"),
+                    bandcamp_item_type=rel.get("bandcamp_item_type"),
+                    artwork_url=rel.get("artwork_url", ""),
+                    mb_url=rel.get("url", ""),
+                    track_titles=rel.get("track_titles") or [],
+                )
+                if inserted:
+                    count += 1
+
+        await _dedupe_releases()
+        return {"status": "linked", "artist": artist, "releases_imported": count}
+
     if body.source == "soundcloud" and body.artist_id is not None:
         target = db.get_artist_by_id(body.artist_id)
         if target is None:
@@ -664,6 +818,8 @@ async def add_artist(body: ArtistAddRequest):
         existing_by_id = db.get_artist_by_itunes_id(int(body.id))
     elif body.source == "soundcloud":
         existing_by_id = db.get_artist_by_soundcloud_permalink(body.id)
+    elif body.source == "bandcamp":
+        existing_by_id = db.get_artist_by_bandcamp_url(body.id)
 
     if existing_by_id:
         return {"status": "already_exists", "artist": existing_by_id}
@@ -691,6 +847,8 @@ async def add_artist(body: ArtistAddRequest):
                 owner = db.get_artist_by_itunes_id(int(body.id))
             elif body.source == "soundcloud" and body.id:
                 owner = db.get_artist_by_soundcloud_permalink(body.id)
+            elif body.source == "bandcamp" and body.id:
+                owner = db.get_artist_by_bandcamp_url(body.id)
         except (ValueError, TypeError):
             owner = None
         if owner and owner["id"] != existing_by_name["id"]:
@@ -701,11 +859,30 @@ async def add_artist(body: ArtistAddRequest):
                 "artist": existing_by_name,
             }
         # Link the new source ID to existing artist
+        bc_url = body.id if body.source == "bandcamp" else existing_by_name.get("bandcamp_url")
+        bc_band_id = (
+            await _resolve_bandcamp_band_id(body.id, body.bandcamp_band_id)
+            if body.source == "bandcamp"
+            else existing_by_name.get("bandcamp_band_id")
+        )
+        if body.source == "bandcamp":
+            current_bc = (existing_by_name.get("bandcamp_url") or "").strip().lower()
+            if current_bc and current_bc != body.id:
+                # Switching profiles: drop the old profile's releases so two
+                # Bandcamp catalogs don't mix under one artist row.
+                conn = db.get_db()
+                conn.execute(
+                    "DELETE FROM releases WHERE artist_id = ? AND source = 'bandcamp'",
+                    (existing_by_name["id"],),
+                )
+                conn.commit()
         artist = db.link_artist(
             artist_id=existing_by_name["id"],
             mbid=body.id if body.source == "musicbrainz" else existing_by_name.get("mbid", ""),
             itunes_artist_id=int(body.id) if body.source == "itunes" else existing_by_name.get("itunes_artist_id"),
             soundcloud_permalink=body.id if body.source == "soundcloud" else existing_by_name.get("soundcloud_permalink"),
+            bandcamp_url=bc_url,
+            bandcamp_band_id=bc_band_id,
         )
 
         # Import releases for the linked source
@@ -727,8 +904,8 @@ async def add_artist(body: ArtistAddRequest):
                     )
                     if inserted:
                         count += 1
-                # MB is authoritative: hide iTunes/SoundCloud copies that
-                # share a title and release type with an MB entry.
+                # MB is authoritative: hide iTunes/Bandcamp/SoundCloud copies
+                # that share a title and release type with an MB entry.
                 db.hide_lower_priority_title_duplicates(artist["id"], "musicbrainz")
             elif body.source == "itunes":
                 releases = await itunes.get_artist_releases(int(body.id), artist_name=body.name)
@@ -768,17 +945,47 @@ async def add_artist(body: ArtistAddRequest):
                     )
                     if inserted:
                         count += 1
+            elif body.source == "bandcamp":
+                releases = await bandcamp.get_artist_releases(
+                    body.id,
+                    known_item_ids=db.get_artist_bandcamp_item_ids(artist["id"]),
+                    band_id=bc_band_id,
+                )
+                for rel in releases:
+                    inserted = db.add_release(
+                        mbid=rel["mbid"],
+                        artist_id=artist["id"],
+                        title=rel["title"],
+                        release_type=rel["type"],
+                        release_date=rel.get("date", ""),
+                        notified=1,
+                        source="bandcamp",
+                        bandcamp_item_id=rel.get("bandcamp_item_id"),
+                        bandcamp_item_type=rel.get("bandcamp_item_type"),
+                        artwork_url=rel.get("artwork_url", ""),
+                        mb_url=rel.get("url", ""),
+                        track_titles=rel.get("track_titles") or [],
+                    )
+                    if inserted:
+                        count += 1
 
         await _dedupe_releases()
         return {"status": "linked", "artist": artist, "releases_imported": count}
 
     # Create new artist entry
+    bc_url = body.id if body.source == "bandcamp" else None
+    bc_band_id = (
+        await _resolve_bandcamp_band_id(bc_url, body.bandcamp_band_id)
+        if bc_url else None
+    )
     artist = db.add_artist(
         mbid=body.id if body.source == "musicbrainz" else "",
         name=body.name,
         disambiguation=body.disambiguation,
         itunes_artist_id=int(body.id) if body.source == "itunes" else None,
         soundcloud_permalink=body.id if body.source == "soundcloud" else None,
+        bandcamp_url=bc_url,
+        bandcamp_band_id=bc_band_id,
     )
 
     # Import releases based on source
@@ -848,6 +1055,29 @@ async def add_artist(body: ArtistAddRequest):
                 )
                 if inserted:
                     count += 1
+        elif body.source == "bandcamp":
+            releases = await bandcamp.get_artist_releases(
+                body.id,
+                known_item_ids=db.get_artist_bandcamp_item_ids(artist["id"]),
+                band_id=bc_band_id,
+            )
+            for rel in releases:
+                inserted = db.add_release(
+                    mbid=rel["mbid"],
+                    artist_id=artist["id"],
+                    title=rel["title"],
+                    release_type=rel["type"],
+                    release_date=rel.get("date", ""),
+                    notified=1,
+                    source="bandcamp",
+                    bandcamp_item_id=rel.get("bandcamp_item_id"),
+                    bandcamp_item_type=rel.get("bandcamp_item_type"),
+                    artwork_url=rel.get("artwork_url", ""),
+                    mb_url=rel.get("url", ""),
+                    track_titles=rel.get("track_titles") or [],
+                )
+                if inserted:
+                    count += 1
 
     await _dedupe_releases()
     return {"status": "added", "artist": artist, "releases_imported": count}
@@ -870,7 +1100,7 @@ async def unlink_artist_itunes(artist_id: int):
 @app.post("/api/artists/{artist_id}/unlink-mb")
 async def unlink_artist_mb(artist_id: int):
     artist = db.unlink_artist_mb(artist_id)
-    # iTunes/SoundCloud copies hidden in favour of MB must fill back in.
+    # iTunes/Bandcamp/SoundCloud copies hidden in favour of MB must fill back in.
     await _dedupe_releases()
     return {"status": "unlinked", "artist": artist}
 
@@ -878,6 +1108,13 @@ async def unlink_artist_mb(artist_id: int):
 @app.post("/api/artists/{artist_id}/unlink-soundcloud")
 async def unlink_artist_soundcloud(artist_id: int):
     artist = db.unlink_artist_soundcloud(artist_id)
+    await _dedupe_releases()
+    return {"status": "unlinked", "artist": artist}
+
+
+@app.post("/api/artists/{artist_id}/unlink-bandcamp")
+async def unlink_artist_bandcamp(artist_id: int):
+    artist = db.unlink_artist_bandcamp(artist_id)
     await _dedupe_releases()
     return {"status": "unlinked", "artist": artist}
 
@@ -935,6 +1172,16 @@ async def import_artists(request: Request):
         disambiguation = entry.get("disambiguation", "")
         itunes_artist_id = entry.get("itunes_artist_id")
         soundcloud_permalink = entry.get("soundcloud_permalink")
+        bandcamp_url = entry.get("bandcamp_url")
+        bandcamp_band_id = entry.get("bandcamp_band_id")
+        if bandcamp_url:
+            # Accept full URLs from hand-edited exports; store the bare host.
+            bandcamp_url = (
+                bandcamp.normalize_profile_url(bandcamp_url)
+                or str(bandcamp_url).strip().lower()
+            )
+        if bandcamp_band_id:
+            bandcamp_band_id = str(bandcamp_band_id).strip() or None
         if itunes_artist_id:
             try:
                 itunes_artist_id = int(itunes_artist_id)
@@ -950,11 +1197,19 @@ async def import_artists(request: Request):
             existing = db.get_artist_by_itunes_id(itunes_artist_id)
         if not existing and soundcloud_permalink:
             existing = db.get_artist_by_soundcloud_permalink(soundcloud_permalink)
+        if not existing and bandcamp_url:
+            existing = db.get_artist_by_bandcamp_url(bandcamp_url)
         if existing:
             skipped += 1
             continue
         try:
-            db.add_artist(mbid or "", name, disambiguation, itunes_artist_id=itunes_artist_id, soundcloud_permalink=soundcloud_permalink)
+            db.add_artist(
+                mbid or "", name, disambiguation,
+                itunes_artist_id=itunes_artist_id,
+                soundcloud_permalink=soundcloud_permalink,
+                bandcamp_url=bandcamp_url,
+                bandcamp_band_id=bandcamp_band_id,
+            )
             added += 1
         except Exception as e:
             errors.append(f"Failed to add {name}: {e}")
@@ -1092,7 +1347,8 @@ def _upstream_error_status(e: Exception) -> int:
 async def get_release_tracks(release_id: str):
     """Fetch and return tracklist for a release.
 
-    Routes to MusicBrainz or iTunes API based on the release source.
+    Routes to the matching source API (MusicBrainz, iTunes, Bandcamp or
+    SoundCloud) based on the release source.
     On upstream failure (e.g. MusicBrainz 503) returns an empty tracklist
     with an `error` message and a 502/503/504 status instead of raising.
     """
@@ -1117,6 +1373,16 @@ async def get_release_tracks(release_id: str):
                 return await soundcloud.get_playlist_tracks(playlist_id)
             track_id = release.get("soundcloud_track_id") or release_id
             return await soundcloud.get_release_tracks(track_id)
+        if source == "bandcamp":
+            item_id = release.get("bandcamp_item_id") or release_id
+            item_type = release.get("bandcamp_item_type") or "album"
+            # The mobile API needs the numeric band id, not the host, so read
+            # it from the tracked artist row.
+            artist_row = db.get_artist_by_id(artist_id) or {}
+            band_id = artist_row.get("bandcamp_band_id") or ""
+            if not band_id:
+                return []
+            return await bandcamp.get_release_tracks(item_id, item_type, band_id)
         # Pass the tracked artist's MBID so their own credit is filtered out
         # of per-track "feat." listings
         return await musicbrainz.get_release_tracks(
@@ -1176,6 +1442,8 @@ async def get_release_streaming(release_id: str):
         return {"mbid": release_id, "streaming": []}
     if source == "soundcloud":
         return {"mbid": release_id, "streaming": []}
+    if source == "bandcamp":
+        return {"mbid": release_id, "streaming": []}
 
     try:
         streaming = await cache.cached(
@@ -1199,13 +1467,14 @@ async def get_mb_artist_links(mbid: str):
 
     Single MusicBrainz lookup (inc=url-rels), parsed once for two purposes:
       - streaming: full streaming-service link list for on-demand display.
-      - itunes_artist_id / soundcloud_permalink: ground truth from the
-        artist's official URL relationships. The frontend prefers these
-        over fuzzy name-based merges when rendering search badges.
+      - itunes_artist_id / soundcloud_permalink / bandcamp_url: ground truth
+        from the artist's official URL relationships. The frontend prefers
+        these over fuzzy name-based merges when rendering search badges.
 
     Returns {"mbid": ..., "streaming": [...],
              "itunes_artist_id": int|None,
-             "soundcloud_permalink": str|None}.
+             "soundcloud_permalink": str|None,
+             "bandcamp_url": str|None}.
     On upstream failure (e.g. MusicBrainz 503 after retries) returns empty
     links with an `error` message and a 502/503/504 status instead of
     raising (which previously surfaced as an ASGI exception / HTTP 500).
@@ -1230,6 +1499,7 @@ async def get_mb_artist_links(mbid: str):
             status_code=_upstream_error_status(e),
             content={"mbid": mbid, "streaming": [],
                      "itunes_artist_id": None, "soundcloud_permalink": None,
+                     "bandcamp_url": None,
                      "error": msg},
         )
     return {"mbid": mbid, **links}
@@ -1255,7 +1525,7 @@ def _titles_match(a: str, b: str) -> bool:
 
 # Artists checked concurrently per scan. Request starts stay paced >=1s per
 # source by the API rate limiters, so this only overlaps latency — it cannot
-# hammer MusicBrainz/iTunes/SoundCloud.
+# hammer MusicBrainz/iTunes/Bandcamp/SoundCloud.
 SCAN_CONCURRENCY = 5
 
 
@@ -1284,12 +1554,15 @@ def _artist_sources(artist: dict) -> list[str]:
         sources.append("musicbrainz")
     if artist.get("itunes_artist_id") and "itunes" in enabled:
         sources.append("itunes")
+    if artist.get("bandcamp_url") and "bandcamp" in enabled:
+        sources.append("bandcamp")
     if artist.get("soundcloud_permalink") and "soundcloud" in enabled:
         sources.append("soundcloud")
     if sources:
         return sources
     # Artist has IDs but all of them are disabled -> fetch nothing
-    if artist.get("mbid") or artist.get("itunes_artist_id") or artist.get("soundcloud_permalink"):
+    if (artist.get("mbid") or artist.get("itunes_artist_id")
+            or artist.get("bandcamp_url") or artist.get("soundcloud_permalink")):
         return []
     # Legacy row with no IDs at all: keep old default so callers no-op safely
     return enabled[:1] if enabled else ["musicbrainz"]
@@ -1308,6 +1581,7 @@ async def _fetch_artist_new_titles(artist: dict) -> list[str]:
     """
     has_mb = bool(artist.get("mbid"))
     has_itunes = bool(artist.get("itunes_artist_id"))
+    has_bc = bool(artist.get("bandcamp_url"))
     has_sc = bool(artist.get("soundcloud_permalink"))
 
     new_titles = []
@@ -1354,8 +1628,8 @@ async def _fetch_artist_new_titles(artist: dict) -> list[str]:
                 if pending_tracklists:
                     await _fetch_tracklists_parallel(pending_tracklists, artist.get("mbid", ""))
                     pending_tracklists.clear()
-                # MB is authoritative: hide iTunes/SoundCloud copies of the
-                # title+type pairs it just added or refreshed.
+                # MB is authoritative: hide iTunes/Bandcamp/SoundCloud copies
+                # of the title+type pairs it just added or refreshed.
                 if mb_changed:
                     db.hide_lower_priority_title_duplicates(artist["id"], "musicbrainz")
             elif source == "itunes" and has_itunes:
@@ -1381,6 +1655,40 @@ async def _fetch_artist_new_titles(artist: dict) -> list[str]:
                 # iTunes outranks SoundCloud: hide SC copies of these titles.
                 if itunes_changed:
                     db.hide_lower_priority_title_duplicates(artist["id"], "itunes")
+            elif source == "bandcamp" and has_bc:
+                bc_band_id = artist.get("bandcamp_band_id")
+                releases = await bandcamp.get_artist_releases(
+                    artist["bandcamp_url"],
+                    known_item_ids=db.get_artist_bandcamp_item_ids(artist["id"]),
+                    band_id=bc_band_id,
+                )
+                if not bc_band_id:
+                    # Legacy/imported rows (or MB-confirmed links) may have a
+                    # URL but no numeric band id; persist it for tracklists.
+                    resolved = await _resolve_bandcamp_band_id(artist["bandcamp_url"])
+                    if resolved:
+                        db.set_artist_bandcamp_band_id(artist["id"], resolved)
+                        artist["bandcamp_band_id"] = resolved
+                for rel in releases:
+                    inserted = db.add_release(
+                        mbid=rel["mbid"],
+                        artist_id=artist["id"],
+                        title=rel["title"],
+                        release_type=rel["type"],
+                        release_date=rel.get("date", ""),
+                        notified=0,
+                        source="bandcamp",
+                        bandcamp_item_id=rel.get("bandcamp_item_id"),
+                        bandcamp_item_type=rel.get("bandcamp_item_type"),
+                        artwork_url=rel.get("artwork_url", ""),
+                        mb_url=rel.get("url", ""),
+                        track_titles=rel.get("track_titles") or [],
+                        return_id=True,
+                    )
+                    if inserted:
+                        new_titles.append(rel["title"])
+                        if isinstance(inserted, int) and not isinstance(inserted, bool):
+                            inserted_rows.append((inserted, rel["title"]))
             elif source == "soundcloud" and has_sc:
                 releases = await soundcloud.get_artist_releases(artist["soundcloud_permalink"])
                 # Store every fetched track/playlist; dedup runs after the
@@ -1408,7 +1716,8 @@ async def _fetch_artist_new_titles(artist: dict) -> list[str]:
 
     if new_titles:
         # Everything fetched above is now registered. Run the shared dedup
-        # pass so MB > iTunes > SoundCloud priority decides what stays visible.
+        # pass so MB > iTunes > Bandcamp > SoundCloud priority decides what
+        # stays visible.
         await _dedupe_releases()
         if inserted_rows:
             # Only report rows that are still visible. Duplicates registered
@@ -1653,7 +1962,7 @@ async def _dedupe_releases() -> dict:
     match. Same-source album/EP rows remain distinct; only a cross-source
     album-vs-EP pair counts as a duplicate. Within a group the
     highest-priority copy survives — MusicBrainz, then iTunes, then
-    SoundCloud — and the rest are hidden. Hidden rows carry ``hidden_reason``
+    Bandcamp, then SoundCloud — and the rest are hidden. Hidden rows carry ``hidden_reason``
     so a later pass can tell dedup hides apart from manual ones, and rows
     this pass hid earlier but that no longer duplicate anything are restored.
     Titles that normalize to an empty string are ignored — they carry no
@@ -2107,6 +2416,8 @@ def _enabled_sources() -> list[str]:
         sources.append("musicbrainz")
     if settings.get("source_itunes", "1") == "1":
         sources.append("itunes")
+    if settings.get("source_bandcamp", "0") == "1":
+        sources.append("bandcamp")
     if settings.get("source_soundcloud", "1") == "1":
         sources.append("soundcloud")
     return sources
