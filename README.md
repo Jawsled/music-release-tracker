@@ -71,6 +71,7 @@ A `Music-Release-Tracker (conda).bat` launcher is included if you prefer running
 - **New-only checkbox:** Shows only entries marked `NEW`. "New" here means *newly added to the database*. This has nothing to do with release dates. Dismiss badges individually with a click or via `Mark All as Seen` button at the top.
 - **Hidden only checkbox:** Shows every hidden release — manual hides plus copies dedup set aside — with the reason and, for dedup hides, the surviving copy or owning album. Each row has an Unhide action. Unhiding a dedup copy also marks it as user-preferred so a later dedup pass leaves it visible.
 - **Tracklist:** Fetched from MusicBrainz/iTunes/Bandcamp/SoundCloud for anything other than singles, with a copy button to quickly copy the entire list.
+- **Album art download:** Click a cover to pick 500, 1000, 1500 or 2000 px, or the largest available upload (1000 px is preselected). Each provider is asked for its closest available variant — Cover Art Archive, Apple's CDN, Bandcamp's `_10`/`_16` sizes or SoundCloud's original — and the saved file is named `Artist - Title (WxH).jpg`.
 - **`SINGLE` badge:** Purely local: matches track titles against the artist's visible single releases, so hidden duplicate copies never add a badge.
 
 ### Hidden releases
@@ -101,7 +102,7 @@ SQLite database (`music-release-tracker.db`) with four active tables. Older data
 
 Alongside the database snapshots, the tracked artist list is written to `BACKUP/music-release-tracker-artists-<timestamp>.json` before migrations run at startup and every 24 hours while the app stays open. These files use the same format as the Artists page export and can be imported directly; the latest 30 are kept.
 
-Cover art for MusicBrainz releases is proxied through `/api/covers/{mbid}` and cached on disk in `.cache/covers/` (regenerable — safe to delete). The feed loads one page at a time and appends more as you scroll. Tracklists, streaming links, and an artist's MusicBrainz links are cached in `api_cache` (TTLs in `cache.py`; entries untouched for 90 days are pruned at startup).
+Cover art for MusicBrainz releases is proxied through `/api/covers/{mbid}` and cached on disk in `.cache/covers/` (regenerable — safe to delete). Downloads go through `/api/artwork/download`, which maps the stored cover to the provider's larger variants and only fetches from that provider's artwork CDN. The feed loads one page at a time and appends more as you scroll. Tracklists, streaming links, and an artist's MusicBrainz links are cached in `api_cache` (TTLs in `cache.py`; entries untouched for 90 days are pruned at startup).
 
 ## Known Issues
 

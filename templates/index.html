@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Music Release Tracker</title>
     <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
-    <link rel="stylesheet" href="/static/style.css?v=20">
+    <link rel="stylesheet" href="/static/style.css?v=22">
 </head>
 <body>
     <header class="app-header">
@@ -257,13 +257,62 @@
         </div>
     </div>
 
+    <!-- Confirmation Modal -->
+    <div id="confirm-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title" aria-describedby="confirm-modal-message">
+        <div class="modal-content confirm-modal-content">
+            <div class="modal-header">
+                <h3 id="confirm-modal-title">Confirm</h3>
+                <button type="button" class="popup-close-btn" id="confirm-modal-close" aria-label="Close confirmation">✕</button>
+            </div>
+            <div class="modal-body">
+                <p id="confirm-modal-message" class="confirm-modal-message"></p>
+                <div class="confirm-modal-actions">
+                    <button type="button" class="link-btn" id="confirm-modal-cancel">Cancel</button>
+                    <button type="button" class="confirm-btn confirm-btn-danger" id="confirm-modal-yes">Confirm</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Album Art Download Modal -->
+    <div id="artwork-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="artwork-modal-title">
+        <div class="modal-content artwork-modal-content">
+            <div class="modal-header">
+                <h3 id="artwork-modal-title">Download album art</h3>
+                <button type="button" class="popup-close-btn" id="artwork-modal-close" aria-label="Close download dialog">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="artwork-preview-row">
+                    <img id="artwork-preview" class="artwork-preview" alt="" data-hide-on-error>
+                    <div class="artwork-meta">
+                        <div id="artwork-modal-release" class="artwork-release"></div>
+                        <div id="artwork-modal-artist" class="artwork-artist"></div>
+                    </div>
+                </div>
+                <fieldset class="artwork-sizes">
+                    <legend>Resolution</legend>
+                    <label class="artwork-size-option"><input type="radio" name="artwork-size" value="500"> 500 × 500</label>
+                    <label class="artwork-size-option"><input type="radio" name="artwork-size" value="1000"> 1000 × 1000</label>
+                    <label class="artwork-size-option"><input type="radio" name="artwork-size" value="1500"> 1500 × 1500</label>
+                    <label class="artwork-size-option"><input type="radio" name="artwork-size" value="2000"> 2000 × 2000</label>
+                    <label class="artwork-size-option"><input type="radio" name="artwork-size" value="0"> Largest</label>
+                </fieldset>
+                <p class="artwork-hint" id="artwork-size-hint">The closest available resolution is used.</p>
+                <div class="artwork-actions">
+                    <button type="button" class="link-btn" id="artwork-cancel">Cancel</button>
+                    <button type="button" class="check-btn" id="artwork-download-btn">Download</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="/static/js/core.js?v=25"></script>
-    <script src="/static/js/feed.js?v=27"></script>
-    <script src="/static/js/artists.js?v=28"></script>
+    <script src="/static/js/feed.js?v=28"></script>
+    <script src="/static/js/artists.js?v=30"></script>
     <script src="/static/js/check.js?v=24"></script>
     <script src="/static/js/misc.js?v=24"></script>
     <script src="/static/js/panels.js?v=25"></script>
-    <script src="/static/js/modal.js?v=26"></script>
+    <script src="/static/js/modal.js?v=28"></script>
     <script src="/static/js/init.js?v=24"></script>
     <div id="toast-container" class="toast-container" aria-live="polite"></div>
 </body>

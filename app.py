@@ -24,6 +24,7 @@ import spotify
 import external_links
 import logstore
 import covers
+import artwork
 import cache
 
 HOST = "127.0.0.1"
@@ -1332,6 +1333,7 @@ async def unlink_artist_itunes(artist_id: int):
     return {"status": "unlinked", "artist": artist}
 
 
+@app.post("/api/artists/{artist_id}/unlink-musicbrainz")
 @app.post("/api/artists/{artist_id}/unlink-mb")
 async def unlink_artist_mb(artist_id: int):
     artist = db.unlink_artist_mb(artist_id)
@@ -1511,6 +1513,52 @@ async def list_releases(
     else:
         response.headers["X-Next-Cursor"] = ""
     return releases
+
+@app.get("/api/artwork/download")
+async def download_artwork(
+    source: str = Query(""),
+    mbid: str = Query(""),
+    artwork_url: str = Query(""),
+    size: int = Query(1000, ge=0, le=3000),
+    artist: str = Query(""),
+    title: str = Query(""),
+):
+    """Download a release cover at (or as close as possible to) `size`.
+
+    size=0 means "largest available". The response carries the real image
+    dimensions so the UI can report what it actually got.
+    """
+    result = await artwork.resolve(
+        source=source,
+        mbid=mbid,
+        artwork_url=artwork_url,
+        size=size or None,
+    )
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "status": "error",
+                "message": "No artwork available for this release.",
+            },
+        )
+
+    filename = artwork.build_filename(
+        artist, title, result.width, result.height, result.content_type
+    )
+    headers = {
+        "Content-Disposition": artwork.content_disposition(filename),
+        "Cache-Control": "private, max-age=0, no-store",
+    }
+    if result.width and result.height:
+        headers["X-Image-Width"] = str(result.width)
+        headers["X-Image-Height"] = str(result.height)
+    return Response(
+        content=result.data,
+        media_type=result.content_type,
+        headers=headers,
+    )
+
 
 @app.get("/api/covers/{mbid}")
 async def get_release_cover(mbid: str):

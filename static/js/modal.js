@@ -1,3 +1,49 @@
+// --- Confirmation Modal ---
+const confirmModal = document.getElementById("confirm-modal");
+const confirmModalTitle = document.getElementById("confirm-modal-title");
+const confirmModalMessage = document.getElementById("confirm-modal-message");
+const confirmModalYes = document.getElementById("confirm-modal-yes");
+const confirmModalCancel = document.getElementById("confirm-modal-cancel");
+const confirmModalClose = document.getElementById("confirm-modal-close");
+
+let _confirmCallback = null;
+let _confirmReturnFocus = null;
+
+function openConfirmModal({ title, message, confirmLabel = "Confirm", onConfirm, returnFocus = null }) {
+  _confirmReturnFocus = returnFocus || document.activeElement;
+  _confirmCallback = typeof onConfirm === "function" ? onConfirm : null;
+  confirmModalTitle.textContent = title || "Confirm";
+  confirmModalMessage.textContent = message || "";
+  confirmModalYes.textContent = confirmLabel;
+  confirmModal.classList.remove("hidden");
+  confirmModalCancel.focus();
+}
+
+function closeConfirmModal() {
+  confirmModal.classList.add("hidden");
+  _confirmCallback = null;
+  if (_confirmReturnFocus && _confirmReturnFocus.isConnected) {
+    _confirmReturnFocus.focus();
+  }
+  _confirmReturnFocus = null;
+}
+
+confirmModalYes.addEventListener("click", () => {
+  const callback = _confirmCallback;
+  closeConfirmModal();
+  if (callback) callback();
+});
+confirmModalCancel.addEventListener("click", closeConfirmModal);
+confirmModalClose.addEventListener("click", closeConfirmModal);
+confirmModal.addEventListener("click", e => {
+  if (e.target === confirmModal) closeConfirmModal();
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !confirmModal.classList.contains("hidden")) {
+    closeConfirmModal();
+  }
+});
+
 // --- Link Source Modal ---
 const linkSourceModal = document.getElementById("link-source-modal");
 const linkSourceTitle = document.getElementById("link-source-title");
@@ -245,4 +291,192 @@ function showLinkConflict(btn, artist, message) {
     item.appendChild(box);
   }
 }
+
+// --- Album Art Download Modal ---
+// The feed cover is a button; clicking it opens this dialog so the user can
+// pick a resolution. The backend resolves the provider's larger variants
+// (Apple, SoundCloud, Bandcamp, Cover Art Archive) and reports the real size
+// it found, which is what the toast shows after a download.
+const artworkModal = document.getElementById("artwork-modal");
+const artworkPreview = document.getElementById("artwork-preview");
+const artworkReleaseEl = document.getElementById("artwork-modal-release");
+const artworkArtistEl = document.getElementById("artwork-modal-artist");
+const artworkHint = document.getElementById("artwork-size-hint");
+const artworkDownloadBtn = document.getElementById("artwork-download-btn");
+const artworkCancelBtn = document.getElementById("artwork-cancel");
+const artworkCloseBtn = document.getElementById("artwork-modal-close");
+const ARTWORK_SIZE_KEY = "mrt_artwork_download_size";
+const ARTWORK_DEFAULT_SIZE = 1000;
+
+let _artworkTarget = null;
+let _artworkReturnFocus = null;
+let _artworkRequestSeq = 0;   // drops results from closed/superseded dialogs
+
+function _artworkSizeInputs() {
+  return artworkModal.querySelectorAll('input[name="artwork-size"]');
+}
+
+function _artworkSelectedSize() {
+  const checked = artworkModal.querySelector('input[name="artwork-size"]:checked');
+  return checked ? Number(checked.value) : ARTWORK_DEFAULT_SIZE;
+}
+
+function _artworkSetSelectedSize(size) {
+  const value = String(size);
+  let found = false;
+  _artworkSizeInputs().forEach(input => {
+    const match = input.value === value;
+    input.checked = match;
+    if (match) found = true;
+  });
+  if (!found) {
+    _artworkSizeInputs().forEach(input => {
+      input.checked = input.value === String(ARTWORK_DEFAULT_SIZE);
+    });
+  }
+}
+
+function _savedArtworkSize() {
+  try {
+    const raw = localStorage.getItem(ARTWORK_SIZE_KEY);
+    if (raw !== null) {
+      const value = Number(raw);
+      if ([0, 500, 1000, 1500, 2000].includes(value)) return value;
+    }
+  } catch { /* storage unavailable — keep the default */ }
+  return ARTWORK_DEFAULT_SIZE;
+}
+
+function openArtworkDownload(btn) {
+  if (!btn) return;
+  _artworkRequestSeq++;   // supersede any download still in flight
+  _artworkTarget = {
+    source: btn.dataset.source || "",
+    mbid: btn.dataset.mbid || "",
+    artworkUrl: btn.dataset.artworkUrl || "",
+    artist: btn.dataset.artist || "",
+    title: btn.dataset.title || "",
+    preview: btn.dataset.coverSrc || "",
+  };
+  _artworkReturnFocus = btn;
+
+  artworkPreview.style.display = "";
+  artworkPreview.src = _artworkTarget.preview;
+  artworkPreview.alt = _artworkTarget.title ? `Album art for ${_artworkTarget.title}` : "";
+  artworkReleaseEl.textContent = _artworkTarget.title || "Untitled release";
+  artworkArtistEl.textContent = _artworkTarget.artist || "";
+  _artworkSetSelectedSize(_savedArtworkSize());
+  artworkHint.textContent = "The closest available resolution is used.";
+  artworkHint.classList.remove("error");
+  artworkDownloadBtn.disabled = false;
+  artworkDownloadBtn.textContent = "Download";
+  artworkModal.classList.remove("hidden");
+  artworkDownloadBtn.focus();
+}
+
+function closeArtworkDownload() {
+  _artworkRequestSeq++;   // a closed dialog must not act on a late response
+  artworkModal.classList.add("hidden");
+  artworkPreview.removeAttribute("src");
+  _artworkTarget = null;
+  if (_artworkReturnFocus && _artworkReturnFocus.isConnected) {
+    _artworkReturnFocus.focus();
+  }
+  _artworkReturnFocus = null;
+}
+
+function _artworkFilename(artist, title, width, height, contentType) {
+  const extension = contentType === "image/png" ? "png"
+    : contentType === "image/webp" ? "webp"
+    : contentType === "image/gif" ? "gif"
+    : "jpg";
+  const base = [artist, title]
+    .filter(part => part && part.trim())
+    .join(" - ")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120) || "album-art";
+  const dimensions = width && height ? `${width}x${height}` : "artwork";
+  return `${base} (${dimensions}).${extension}`;
+}
+
+async function downloadArtwork() {
+  const target = _artworkTarget;
+  if (!target) return;
+  const seq = ++_artworkRequestSeq;
+  const size = _artworkSelectedSize();
+  const params = new URLSearchParams();
+  params.set("source", target.source);
+  params.set("size", String(size));
+  if (target.mbid) params.set("mbid", target.mbid);
+  if (target.artworkUrl) params.set("artwork_url", target.artworkUrl);
+  if (target.artist) params.set("artist", target.artist);
+  if (target.title) params.set("title", target.title);
+
+  const idleLabel = artworkDownloadBtn.textContent;
+  artworkDownloadBtn.disabled = true;
+  artworkDownloadBtn.textContent = "Downloading…";
+  artworkHint.textContent = "Fetching the best available artwork…";
+  artworkHint.classList.remove("error");
+
+  try {
+    const resp = await apiRaw(`/api/artwork/download?${params}`, { allowError: true });
+    if (seq !== _artworkRequestSeq) return;
+    if (!resp.ok) {
+      let message = "No artwork available for this release.";
+      try {
+        const data = await resp.json();
+        if (data && data.message) message = data.message;
+      } catch { /* non-JSON error body */ }
+      throw new Error(message);
+    }
+
+    const blob = await resp.blob();
+    if (seq !== _artworkRequestSeq) return;
+    const width = resp.headers.get("X-Image-Width") || "";
+    const height = resp.headers.get("X-Image-Height") || "";
+    const filename = _artworkFilename(
+      target.artist,
+      target.title,
+      width,
+      height,
+      blob.type,
+    );
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+    try { localStorage.setItem(ARTWORK_SIZE_KEY, String(size)); } catch { /* ignore */ }
+    const actual = width && height ? ` (${width} × ${height})` : "";
+    showToast(`Album art downloaded${actual}`);
+    closeArtworkDownload();
+  } catch (err) {
+    if (seq !== _artworkRequestSeq) return;
+    artworkHint.textContent = err && err.message
+      ? err.message
+      : "Could not download artwork.";
+    artworkHint.classList.add("error");
+    artworkDownloadBtn.disabled = false;
+    artworkDownloadBtn.textContent = idleLabel || "Download";
+  }
+}
+
+artworkDownloadBtn.addEventListener("click", downloadArtwork);
+artworkCancelBtn.addEventListener("click", closeArtworkDownload);
+artworkCloseBtn.addEventListener("click", closeArtworkDownload);
+artworkModal.addEventListener("click", e => {
+  if (e.target === artworkModal) closeArtworkDownload();
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !artworkModal.classList.contains("hidden")) {
+    closeArtworkDownload();
+  }
+});
 

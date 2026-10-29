@@ -168,6 +168,7 @@ const ACTIONS = {
   "reset-filters": () => resetFilters(),
   "toggle-tracklist": el => toggleTracklist(el),
   "toggle-streaming": el => toggleStreaming(el),
+  "open-artwork-download": el => openArtworkDownload(el),
   "hide-release": el => hideRelease(Number(el.dataset.id), el),
   "unhide-release": el => unhideRelease(Number(el.dataset.id), el),
   "mark-seen": el => markSeen(Number(el.dataset.id), el),
@@ -289,7 +290,11 @@ document.addEventListener("error", e => {
     fallback.className = "cover-fallback";
     fallback.setAttribute("aria-hidden", "true");
     fallback.textContent = initials;
-    img.replaceWith(fallback);
+    // A cover that failed to load has nothing to download, so drop the whole
+    // button instead of leaving an initials tile that opens the dialog.
+    const coverBtn = img.closest(".release-cover-btn");
+    if (coverBtn) coverBtn.replaceWith(fallback);
+    else img.replaceWith(fallback);
   }
 }, true);
 
@@ -1090,8 +1095,18 @@ function renderReleaseCard(r) {
   } else if (source === 'musicbrainz' && r.mbid) {
     coverUrl = `/api/covers/${encodeURIComponent(r.mbid)}`;
   }
+  // The cover doubles as a download button. The dialog sends the release's
+  // source + artwork URL (or MBID) to the backend, which resolves a larger
+  // variant from that provider's CDN.
   const coverHtml = coverUrl
-    ? `<img class="release-cover" src="${coverUrl}" alt="" width="64" height="64" decoding="async" loading="lazy" data-cover-fallback="${esc(initialsFor(r.artist_name))}">`
+    ? `<button type="button" class="release-cover-btn" data-action="open-artwork-download" title="Download album art" aria-label="Download album art for ${esc(r.artist_name)} — ${esc(r.title)}"${dataAttrs({
+        source,
+        mbid: r.mbid,
+        "artwork-url": r.artwork_url || "",
+        "cover-src": coverUrl,
+        artist: r.artist_name,
+        title: r.title,
+      })}><img class="release-cover" src="${coverUrl}" alt="" width="64" height="64" decoding="async" loading="lazy" data-cover-fallback="${esc(initialsFor(r.artist_name))}"></button>`
     : `<div class="cover-fallback" aria-hidden="true">${esc(initialsFor(r.artist_name))}</div>`;
 
     // Streaming links only exist for MusicBrainz-sourced releases.

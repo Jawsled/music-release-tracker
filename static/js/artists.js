@@ -628,12 +628,20 @@ function toggleArtistMenu(btn) {
   }
 }
 
-// Close dropdown when clicking outside
+// Close dropdown when clicking outside. Actions that re-render the menu
+// (e.g. Edit note) remove the clicked node from the DOM, so use the event
+// path captured at dispatch instead of the now-detached target.
 document.addEventListener('click', e => {
-  if (!e.target.closest('.artist-manage-wrapper')) {
-    document.querySelectorAll('.artist-dropdown:not(.hidden)').forEach(d => d.classList.add('hidden'));
-  }
+  const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+  const inside = path.some(n => n && n.classList && n.classList.contains('artist-manage-wrapper'))
+    || (e.target.closest && e.target.closest('.artist-manage-wrapper'));
+  if (!inside) _closeArtistMenus();
 });
+
+function _artistName(id) {
+  const a = (_artistsCache || []).find(x => String(x.id) === String(id));
+  return a ? a.name : "this artist";
+}
 
 function _artistMenuOf(btn) {
   // The dropdown belonging to the clicked item. Falls back to any open
@@ -643,16 +651,25 @@ function _artistMenuOf(btn) {
   return [...document.querySelectorAll('.artist-dropdown:not(.hidden)')];
 }
 
-function _artistName(id) {
-  const a = (_artistsCache || []).find(x => String(x.id) === String(id));
-  return a ? a.name : "this artist";
+function _artistManageButton(btn) {
+  const wrapper = btn && btn.closest ? btn.closest('.artist-manage-wrapper') : null;
+  return wrapper ? wrapper.querySelector('.manage-btn') : null;
+}
+
+function _closeArtistMenus() {
+  document.querySelectorAll('.artist-dropdown:not(.hidden)').forEach(d => d.classList.add('hidden'));
 }
 
 function confirmRemoveArtist(id, btn) {
   const name = _artistName(id);
-  _artistMenuOf(btn).forEach(d => {
-    d.classList.remove('hidden');
-    d.innerHTML = `<div class="inline-confirm">Untrack “${esc(name)}”? <button class="confirm-yes"${dataAttrs({ action: "do-remove-artist", id: id })}>Confirm</button> <button class="confirm-no"${dataAttrs({ action: "load-artists" })}>Keep</button></div>`;
+  const returnFocus = _artistManageButton(btn);
+  _closeArtistMenus();
+  openConfirmModal({
+    title: "Untrack artist?",
+    message: `Untrack “${name}”? All of its releases will be removed from the feed.`,
+    confirmLabel: "Untrack",
+    returnFocus,
+    onConfirm: () => doRemoveArtist(id),
   });
 }
 
@@ -670,18 +687,30 @@ function confirmUnlinkArtist(id, source, btn) {
     : source === 'itunes' ? 'Apple Music'
     : source === 'bandcamp' ? 'Bandcamp'
     : 'SoundCloud';
-  _artistMenuOf(btn).forEach(d => {
-    d.classList.remove('hidden');
-    d.innerHTML = `<div class="inline-confirm">Unlink ${sourceLabel}? <button class="confirm-yes"${dataAttrs({ action: "do-unlink-artist", id: id, source: source })}>Confirm</button> <button class="confirm-no"${dataAttrs({ action: "load-artists" })}>Keep</button></div>`;
+  const name = _artistName(id);
+  const returnFocus = _artistManageButton(btn);
+  _closeArtistMenus();
+  openConfirmModal({
+    title: `Unlink ${sourceLabel}?`,
+    message: `Unlink ${sourceLabel} from “${name}”? Its ${sourceLabel} releases will be removed.`,
+    confirmLabel: "Unlink",
+    returnFocus,
+    onConfirm: () => doUnlinkArtist(id, source),
   });
 }
 
 function doUnlinkArtist(id, source) {
-  apiRaw(`/api/artists/${id}/unlink-${source}`, { method: "POST", allowError: true }).then(() => {
+  // MusicBrainz is the one source whose API slug is not its UI name.
+  const slug = source === "musicbrainz" ? "mb" : source;
+  apiRaw(`/api/artists/${id}/unlink-${slug}`, { method: "POST" }).then(() => {
     showToast("Source unlinked");
     loadArtists();
     _refreshArtistsCache();
     loadReleases();
+  }).catch(() => {
+    showToast("Could not unlink source — check Logs");
+    loadArtists();
+    _refreshArtistsCache();
   });
 }
 
