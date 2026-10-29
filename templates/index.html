@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Music Release Tracker</title>
     <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
-    <link rel="stylesheet" href="/static/style.css?v=18">
+    <link rel="stylesheet" href="/static/style.css?v=20">
 </head>
 <body>
     <header class="app-header">
@@ -200,7 +200,7 @@
         <section id="tab-artists" class="tab-content">
             <div class="search-bar">
                 <div class="search-box">
-                    <input type="text" id="artist-search-input" placeholder="Search MusicBrainz, iTunes, Bandcamp and SoundCloud, or paste URL" aria-label="Search artists">
+                    <input type="text" id="artist-search-input" placeholder="Search MusicBrainz, iTunes, Bandcamp and SoundCloud, or paste a link" aria-label="Search artists">
                     <div class="search-divider" aria-hidden="true"></div>
                     <div class="filter-dropdown" id="search-source-wrapper">
                         <button type="button" class="search-source-btn" id="search-source-btn" data-action="toggle-search-source-menu" aria-haspopup="true" aria-expanded="false" title="Choose which platforms to search">All ▾</button>
@@ -214,7 +214,7 @@
                 </div>
                 <button id="artist-search-btn">Search</button>
             </div>
-            <p class="search-hint">Pasting MBID or MusicBrainz / Apple Music / SoundCloud / Bandcamp URL also works!</p>
+            <p class="search-hint">Paste an MBID or an artist link from MusicBrainz, Apple Music, Spotify, SoundCloud, Bandcamp, Tidal, Qobuz, Amazon Music or YouTube.</p>
             <div id="search-results" class="search-results" aria-live="polite"></div>
             <div id="search-more-wrap" class="search-more-wrap hidden"><button class="check-btn" id="search-more-btn">Show more</button></div>
             <div class="artists-header-row">
@@ -259,11 +259,11 @@
 
     <script src="/static/js/core.js?v=25"></script>
     <script src="/static/js/feed.js?v=27"></script>
-    <script src="/static/js/artists.js?v=26"></script>
+    <script src="/static/js/artists.js?v=28"></script>
     <script src="/static/js/check.js?v=24"></script>
     <script src="/static/js/misc.js?v=24"></script>
     <script src="/static/js/panels.js?v=25"></script>
-    <script src="/static/js/modal.js?v=25"></script>
+    <script src="/static/js/modal.js?v=26"></script>
     <script src="/static/js/init.js?v=24"></script>
     <div id="toast-container" class="toast-container" aria-live="polite"></div>
 </body>

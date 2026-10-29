@@ -242,6 +242,50 @@ async def search_artist(query: str) -> list[dict]:
     return results
 
 
+async def get_artists_by_url(resource_url: str) -> list[dict]:
+    """Return the MusicBrainz artist(s) linked to an external URL.
+
+    Uses the /url endpoint with artist relationships, so the match is based on
+    MB's curated URL data rather than a fuzzy name search. A pasted streaming
+    link (Spotify, Apple Music, ...) therefore identifies the right artist even
+    when several artists share a name. Returns [] when the URL is not linked to
+    any artist (the endpoint answers 404 in that case).
+    """
+    try:
+        data = await _rate_limited_get(
+            f"{BASE_URL}/url",
+            params={
+                "resource": resource_url,
+                "inc": "artist-rels",
+                "fmt": "json",
+            },
+        )
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return []
+        raise
+
+    seen: set[str] = set()
+    results: list[dict] = []
+    for rel in data.get("relations") or []:
+        if rel.get("target-type") != "artist":
+            continue
+        artist = rel.get("artist") or {}
+        mbid = artist.get("id")
+        if not mbid or mbid in seen:
+            continue
+        seen.add(mbid)
+        results.append({
+            "mbid": mbid,
+            "name": artist.get("name", ""),
+            "disambiguation": artist.get("disambiguation", ""),
+            "type": artist.get("type", ""),
+            "country": artist.get("country", ""),
+            "score": 100,
+        })
+    return results
+
+
 async def get_release_tracks(rg_id: str, main_mbid: str = "") -> list[dict]:
     """Fetch tracks for a release group from MusicBrainz.
 
@@ -624,6 +668,18 @@ async def get_artist_links(mbid: str) -> dict:
             parsed_bc = _extract_bandcamp_url(value)
             if parsed_bc:
                 bandcamp_url = parsed_bc
+
+    # Apple links are frequently typed generically ("streaming" or "purchase
+    # for download"), which the relationship-type check above misses. The
+    # URL-derived streaming list still identifies the service, so recover the
+    # artist ID from there.
+    if itunes_artist_id is None:
+        for item in streaming:
+            if item.get("key") == "apple_music":
+                parsed = _extract_apple_artist_id(item.get("url", ""))
+                if parsed:
+                    itunes_artist_id = parsed
+                    break
 
     return {
         "streaming": streaming,

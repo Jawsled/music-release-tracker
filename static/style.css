@@ -270,6 +270,7 @@ a.source-icon-btn { text-decoration: none; }
 .mb-links-panel .status-msg { margin: 0; }
 .mb-links-panel .result-sources { margin-top: 0; }
 .mb-confirmed-tag { display: inline-flex; align-items: center; color: var(--success-bright); font-size: 0.72rem; font-weight: 600; white-space: nowrap; align-self: center; cursor: default; }
+.link-match-tag { display: inline-flex; align-items: center; color: var(--warn-bright); font-size: 0.72rem; font-weight: 600; white-space: nowrap; align-self: center; cursor: default; border: 1px solid var(--warn); border-radius: 10px; padding: 0.05rem 0.45rem; }
 
 /* Artist manage dropdown */
 .artist-manage-wrapper { position: relative; }

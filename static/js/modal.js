@@ -27,7 +27,9 @@ function openLinkSourceModal(artistId, artistName, source) {
       ? "Paste a SoundCloud URL or permalink, then Search."
       : source === "bandcamp"
         ? "Paste a Bandcamp artist URL (artist.bandcamp.com), then Search. Bandcamp has no name search."
-        : `Showing matches for “${artistName}” — refine or paste a link, then Search.`;
+        : source === "musicbrainz"
+          ? `Showing matches for “${artistName}” — refine, or paste a MusicBrainz, Spotify, Tidal, Qobuz, Amazon Music or YouTube artist link, then Search.`
+          : `Showing matches for “${artistName}” — refine or paste a link, then Search.`;
 
   // Always visible input, pre-filled with artist name (or guessed profile URL)
   if (source === "soundcloud") {
@@ -86,7 +88,7 @@ async function searchLinkSource(query) {
     }
 
     if (results.length === 0) {
-      linkSourceResults.innerHTML = '<p class="status-msg">No artists found. Check spelling or paste a direct link.</p>';
+      linkSourceResults.innerHTML = `<p class="status-msg">${esc(noResultsMessage(query))}</p>`;
     } else {
       linkSourceResults.innerHTML = `<p class="status-msg">Found ${results.length} — showing ${Math.min(results.length, 10)}</p>` + results.slice(0, 10).map(a => {
         let artistImage = a.artistImageUrl || '';

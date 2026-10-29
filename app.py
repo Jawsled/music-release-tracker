@@ -20,6 +20,8 @@ import musicbrainz
 import itunes
 import soundcloud
 import bandcamp
+import spotify
+import external_links
 import logstore
 import covers
 import cache
@@ -220,6 +222,10 @@ async def search_artists(body: ArtistSearchRequest):
     permalinks and Bandcamp artist URLs directly into the search bar. Bandcamp
     names use the autocomplete endpoint behind its site search; a pasted
     Bandcamp URL resolves that exact profile.
+
+    Artist links from services the app only displays (Spotify, Tidal, Qobuz,
+    Amazon Music, YouTube / YouTube Music) are resolved through MusicBrainz URL
+    relationships instead of being searched as raw URLs.
     """
     import re as _re
 
@@ -290,6 +296,28 @@ async def search_artists(body: ArtistSearchRequest):
                 }]
         except Exception:
             pass
+
+    # Spotify is not a tracked source, but a pasted artist link is an exact
+    # identifier. Resolve it through MusicBrainz URL relationships (the SAMBL
+    # approach) so it never turns into a name search over the raw URL.
+    if spotify.looks_like_spotify(query):
+        if body.source not in ("", "musicbrainz"):
+            return []
+        if "musicbrainz" not in _enabled_sources():
+            return []
+        return await _resolve_spotify_artist(query)
+
+    # Same idea for the other streaming services the app already lists on
+    # releases (Tidal, Qobuz, Amazon Music, YouTube/YouTube Music). These are
+    # trackable only through MusicBrainz, so a pasted link is used to locate
+    # the MB artist and its confirmed platform links.
+    if external_links.looks_like(query):
+        if body.source not in ("", "musicbrainz"):
+            return []
+        if "musicbrainz" not in _enabled_sources():
+            return []
+        link = await external_links.parse(query)
+        return await _resolve_external_artist(link) if link else []
 
     # SoundCloud URL pastes resolve to the exact profile (unambiguous link).
     # Plain words / spaced names fall through to the combined search below,
@@ -642,6 +670,168 @@ def _mark_bc_tracked(results: list[dict]) -> list[dict]:
         else:
             r["already_tracked"] = False
     return results
+
+
+def _mark_mb_tracked(results: list[dict]) -> list[dict]:
+    """Annotate MusicBrainz-resolved results with already_tracked info."""
+    for r in results:
+        mbid = r.get("mbid", "")
+        existing = db.get_artist_by_mbid(mbid) if mbid else None
+        if not existing and r.get("itunes_artist_id"):
+            existing = db.get_artist_by_itunes_id(r["itunes_artist_id"])
+        if not existing and r.get("soundcloud_permalink"):
+            existing = db.get_artist_by_soundcloud_permalink(r["soundcloud_permalink"])
+        if not existing and r.get("bandcamp_url"):
+            existing = db.get_artist_by_bandcamp_url(r["bandcamp_url"])
+        r["already_tracked"] = existing is not None
+        r["existing_mbid"] = existing.get("mbid") if existing else None
+        r["existing_itunes_id"] = existing.get("itunes_artist_id") if existing else None
+        r["existing_bandcamp_url"] = existing.get("bandcamp_url") if existing else None
+    return results
+
+
+def _mb_row_from_artist(artist: dict) -> dict:
+    """Build the search-result shape for a MusicBrainz artist."""
+    return {
+        "name": artist.get("name", ""),
+        "mbid": artist.get("mbid", ""),
+        "itunes_artist_id": None,
+        "soundcloud_permalink": None,
+        "bandcamp_url": None,
+        "bandcamp_band_id": None,
+        "disambiguation": artist.get("disambiguation", ""),
+        "type": artist.get("type", ""),
+        "country": artist.get("country", ""),
+        "score": artist.get("score", 100),
+        "source": "musicbrainz",
+        "artistImageUrl": "",
+    }
+
+
+async def _enrich_mb_row(row: dict) -> dict:
+    """Attach MB-confirmed platform links so one Add links every source."""
+    mbid = row.get("mbid", "")
+    if not mbid:
+        return row
+    try:
+        links = await cache.cached(
+            f"mb_links:{mbid}",
+            cache.TTL_MB_LINKS,
+            lambda: musicbrainz.get_artist_links(mbid),
+        )
+    except Exception:
+        return row
+    if not links:
+        return row
+    if links.get("itunes_artist_id"):
+        row["itunes_artist_id"] = links["itunes_artist_id"]
+        row["_confirmed_apple"] = True
+    if links.get("soundcloud_permalink"):
+        row["soundcloud_permalink"] = links["soundcloud_permalink"]
+        row["_confirmed_sc"] = True
+    if links.get("bandcamp_url"):
+        row["bandcamp_url"] = links["bandcamp_url"]
+        row["_confirmed_bc"] = True
+    row["_mb_streaming"] = links.get("streaming") or []
+    row["_mb_enriched"] = True
+    return row
+
+
+async def _resolve_link_artist(
+    urls: list[str],
+    service: str,
+    cache_key: str,
+    name_fetcher=None,
+) -> list[dict]:
+    """Resolve canonical external-artist URL(s) to MusicBrainz search rows.
+
+    ``urls`` are tried in order (e.g. a locale-specific Amazon URL, then the
+    .com equivalent). Exact matches come from MusicBrainz URL relationships.
+    If none exist and ``name_fetcher`` is supplied, the artist name from the
+    service's page is used for a clearly-marked name match.
+    """
+    matches: list[dict] = []
+    for url in urls:
+        try:
+            found = await cache.cached(
+                f"link_artist:{url}",
+                cache.TTL_MB_LINKS,
+                lambda u=url: musicbrainz.get_artists_by_url(u),
+            )
+        except Exception as e:
+            logger.warning(f"{service} link resolution failed for {url}: {_error_message(e)}")
+            continue
+        if found:
+            matches = found
+            break
+
+    if matches:
+        rows = []
+        for match in matches[:5]:
+            rows.append(await _enrich_mb_row(_mb_row_from_artist(match)))
+        return _mark_mb_tracked(rows)
+
+    if name_fetcher is None:
+        return []
+    try:
+        name = await cache.cached(
+            f"link_name:{cache_key}",
+            cache.TTL_MB_LINKS,
+            name_fetcher,
+        )
+    except Exception as e:
+        logger.warning(f"{service} page lookup failed for {cache_key}: {_error_message(e)}")
+        return []
+    if not name:
+        return []
+
+    try:
+        candidates = await musicbrainz.search_artist(name)
+    except Exception as e:
+        logger.warning(
+            f"MusicBrainz fallback search failed for {service} artist "
+            f"'{name}': {_error_message(e)}"
+        )
+        return []
+
+    wanted = _normalize_name(name)
+    exact = [c for c in candidates if _normalize_name(c.get("name", "")) == wanted]
+    rows = []
+    for candidate in (exact[:5] or candidates[:3]):
+        row = _mb_row_from_artist(candidate)
+        # No MB link ties this artist to the service page: make that visible
+        # in the UI instead of presenting a name match as confirmed.
+        row["_link_name_only"] = True
+        row["_link_service"] = service
+        rows.append(row)
+    return _mark_mb_tracked(rows)
+
+
+async def _resolve_spotify_artist(query: str) -> list[dict]:
+    """Resolve a pasted Spotify artist link to MusicBrainz search rows."""
+    spotify_id = await spotify.resolve_artist_id(query)
+    if not spotify_id:
+        return []
+    return await _resolve_link_artist(
+        [spotify.artist_url(spotify_id)],
+        "Spotify",
+        f"spotify:{spotify_id}",
+        lambda: spotify.fetch_artist_name(spotify_id),
+    )
+
+
+async def _resolve_external_artist(link: external_links.ArtistLink) -> list[dict]:
+    """Resolve a parsed Tidal/Qobuz/Amazon/YouTube artist link."""
+    name_fetcher = (
+        (lambda: external_links.fetch_artist_name(link))
+        if link.name_url else None
+    )
+    return await _resolve_link_artist(
+        list(link.urls),
+        link.label,
+        f"{link.service}:{link.urls[0]}",
+        name_fetcher,
+    )
 
 
 async def _resolve_bandcamp_band_id(host: str, band_id: str | None = None) -> str | None:

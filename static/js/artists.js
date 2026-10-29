@@ -67,6 +67,10 @@ function searchResultPills(a) {
     if (a.soundcloud_permalink && _srcEnabled('soundcloud')) pills.push(`<a class="result-pill" href="https://soundcloud.com/${esc(a.soundcloud_permalink)}" target="_blank" rel="noopener"${scTitle}>${sourceIcon('soundcloud', 14)} SoundCloud ↗</a>`);
   }
   pills.push(mbConfirmedTag(a));
+  if (a._link_name_only) {
+    const service = a._link_service || "Service";
+    pills.push(`<span class="link-match-tag" title="MusicBrainz has no ${esc(service)} link for this artist, so this is a name match from the ${esc(service)} page — check it before adding">${esc(service)} name match</span>`);
+  }
   const inner = pills.join("");
   return inner ? `<div class="result-sources">${inner}</div>` : "";
 }
@@ -329,6 +333,26 @@ document.addEventListener("click", e => {
   if (wrapper && !wrapper.contains(e.target)) closeSearchSourceMenu();
 });
 
+function noResultsMessage(query) {
+  if (/^spotify:(?:album|track|playlist|episode|show):/i.test(query) ||
+      /(?:open\.|play\.)?spotify\.com\/(?:intl-[A-Za-z-]+\/)?(?:album|track|playlist|episode|show)\//i.test(query)) {
+    return "Paste a Spotify artist link (open.spotify.com/artist/…) — album and track links aren't supported here.";
+  }
+  const services = [
+    [/^spotify:|spotify\.(?:com|link)|spoti\.fi/i, "Spotify"],
+    [/tidal\.com/i, "Tidal"],
+    [/qobuz\.com/i, "Qobuz"],
+    [/music\.amazon\./i, "Amazon Music"],
+    [/(?:music\.)?youtube\.com|youtu\.be/i, "YouTube"],
+  ];
+  for (const [re, label] of services) {
+    if (re.test(query)) {
+      return `Couldn't resolve that ${label} link to a MusicBrainz artist. Try searching by name, or paste the artist page link instead.`;
+    }
+  }
+  return "No artists found. Check spelling or paste a direct link.";
+}
+
 async function searchArtists() {
   const query = searchInput.value.trim();
   if (!query) return;
@@ -355,7 +379,7 @@ async function searchArtists() {
     resetRowData();
     if (results.length === 0) {
       _lastSearchResults = [];
-      searchResults.innerHTML = '<p class="status-msg">No artists found. Check spelling or paste a direct link.</p>';
+      searchResults.innerHTML = `<p class="status-msg">${esc(noResultsMessage(query))}</p>`;
       document.getElementById("search-more-wrap").classList.add("hidden");
     } else {
       _lastSearchResults = results;

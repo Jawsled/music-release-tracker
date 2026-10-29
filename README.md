@@ -8,7 +8,7 @@ A local-first desktop app that tracks new releases with webUI. Powered by [Music
 
 ## Features
 
-- **Artist search:** Search MusicBrainz, iTunes, Bandcamp and SoundCloud by name (platform filter included in the search box), or paste an MBID, a MusicBrainz / Apple Music / Bandcamp / SoundCloud URL, or a SoundCloud permalink. Preview buttons and pills let you confirm you're adding the right artist before you commit.
+- **Artist search:** Search MusicBrainz, iTunes, Bandcamp and SoundCloud by name (platform filter included in the search box), or paste an MBID, a MusicBrainz / Apple Music / Spotify / Bandcamp / SoundCloud URL, or a SoundCloud permalink. Pasted Tidal, Qobuz, Amazon Music and YouTube / YouTube Music artist links work too. These extra links are resolved through MusicBrainz URL relationships (the SAMBL approach) to the exact MB artist and its confirmed platform links — those services are not tracked sources. Preview buttons and pills let you confirm you're adding the right artist before you commit.
 - **Release feed:** Browse albums, EPs, singles and other releases sorted by date; filter by artist, release type, new-only, or hidden-only.
 - **Tracklists:** Fetch tracklists for album and EP releases, including track numbers, durations and featured-artist credits. Tracks also released as visible singles get a `SINGLE` badge.
 - **Streaming links:** Fetch external streaming links listed on the MusicBrainz release page (Spotify, Apple Music, Tidal, and more).
@@ -54,8 +54,8 @@ A `Music-Release-Tracker (conda).bat` launcher is included if you prefer running
 ### Artists
 
 - **Search:** Queries the MusicBrainz, iTunes, Bandcamp and SoundCloud APIs (whichever platforms are selected and enabled). Names matching across platforms merge into one row so you can link everything at once. Bandcamp's search comes from the same autocomplete endpoint its site uses, so results are best-effort and capped at roughly 50 bands.
-- **Manual query:** If search comes up empty, paste an MBID, a full MusicBrainz / Apple Music / Bandcamp / SoundCloud URL, or a SoundCloud permalink.
-- **Linking:** Already have an artist added via one source? Link the other sources to the same entry. Unlinking asks for confirmation inline, then removes that source's releases for the artist from the database.
+- **Manual query:** If search comes up empty, paste an MBID, a full MusicBrainz / Apple Music / Spotify / Bandcamp / SoundCloud URL, or a SoundCloud permalink. Tidal, Qobuz, Amazon Music and YouTube / YouTube Music artist links also resolve through MusicBrainz URL relationships. If there's no MB relation, falls back to just regular name search. Amazon Music links resolve only when MB has recorded that storefront's URL (its locale-specific artist IDs can differ), and Qobuz has no name fallback.
+- **Linking:** Already have an artist added via one source? Link the other sources to the same entry. Unlinking asks for confirmation, then removes that source's releases for the artist from the database.
 - **Import / Export:** Import/export artist entries (name, MBIDs, iTunes IDs, SoundCloud permalinks, Bandcamp URLs and band IDs) as JSON. The app also writes the same format to `BACKUP/` automatically. This JSON covers artists only, so it can repopulate the artist list but not releases or settings.
 - **Sorting:** The tracked artists list sorts alphabetically, case-insensitively, with accented characters folded to their base letters.
 
