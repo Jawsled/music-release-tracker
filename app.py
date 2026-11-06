@@ -2183,6 +2183,11 @@ async def save_settings(request: Request):
         # storing a Python-repr string accidentally.
         if key in ("dedup_ignores", "explicit_map"):
             continue
+        if key == "dedup_date_window":
+            try:
+                value = max(0, min(int(value), MAX_DEDUP_DATE_WINDOW))
+            except (TypeError, ValueError):
+                continue
         db.set_setting(key, str(value))
     return {"status": "ok"}
 
@@ -2234,6 +2239,21 @@ async def run_dedup():
 # repaired even when the user has not enabled startup_dedup.
 DEDUP_POLICY_VERSION = 5
 
+# SoundCloud tracklist dedup treats a Single as an album track when it landed
+# within this many days of the album/EP. Default keeps the original ±1 day.
+DEFAULT_DEDUP_DATE_WINDOW = 1
+MAX_DEDUP_DATE_WINDOW = 30
+
+
+def _dedup_date_window() -> int:
+    """Return the configured ±day window for tracklist dedup."""
+    raw = db.get_all_settings().get("dedup_date_window")
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_DEDUP_DATE_WINDOW
+    return max(0, min(days, MAX_DEDUP_DATE_WINDOW))
+
 
 async def _dedupe_releases() -> dict:
     """Hide duplicate releases and restore ones that no longer are.
@@ -2253,8 +2273,8 @@ async def _dedupe_releases() -> dict:
 
     A second pass hides SoundCloud Singles that are really album/EP tracks.
     MusicBrainz tracklists are authoritative; other tracklists only match
-    when the single landed with the album (within one day), so a genuine
-    single released earlier stays visible.
+    when the single landed with the album (within the configured date window,
+    ±1 day by default), so a genuine single released earlier stays visible.
 
     The whole pass runs in one ``db.batch()`` transaction: it cannot commit a
     scan's open batch and a failure leaves no partial dedup state.
@@ -2277,6 +2297,7 @@ async def _dedupe_releases() -> dict:
 
     hidden = 0
     restored = 0
+    date_window = _dedup_date_window()
 
     def _apply_title_groups(release_rows) -> None:
         """One title+type-family duplicate pass over a snapshot of rows."""
@@ -2377,10 +2398,10 @@ async def _dedupe_releases() -> dict:
 
         # Hide SoundCloud tracks that are really album/EP tracks. MusicBrainz
         # tracklists are authoritative and always win. Other sources only
-        # count when the single landed with the album (within a day):
-        # SoundCloud imports every upload as a Single, so a track uploaded on
-        # release day must not look like a standalone single, while a single
-        # released earlier stays visible.
+        # count when the single landed with the album (within the configured
+        # date window): SoundCloud imports every upload as a Single, so a track
+        # uploaded on release day must not look like a standalone single, while
+        # a single released earlier stays visible.
         track_rows = conn.execute(
             "SELECT id, artist_id, source, release_date, track_titles "
             "FROM releases WHERE track_titles != '' "
@@ -2431,7 +2452,7 @@ async def _dedupe_releases() -> dict:
                 if album_date is None:
                     continue
                 delta = abs((single_date - album_date).days)
-                if delta <= 1 and (best_delta is None or delta < best_delta):
+                if delta <= date_window and (best_delta is None or delta < best_delta):
                     best = candidate
                     best_delta = delta
             return best

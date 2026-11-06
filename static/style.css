@@ -788,6 +788,44 @@ h2 { font-size: 1rem; color: var(--text-muted); margin-bottom: 0.75rem; font-wei
     margin-left: auto;
 }
 
+.settings-field {
+    margin-bottom: 0.85rem;
+}
+
+.settings-field-label {
+    display: block;
+    font-size: 0.88rem;
+    color: var(--text);
+    font-weight: 500;
+    margin-bottom: 0.4rem;
+}
+
+.settings-number-row {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+}
+
+.settings-number {
+    width: 4.5rem;
+    background: var(--bg);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    padding: 0.4rem 0.55rem;
+    border-radius: 5px;
+    font-size: 0.82rem;
+}
+
+.settings-number:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.settings-number-affix {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+}
+
 .settings-status {
     font-size: 0.82rem;
     margin-left: 0.5rem;

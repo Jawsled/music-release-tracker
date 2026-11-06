@@ -583,8 +583,9 @@ def _track_to_release(track: dict) -> dict:
     permalink_url = track.get("permalink_url", "")
     title = (track.get("title") or "").strip() or "Untitled"
 
-    # Normalize date to YYYY-MM-DD
-    date_str = _iso_date(track.get("created_at"))
+    # Prefer SoundCloud's explicit release date; created_at is only the upload
+    # time and can be days or months before the release.
+    date_str = _iso_date(track.get("release_date")) or _iso_date(track.get("created_at"))
 
     artwork = _upgrade_artwork(track.get("artwork_url"))
     user = track.get("user", {})
@@ -632,7 +633,16 @@ def _playlist_type(pl: dict) -> str | None:
 
 
 def _playlist_release_date(pl: dict) -> str:
-    """Release date from release_year/month_day, else the upload date."""
+    """Release date from release_date, release_year/month/day, else upload date.
+
+    SoundCloud exposes an explicit ``release_date`` on playlists (the date
+    shown on the release page). ``created_at`` is only when the playlist was
+    first created, which can be months earlier — using it made album-track
+    dedup compare singles against the wrong date.
+    """
+    explicit = _iso_date(pl.get("release_date"))
+    if explicit:
+        return explicit
     year = _int_or_none(pl.get("release_year"))
     if year:
         parts = [f"{year:04d}"]

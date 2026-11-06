@@ -8,6 +8,15 @@ const LOGS_REFRESH_INTERVAL = 2000; // 2 seconds
 let activeLogLevel = "ALL";
 let _lastFocusedEl = null;
 
+const DEDUP_DATE_WINDOW_DEFAULT = 1;
+const DEDUP_DATE_WINDOW_MAX = 30;
+
+function normalizeDedupDateWindow(value) {
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return DEDUP_DATE_WINDOW_DEFAULT;
+  return Math.max(0, Math.min(parsed, DEDUP_DATE_WINDOW_MAX));
+}
+
 function updateScrim() {
   const anyOpen = !logsPanel.classList.contains("hidden") || !settingsPanel.classList.contains("hidden");
   panelScrim.classList.toggle("hidden", !anyOpen);
@@ -159,6 +168,8 @@ async function loadSettings() {
     document.getElementById("source-soundcloud").checked = settings.source_soundcloud !== "0";
     document.getElementById("setting-startup-refresh").checked = settings.startup_refresh === "1";
     document.getElementById("setting-startup-dedup").checked = settings.startup_dedup === "1";
+    document.getElementById("setting-dedup-date-window").value =
+      normalizeDedupDateWindow(settings.dedup_date_window);
   } catch {
     // On error, default to the same initial state as a fresh install
     document.getElementById("source-musicbrainz").checked = true;
@@ -167,6 +178,7 @@ async function loadSettings() {
     document.getElementById("source-soundcloud").checked = true;
     document.getElementById("setting-startup-refresh").checked = false;
     document.getElementById("setting-startup-dedup").checked = false;
+    document.getElementById("setting-dedup-date-window").value = DEDUP_DATE_WINDOW_DEFAULT;
   }
   loadDedupRules();
   loadExplicitMap();
@@ -349,6 +361,9 @@ document.getElementById("explicit-clean-input").addEventListener("keydown", e =>
 });
 
 async function saveSettings(auto = false) {
+  const dateWindowEl = document.getElementById("setting-dedup-date-window");
+  const dateWindow = normalizeDedupDateWindow(dateWindowEl.value);
+  dateWindowEl.value = String(dateWindow);
   const settings = {
     source_musicbrainz: document.getElementById("source-musicbrainz").checked ? "1" : "0",
     source_itunes: document.getElementById("source-itunes").checked ? "1" : "0",
@@ -356,6 +371,7 @@ async function saveSettings(auto = false) {
     source_soundcloud: document.getElementById("source-soundcloud").checked ? "1" : "0",
     startup_refresh: document.getElementById("setting-startup-refresh").checked ? "1" : "0",
     startup_dedup: document.getElementById("setting-startup-dedup").checked ? "1" : "0",
+    dedup_date_window: String(dateWindow),
   };
 
   try {

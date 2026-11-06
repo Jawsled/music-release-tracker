@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Music Release Tracker</title>
     <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
-    <link rel="stylesheet" href="/static/style.css?v=22">
+    <link rel="stylesheet" href="/static/style.css?v=23">
 </head>
 <body>
     <header class="app-header">
@@ -93,6 +93,15 @@
             <div class="settings-section">
                 <h3>Maintenance</h3>
                 <p class="settings-hint">Scans store every fetched release, then hide duplicates with the same title and release type (album/EP/single), or SoundCloud tracks already on an album. MusicBrainz wins over Apple Music/Bandcamp/SoundCloud, which only fill in releases MB doesn't cover (yet). Hidden duplicates stay reviewable under Hidden only.</p>
+                <div class="settings-field">
+                    <label class="settings-field-label" for="setting-dedup-date-window">Release date window</label>
+                    <div class="settings-number-row">
+                        <span class="settings-number-affix">±</span>
+                        <input type="number" id="setting-dedup-date-window" class="settings-number" min="0" max="30" step="1" value="1" inputmode="numeric" data-change-action="save-settings" aria-describedby="setting-dedup-date-window-hint">
+                        <span class="settings-number-affix">day(s)</span>
+                    </div>
+                    <p class="settings-hint" id="setting-dedup-date-window-hint">SoundCloud singles released within this many days of an album/EP count as album tracks. Default: ±1 day. Changes apply when Dedup runs (or on the next scan).</p>
+                </div>
                 <div class="settings-maintenance">
                     <button class="check-btn" data-action="run-dedup">Run Dedup Now</button>
                     <span id="dedup-status" class="settings-status"></span>
@@ -311,7 +320,7 @@
     <script src="/static/js/artists.js?v=30"></script>
     <script src="/static/js/check.js?v=24"></script>
     <script src="/static/js/misc.js?v=24"></script>
-    <script src="/static/js/panels.js?v=25"></script>
+    <script src="/static/js/panels.js?v=26"></script>
     <script src="/static/js/modal.js?v=28"></script>
     <script src="/static/js/init.js?v=24"></script>
     <div id="toast-container" class="toast-container" aria-live="polite"></div>
