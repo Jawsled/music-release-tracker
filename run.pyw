@@ -57,7 +57,7 @@ def run_setup():
 
 def run_app():
     subprocess.Popen(
-        [str(PYTHON), str(APP_DIR / "app.py")],
+        [str(PYTHON), str(APP_DIR / "app.py"), *sys.argv[1:]],
         cwd=str(APP_DIR),
         creationflags=CREATION_FLAGS,
     )

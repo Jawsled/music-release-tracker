@@ -10,11 +10,18 @@ let _lastFocusedEl = null;
 
 const DEDUP_DATE_WINDOW_DEFAULT = 1;
 const DEDUP_DATE_WINDOW_MAX = 30;
+const PORT_DEFAULT = 7070;
 
 function normalizeDedupDateWindow(value) {
   const parsed = parseInt(value, 10);
   if (!Number.isFinite(parsed)) return DEDUP_DATE_WINDOW_DEFAULT;
   return Math.max(0, Math.min(parsed, DEDUP_DATE_WINDOW_MAX));
+}
+
+function normalizePort(value) {
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 1024 || parsed > 65535) return PORT_DEFAULT;
+  return parsed;
 }
 
 function updateScrim() {
@@ -159,6 +166,8 @@ document.addEventListener("click", e => {
 });
 
 async function loadSettings() {
+  const currentPortEl = document.getElementById("setting-port-current");
+  if (currentPortEl) currentPortEl.textContent = window.location.port || window.location.host;
   try {
     const settings = await api("/api/settings");
     // Default: MB/iTunes/SoundCloud enabled, Bandcamp opt-in (off), dedup off
@@ -170,6 +179,7 @@ async function loadSettings() {
     document.getElementById("setting-startup-dedup").checked = settings.startup_dedup === "1";
     document.getElementById("setting-dedup-date-window").value =
       normalizeDedupDateWindow(settings.dedup_date_window);
+    document.getElementById("setting-port").value = normalizePort(settings.port);
   } catch {
     // On error, default to the same initial state as a fresh install
     document.getElementById("source-musicbrainz").checked = true;
@@ -179,6 +189,7 @@ async function loadSettings() {
     document.getElementById("setting-startup-refresh").checked = false;
     document.getElementById("setting-startup-dedup").checked = false;
     document.getElementById("setting-dedup-date-window").value = DEDUP_DATE_WINDOW_DEFAULT;
+    document.getElementById("setting-port").value = PORT_DEFAULT;
   }
   loadDedupRules();
   loadExplicitMap();
@@ -364,6 +375,9 @@ async function saveSettings(auto = false) {
   const dateWindowEl = document.getElementById("setting-dedup-date-window");
   const dateWindow = normalizeDedupDateWindow(dateWindowEl.value);
   dateWindowEl.value = String(dateWindow);
+  const portEl = document.getElementById("setting-port");
+  const port = normalizePort(portEl.value);
+  portEl.value = String(port);
   const settings = {
     source_musicbrainz: document.getElementById("source-musicbrainz").checked ? "1" : "0",
     source_itunes: document.getElementById("source-itunes").checked ? "1" : "0",
@@ -372,6 +386,7 @@ async function saveSettings(auto = false) {
     startup_refresh: document.getElementById("setting-startup-refresh").checked ? "1" : "0",
     startup_dedup: document.getElementById("setting-startup-dedup").checked ? "1" : "0",
     dedup_date_window: String(dateWindow),
+    port: String(port),
   };
 
   try {

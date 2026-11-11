@@ -4,6 +4,7 @@ __pycache__/
 BACKUP/
 .cache/
 .env
+.tmp-verify/
 
 # dbs (personal data)
 *.db

@@ -91,6 +91,17 @@
                 </div>
             </div>
             <div class="settings-section">
+                <h3>Server</h3>
+                <div class="settings-field">
+                    <label class="settings-field-label" for="setting-port">Port</label>
+                    <div class="settings-number-row">
+                        <input type="number" id="setting-port" class="settings-number" min="1024" max="65535" step="1" inputmode="numeric" data-change-action="save-settings" aria-describedby="setting-port-hint">
+                    </div>
+                    <p class="settings-hint" id="setting-port-hint">Preferred port for the web UI. Restart the app to apply. If the port is in use (or reserved by Windows), the app uses a nearby port instead. The <code>--port</code> argument and <code>MUSIC_RELEASE_TRACKER_PORT</code> environment variable take precedence.</p>
+                    <p class="settings-hint">Current session: <span id="setting-port-current"></span></p>
+                </div>
+            </div>
+            <div class="settings-section">
                 <h3>Maintenance</h3>
                 <p class="settings-hint">Scans store every fetched release, then hide duplicates with the same title and release type (album/EP/single), or SoundCloud tracks already on an album. MusicBrainz wins over Apple Music/Bandcamp/SoundCloud, which only fill in releases MB doesn't cover (yet). Hidden duplicates stay reviewable under Hidden only.</p>
                 <div class="settings-field">

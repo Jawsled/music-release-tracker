@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   /* Backgrounds & surfaces */
   --bg: #1a1a1a;
   --bg-deep: #1e1e1e;
@@ -184,6 +184,7 @@ main { max-width: 800px; margin: 0 auto; padding: 1.5rem; }
 .tracklist-header { padding: 0.6rem 1rem; display: flex; justify-content: space-between; align-items: center; background: rgba(255,255,255,0.03); position: sticky; top: 0; z-index: 1; }
 .tracklist-title { font-size: 0.78rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; font-weight: 500; }
 .tracklist-count { font-size: 0.75rem; color: var(--text-faint); }
+.tracklist-via { color: var(--text-dim-2); }
 .tracklist-list { padding: 0.25rem 1rem 0.75rem; }
 
 .track-item { display: flex; align-items: center; gap: 0.75rem; padding: 0.4rem 0; font-size: 0.85rem; border-bottom: 1px solid rgba(255,255,255,0.04); }

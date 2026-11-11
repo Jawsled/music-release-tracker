@@ -16,16 +16,44 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Awaitable, Callable
 
 import db
 
-# Tracklists are effectively immutable; streaming links and an artist's
-# external links change occasionally, so they get shorter TTLs.
+# Tracklists are effectively immutable once an entry is complete, but
+# MusicBrainz seeds pre-release and freshly-released albums with only the
+# tracks announced so far and fills the rest in over the following days, so
+# those entries must not be trusted for a month. Fresh-enough releases
+# re-check daily; everything else keeps the long TTL. Streaming links and an
+# artist's external links change occasionally, so they get shorter TTLs.
 TTL_TRACKS = 30 * 24 * 3600     # 30 days
+TTL_TRACKS_FRESH = 24 * 3600    # 1 day (recently/future released albums)
+TTL_FRESH_DAYS = 30             # releases dated within ±this many days
 TTL_STREAMING = 24 * 3600       # 1 day
 TTL_MB_LINKS = 7 * 24 * 3600    # 7 days
+
+
+def tracks_ttl(release_date: str) -> float:
+    """Tracklist TTL for one release, based on its release date.
+
+    Future dates and dates within :data:`TTL_FRESH_DAYS` count as fresh —
+    that is the window where MusicBrainz entries are still being filled in.
+    Unparsable/partial dates count as fresh too: a missing date is more
+    likely a data gap than a decades-old release, and the cost of one extra
+    daily re-check is negligible.
+    """
+    text = (release_date or "").strip()
+    try:
+        released = date.fromisoformat(text)
+    except ValueError:
+        return TTL_TRACKS_FRESH
+    today = datetime.now(timezone.utc).date()
+    delta = (released - today).days
+    if -TTL_FRESH_DAYS <= delta <= TTL_FRESH_DAYS:
+        return TTL_TRACKS_FRESH
+    return TTL_TRACKS
+
 
 # Concurrent requests for the same key (e.g. a startup backfill racing a UI
 # expand) share one fetch instead of both hitting the API.

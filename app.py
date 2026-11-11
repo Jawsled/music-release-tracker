@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import socket
 import webbrowser
 from contextlib import asynccontextmanager
 from datetime import date
@@ -28,7 +30,90 @@ import artwork
 import cache
 
 HOST = "127.0.0.1"
-PORT = 7070
+DEFAULT_PORT = 7070
+# Set to the actual listening port in __main__ (may differ on fallback).
+PORT = DEFAULT_PORT
+MIN_PORT, MAX_PORT = 1024, 65535
+
+
+def _valid_port(value) -> int | None:
+    """Return value as a usable TCP port, or None when it is invalid."""
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return port if MIN_PORT <= port <= MAX_PORT else None
+
+
+def _stored_port() -> int | None:
+    """Read the port saved in Settings without initializing the database."""
+    try:
+        if not os.path.exists(db.DB_PATH) or os.path.getsize(db.DB_PATH) == 0:
+            return None
+    except OSError:
+        return None
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(db.DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'setting_port'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return _valid_port(row[0]) if row else None
+
+
+def _preferred_port() -> int:
+    """Resolve the port preference: --port, env var, Settings, then 7070."""
+    import argparse
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--port", type=int)
+    args, _ = parser.parse_known_args()
+    for candidate in (
+        args.port,
+        os.environ.get("MUSIC_RELEASE_TRACKER_PORT"),
+        _stored_port(),
+    ):
+        port = _valid_port(candidate)
+        if port is not None:
+            return port
+    return DEFAULT_PORT
+
+
+def _port_candidates(preferred: int) -> tuple[int, ...]:
+    nearby = range(preferred + 1, preferred + 10)
+    # Windows/Hyper-V often reserves 7024-7123, so include high ports that are
+    # normally outside its dynamic exclusion ranges.
+    extras = (*range(8721, 8731), 8000, 8080)
+    return tuple(dict.fromkeys((preferred, *nearby, *extras)))
+
+
+def _find_free_port(preferred: int) -> int:
+    """Return the first port we can actually bind on HOST.
+
+    Probe each candidate before handing it to uvicorn so a reserved or busy
+    port produces a fallback instead of a startup crash.
+    """
+    candidates = _port_candidates(preferred)
+    for port in candidates:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind((HOST, port))
+        except OSError:
+            continue
+        return port
+    tried = ", ".join(str(port) for port in candidates)
+    raise SystemExit(
+        f"Could not find a free port (tried {tried}).\n"
+        "Windows may have reserved these ports. Choose one with "
+        "MUSIC_RELEASE_TRACKER_PORT=<port> or inspect the reserved ranges:\n"
+        "  netsh interface ipv4 show excludedportrange protocol=tcp"
+    )
 
 # Setup application logging
 logger = logging.getLogger("music-release-tracker")
@@ -1233,6 +1318,7 @@ async def add_artist(body: ArtistAddRequest):
             # tracklists fetched in parallel after the loop instead of
             # one awaited request per album.
             pending_tracklists: list[tuple[int, str]] = []
+            pending_tracklist_dates: dict[int, str] = {}
             for rel in releases:
                 inserted = db.add_release(
                     mbid=rel["mbid"],
@@ -1252,7 +1338,10 @@ async def add_artist(body: ArtistAddRequest):
                         release_row = db.get_release_by_mbid(rel["mbid"], artist["id"])
                         if release_row:
                             pending_tracklists.append((release_row["id"], rel["mbid"]))
-            await _fetch_tracklists_parallel(pending_tracklists, body.id)
+                            pending_tracklist_dates[release_row["id"]] = rel.get("date", "")
+            await _fetch_tracklists_parallel(
+                pending_tracklists, body.id, pending_tracklist_dates
+            )
             db.hide_lower_priority_title_duplicates(artist["id"], "musicbrainz")
         elif body.source == "itunes":
             releases = await itunes.get_artist_releases(int(body.id), artist_name=body.name)
@@ -1626,6 +1715,118 @@ def _upstream_error_status(e: Exception) -> int:
     return 502
 
 
+async def _fetch_source_tracks(release: dict, fallback_id: str) -> list[dict]:
+    """Fetch one release's tracklist from its own source API.
+
+    Shared by the tracklist endpoint and the duplicate-superset fallback so
+    both read the same upstream shapes and share the ``tracks:<id>`` cache
+    entries. ``fallback_id`` stands in for the source-specific id when the
+    row predates stored ids (matching the endpoint's historical behavior).
+    """
+    source = release.get("source", "musicbrainz")
+    if source == "itunes":
+        collection_id = release.get("itunes_collection_id") or fallback_id
+        return await itunes.get_release_tracks(int(collection_id))
+    if source == "soundcloud":
+        playlist_id = release.get("soundcloud_playlist_id")
+        if playlist_id:
+            return await soundcloud.get_playlist_tracks(playlist_id)
+        track_id = release.get("soundcloud_track_id") or fallback_id
+        return await soundcloud.get_release_tracks(track_id)
+    if source == "bandcamp":
+        item_id = release.get("bandcamp_item_id") or fallback_id
+        item_type = release.get("bandcamp_item_type") or "album"
+        # The mobile API needs the numeric band id, not the host, so read
+        # it from the tracked artist row.
+        artist_row = db.get_artist_by_id(release["artist_id"]) or {}
+        band_id = artist_row.get("bandcamp_band_id") or ""
+        if not band_id:
+            return []
+        return await bandcamp.get_release_tracks(item_id, item_type, band_id)
+    # Pass the tracked artist's MBID so their own credit is filtered out
+    # of per-track "feat." listings
+    return await musicbrainz.get_release_tracks(
+        release.get("mbid") or fallback_id,
+        main_mbid=release.get("artist_mbid") or "",
+    )
+
+
+async def _duplicate_superset_tracks(
+    release: dict, primary_tracks: list[dict]
+) -> tuple[list[dict], str] | None:
+    """Return a hidden duplicate's fuller tracklist, or None.
+
+    Dedup keeps one visible copy per (artist, normalized title, type family)
+    and hides the rest. Which copy survives is decided by source policy, not
+    by data quality — so a MusicBrainz entry seeded with only the tracks
+    announced so far can sit next to a hidden Apple Music copy that already
+    lists the full album. This reads the hidden siblings of ``release``
+    (same artist, same normalized title, same type family, different
+    source, hidden by dedup — never manual hides) and returns
+    ``(tracks, source)`` for the one whose normalized track set is a strict
+    superset of the visible copy's.
+
+    Strict-superset is the safety rail: a deluxe edition with extra tracks
+    the visible release does not contain is not a superset and never
+    hijacks the card, and the fallback is self-reverting — as soon as the
+    primary source lists the same tracks, the superset condition fails and
+    the default list is served again.
+    """
+    keeper_norm = db.normalize_release_title(release.get("title") or "")
+    if not keeper_norm:
+        return None
+    keeper_family = db.release_type_family(release.get("release_type") or "")
+    keeper_source = (release.get("source") or "").strip().casefold()
+
+    conn = db.get_db()
+    rows = conn.execute(
+        "SELECT id, source, title, release_type, release_date, artist_id, mbid, "
+        "itunes_collection_id, soundcloud_track_id, soundcloud_playlist_id, "
+        "bandcamp_item_id, bandcamp_item_type "
+        "FROM releases WHERE artist_id = ? AND is_visible = 0 "
+        "AND hidden_reason IN (?, ?)",
+        (release["artist_id"], db.HIDE_REASON_DEDUP_TITLE, db.HIDE_REASON_DEDUP_TRACK),
+    ).fetchall()
+
+    base_titles = {
+        db.normalize_release_title(t.get("title") or "")
+        for t in primary_tracks if isinstance(t, dict)
+    }
+    base_titles.discard("")
+
+    best: tuple[int, list[dict], str] | None = None  # (track count, tracks, source)
+    for row in rows:
+        source = (row["source"] or "").strip().casefold()
+        if not source or source == keeper_source:
+            continue
+        if db.release_type_family(row["release_type"] or "") != keeper_family:
+            continue
+        if db.normalize_release_title(row["title"] or "") != keeper_norm:
+            continue
+        try:
+            cand_tracks = await cache.cached(
+                f"tracks:{row['id']}",
+                cache.tracks_ttl(row["release_date"] or ""),
+                lambda r=row, rid=row["id"]: _fetch_source_tracks(dict(r), str(rid)),
+            )
+        except Exception:
+            continue
+        cand_titles = {
+            db.normalize_release_title(t.get("title") or "")
+            for t in cand_tracks if isinstance(t, dict)
+        }
+        cand_titles.discard("")
+        if not cand_titles or not base_titles <= cand_titles:
+            continue  # empty, or missing tracks the primary list has
+        if len(cand_titles) <= len(base_titles):
+            continue  # not strictly fuller
+        if best is None or len(cand_titles) > best[0]:
+            best = (len(cand_titles), cand_tracks, source)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
 @app.get("/api/releases/{release_id}/tracks")
 async def get_release_tracks(release_id: str):
     """Fetch and return tracklist for a release.
@@ -1634,47 +1835,31 @@ async def get_release_tracks(release_id: str):
     SoundCloud) based on the release source.
     On upstream failure (e.g. MusicBrainz 503) returns an empty tracklist
     with an `error` message and a 502/503/504 status instead of raising.
+
+    If a dedup-hidden duplicate of this release carries a strictly fuller
+    tracklist (see ``_duplicate_superset_tracks``), that list is served
+    instead and ``tracklist_source`` names its source; the frontend labels
+    the section "via <source>". ``tracklist_source`` is null when the
+    release's own source list is served.
     """
     # Look up release to determine source and artist
     release = db.get_release_by_id(release_id)
     if not release:
         return {"mbid": release_id, "tracks": []}
 
-    source = release.get("source", "musicbrainz")
     artist_id = release["artist_id"]
 
     # Fetch tracks from the appropriate API. Cached per release row so repeat
-    # expands (this session or after a restart) are a local read; the failure
+    # expansions (this session or after a restart) are a local read; the failure
     # handling below still sees the original upstream exception.
     async def _fetch_tracks() -> list[dict]:
-        if source == "itunes":
-            collection_id = release.get("itunes_collection_id") or release_id
-            return await itunes.get_release_tracks(int(collection_id))
-        if source == "soundcloud":
-            playlist_id = release.get("soundcloud_playlist_id")
-            if playlist_id:
-                return await soundcloud.get_playlist_tracks(playlist_id)
-            track_id = release.get("soundcloud_track_id") or release_id
-            return await soundcloud.get_release_tracks(track_id)
-        if source == "bandcamp":
-            item_id = release.get("bandcamp_item_id") or release_id
-            item_type = release.get("bandcamp_item_type") or "album"
-            # The mobile API needs the numeric band id, not the host, so read
-            # it from the tracked artist row.
-            artist_row = db.get_artist_by_id(artist_id) or {}
-            band_id = artist_row.get("bandcamp_band_id") or ""
-            if not band_id:
-                return []
-            return await bandcamp.get_release_tracks(item_id, item_type, band_id)
-        # Pass the tracked artist's MBID so their own credit is filtered out
-        # of per-track "feat." listings
-        return await musicbrainz.get_release_tracks(
-            release_id, main_mbid=release.get("artist_mbid") or ""
-        )
+        return await _fetch_source_tracks(release, release_id)
 
     try:
         tracks = await cache.cached(
-            f"tracks:{release['id']}", cache.TTL_TRACKS, _fetch_tracks
+            f"tracks:{release['id']}",
+            cache.tracks_ttl(release.get("release_date") or ""),
+            _fetch_tracks,
         )
     except Exception as e:
         msg = _error_message(e)
@@ -1683,6 +1868,15 @@ async def get_release_tracks(release_id: str):
             status_code=_upstream_error_status(e),
             content={"mbid": release_id, "tracks": [], "error": msg},
         )
+
+    # A hidden duplicate may carry the fuller list (e.g. MusicBrainz slowly
+    # filling in a pre-release album while Apple Music already has all
+    # tracks). Serve the strict superset with attribution; it reverts
+    # automatically once the primary source catches up.
+    served_source = None
+    fallback = await _duplicate_superset_tracks(release, tracks)
+    if fallback is not None:
+        tracks, served_source = fallback
 
     # Find all single titles locally for this artist
     single_titles: set[str] = set()
@@ -1704,7 +1898,11 @@ async def get_release_tracks(release_id: str):
                         break
         result_tracks.append({**track, "has_single": has_single})
 
-    return {"mbid": release_id, "tracks": result_tracks}
+    return {
+        "mbid": release_id,
+        "tracks": result_tracks,
+        "tracklist_source": served_source,
+    }
 
 
 @app.get("/api/releases/{release_id}/streaming")
@@ -1876,6 +2074,9 @@ async def _fetch_artist_new_titles(artist: dict) -> list[str]:
     # fetched in parallel right after it so the dedup pass that follows the
     # import sees the tracklists too.
     pending_tracklists: list[tuple[int, str]] = []
+    # release row id -> release date, so fresh albums get the short
+    # tracklist TTL and pick up MusicBrainz's gradual fills quickly.
+    pending_tracklist_dates: dict[int, str] = {}
     async with db.batch():
         mb_changed = False
         itunes_changed = False
@@ -1905,11 +2106,14 @@ async def _fetch_artist_new_titles(artist: dict) -> list[str]:
                             release_row = db.get_release_by_mbid(rel["mbid"], artist["id"])
                             if release_row:
                                 pending_tracklists.append((release_row["id"], rel["mbid"]))
+                                pending_tracklist_dates[release_row["id"]] = rel.get("date", "")
                 # Fetch this pass's tracklists before the dedup pass that
                 # follows the import, so SoundCloud track duplicates are
                 # matched against them.
                 if pending_tracklists:
-                    await _fetch_tracklists_parallel(pending_tracklists, artist.get("mbid", ""))
+                    await _fetch_tracklists_parallel(
+                        pending_tracklists, artist.get("mbid", ""), pending_tracklist_dates
+                    )
                     pending_tracklists.clear()
                 # MB is authoritative: hide iTunes/Bandcamp/SoundCloud copies
                 # of the title+type pairs it just added or refreshed.
@@ -2171,7 +2375,9 @@ def _sse(data: dict) -> str:
 @app.get("/api/settings")
 async def get_settings():
     """Return all settings."""
-    return db.get_all_settings()
+    settings = db.get_all_settings()
+    settings.setdefault("port", str(DEFAULT_PORT))
+    return settings
 
 
 @app.post("/api/settings")
@@ -2188,6 +2394,11 @@ async def save_settings(request: Request):
                 value = max(0, min(int(value), MAX_DEDUP_DATE_WINDOW))
             except (TypeError, ValueError):
                 continue
+        if key == "port":
+            port = _valid_port(value)
+            if port is None:
+                continue
+            value = str(port)
         db.set_setting(key, str(value))
     return {"status": "ok"}
 
@@ -2516,7 +2727,7 @@ async def _backfill_tracklists():
     import asyncio
     conn = db.get_db()
     rows = conn.execute(
-        """SELECT r.id, r.mbid, r.artist_id, a.mbid as artist_mbid
+        """SELECT r.id, r.mbid, r.artist_id, r.release_date, a.mbid as artist_mbid
            FROM releases r
            JOIN artists a ON r.artist_id = a.id
            WHERE r.source = 'musicbrainz'
@@ -2538,7 +2749,7 @@ async def _backfill_tracklists():
             try:
                 tracks = await cache.cached(
                     f"tracks:{row['id']}",
-                    cache.TTL_TRACKS,
+                    cache.tracks_ttl(row["release_date"]),
                     lambda: musicbrainz.get_release_tracks(row["mbid"], row["artist_mbid"] or ""),
                 )
             except Exception:
@@ -2684,22 +2895,24 @@ async def _backfill_sc_urls():
 _TRACKLIST_CONCURRENCY = 4
 
 
-async def _fetch_tracklists_parallel(pending: list[tuple[int, str]], artist_mbid: str = ""):
+async def _fetch_tracklists_parallel(pending: list[tuple[int, str]], artist_mbid: str = "", dates: dict[int, str] | None = None):
     """Fetch tracklists for (release_id, release_mbid) pairs concurrently.
 
-    Failures are swallowed per release, exactly like the previous inline
+    ``dates`` optionally maps release_id -> release_date so fresh entries use
+    the short tracklist TTL (see ``cache.tracks_ttl``); missing keys fall back
+    to it. Failures are swallowed per release, exactly like the previous inline
     await; a failed fetch is retried by the startup backfill on next boot.
     """
     if not pending:
         return
     sem = asyncio.Semaphore(_TRACKLIST_CONCURRENCY)
 
-    async def _fill(release_id: int, release_mbid: str):
+    async def _fill(release_id: int, release_mbid: str, release_date: str = ""):
         async with sem:
             try:
                 tracks = await cache.cached(
                     f"tracks:{release_id}",
-                    cache.TTL_TRACKS,
+                    cache.tracks_ttl(release_date),
                     lambda: musicbrainz.get_release_tracks(release_mbid, artist_mbid or ""),
                 )
             except Exception:
@@ -2707,7 +2920,10 @@ async def _fetch_tracklists_parallel(pending: list[tuple[int, str]], artist_mbid
             if tracks:
                 db.update_release_track_titles(release_id, [t["title"] for t in tracks])
 
-    await asyncio.gather(*(_fill(rid, mbid) for rid, mbid in pending))
+    await asyncio.gather(*(
+        _fill(rid, mbid, (dates or {}).get(rid, ""))
+        for rid, mbid in pending
+    ))
 
 
 # --- Source settings helper ---
@@ -2732,6 +2948,11 @@ def _enabled_sources() -> list[str]:
 if __name__ == "__main__":
     import uvicorn
 
+    preferred = _preferred_port()
+    PORT = _find_free_port(preferred)
+    if PORT != preferred:
+        print(f"\n  Port {preferred} is unavailable (reserved or in use); "
+              f"using {PORT} instead.")
     print(f"\n  Music Release Tracker")
     print(f"  Running at http://{HOST}:{PORT}\n")
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning")

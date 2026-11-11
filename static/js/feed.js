@@ -176,6 +176,7 @@ const ACTIONS = {
     const item = el.closest(".release-item");
     if (!item) return;
     delete tracklistCache[item.dataset.mbid];
+    delete tracklistSourceCache[item.dataset.mbid];
     const section = item.querySelector(".tracklist-section");
     if (section) {
       section.classList.remove("expanded");
@@ -1169,6 +1170,10 @@ function renderReleaseCard(r) {
 
 // --- Tracklist Toggle (integrated inline) ---
 const tracklistCache = {};
+// Per-release source attribution for the served tracklist (null when the
+// release's own source list was served; e.g. "itunes" when a hidden
+// duplicate's fuller list won).
+const tracklistSourceCache = {};
 const streamingCache = {};
 
 function setCardExpanded(item, kind, isExpanded) {
@@ -1206,7 +1211,7 @@ function toggleTracklist(cardEl) {
 
   // Check cache
   if (tracklistCache[releaseMbid]) {
-    renderTracklist(section, tracklistCache[releaseMbid]);
+    renderTracklist(section, tracklistCache[releaseMbid], tracklistSourceCache[releaseMbid]);
     return;
   }
 
@@ -1216,14 +1221,15 @@ function toggleTracklist(cardEl) {
     .then(data => {
       const tracks = data.tracks;
       tracklistCache[releaseMbid] = tracks;
-      renderTracklist(section, tracks);
+      tracklistSourceCache[releaseMbid] = data.tracklist_source || null;
+      renderTracklist(section, tracks, data.tracklist_source || null);
     })
     .catch(() => {
       section.innerHTML = `<p class="tracklist-error">Failed to load tracks. <button class="link-btn"${dataAttrs({ action: "retry-tracklist" })}>Retry</button></p>`;
     });
 }
 
-function renderTracklist(container, tracks) {
+function renderTracklist(container, tracks, viaSource) {
   if (!tracks || tracks.length === 0) {
     container.innerHTML = '<p class="tracklist-empty">No tracks found.</p>';
     return;
@@ -1239,10 +1245,16 @@ function renderTracklist(container, tracks) {
 
   const item = container.closest(".release-item");
   const mbid = item ? item.dataset.mbid : "";
+  // When the served list came from a dedup-hidden duplicate (e.g. the
+  // MusicBrainz entry is still being filled in and Apple Music already
+  // lists every track), say so next to the count.
+  const viaNote = viaSource
+    ? raw(` <span class="tracklist-via" title="Fuller list served from this source's copy of the release">via ${esc(sourceLabel(viaSource))}</span>`)
+    : "";
   container.innerHTML = html`
     <div class="tracklist-header">
       <span class="tracklist-title">Tracklist</span>
-      <span><span class="tracklist-count">${tracks.length} tracks</span> <button class="copy-tracklist-btn"${raw(dataAttrs({ action: "copy-tracklist", mbid: mbid }))} title="Copy track titles">Copy</button></span>
+      <span><span class="tracklist-count">${tracks.length} tracks${viaNote}</span> <button class="copy-tracklist-btn"${raw(dataAttrs({ action: "copy-tracklist", mbid: mbid }))} title="Copy track titles">Copy</button></span>
     </div>
     <div class="tracklist-list">
       ${tracks.map(t => {

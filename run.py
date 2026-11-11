@@ -58,7 +58,7 @@ def run_app():
     print("[*] Starting Music Release Tracker...\n")
     try:
         subprocess.check_call(
-            [str(PYTHON), str(APP_DIR / "app.py")],
+            [str(PYTHON), str(APP_DIR / "app.py"), *sys.argv[1:]],
             cwd=str(APP_DIR),
         )
     except KeyboardInterrupt:

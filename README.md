@@ -23,7 +23,7 @@ A local-first desktop app that tracks new releases with webUI. Powered by [Music
 
 ## Quick Start
 
-```bash
+```
 git clone https://github.com/Jawsled/music-release-tracker.git
 cd music-release-tracker
 python run.py
@@ -36,6 +36,21 @@ C:\ProgramData\Microsoft\Windows\Start Menu\Programs
 ```
 
 That's it. On first run the app creates a dedicated launcher environment, installs dependencies automatically, then opens the web UI at `http://127.0.0.1:7070`.
+
+### Changing the port
+
+The app prefers `7070`, but Windows/Hyper-V sometimes reserves ranges that include it (for example `7024–7123`), which makes binding fail with `Errno 13`. In that case the app automatically picks the next free port and prints the URL.
+
+To choose a port yourself, use **Settings → Server → Port** (restart required), or override it at launch:
+
+```
+# Command line (highest priority)
+python run.py --port 8080
+
+# Environment variable
+MUSIC_RELEASE_TRACKER_PORT=8080 python run.py   # Linux/macOS
+set MUSIC_RELEASE_TRACKER_PORT=8080 && python run.py   # Windows
+```
 
 ### Conda (optional)
 
@@ -130,7 +145,7 @@ Telegram support was dropped during a significant rewrite. Feel free to build yo
 
 The original launcher installs dependencies automatically into its dedicated `.venv-run/` environment from [`requirements.txt`](requirements.txt). If you use uv, the project environment is kept separately in `.venv/`:
 
-```bash
+```
 uv sync
 uv run music-release-tracker
 ```
